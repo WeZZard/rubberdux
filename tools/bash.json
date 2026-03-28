@@ -2,21 +2,21 @@
   "type": "function",
   "function": {
     "name": "bash",
-    "description": "Execute a bash command. Set run_in_background=true for long-running commands (network requests, builds, heavy computation). When run_in_background is true, the result contains a task ID and output file path. Check the output file later with read_file. Do NOT immediately check background task outputs — let the user continue the conversation.",
+    "description": "Execute a bash command. For commands that may take more than 2 seconds (network requests, builds, package installs, recursive file searches, compilation), you MUST set run_in_background=true. When run_in_background is true, the command runs asynchronously and the result contains a task ID and output file path. You can check the output file later with read_file when the user asks. Do NOT use sleep to wait for background tasks. Do NOT poll or retry background task outputs. Report the task ID to the user and move on.",
     "parameters": {
       "type": "object",
       "properties": {
         "command": {
           "type": "string",
-          "description": "The bash command to execute"
+          "description": "The bash command to execute. Do not use sleep to create delays for long-running commands."
         },
         "run_in_background": {
           "type": "boolean",
-          "description": "Set to true for long-running commands (network requests, builds, recursive searches). Defaults to false."
+          "description": "MUST be true for commands that may take more than 2 seconds: network requests (curl, wget), builds (cargo build, npm install, make), recursive searches on large directories, package management (pip, brew), and any command with unpredictable execution time. Defaults to false."
         },
         "timeout": {
           "type": "number",
-          "description": "Timeout in milliseconds. Defaults to 120000 (2 minutes)."
+          "description": "Timeout in milliseconds for synchronous commands. Defaults to 120000 (2 minutes)."
         }
       },
       "required": ["command"]

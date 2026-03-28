@@ -11,6 +11,14 @@ pub async fn execute(args: &serde_json::Value) -> ToolResult {
         }
     };
 
+    // Reject commands that start with sleep — polling is not allowed
+    if command.trim_start().starts_with("sleep") {
+        return ToolResult {
+            content: "Error: do not use sleep to wait for long-running commands. Use run_in_background=true instead and let the user check results later.".into(),
+            is_error: true,
+        };
+    }
+
     let run_in_bg = args["run_in_background"].as_bool().unwrap_or(false);
     let timeout_ms = args["timeout"].as_u64().unwrap_or(120_000);
 
