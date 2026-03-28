@@ -1,9 +1,76 @@
+use std::fs::OpenOptions;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
+
 use tokio::sync::mpsc;
 
 use crate::channel::{AgentResponse, UserMessage};
 use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
 
 const DEFAULT_BEST_PERFORMANCE_TOKENS: usize = 153_600;
+const DEFAULT_SESSION_DIR: &str = "./sessions";
+const SESSION_FILENAME: &str = "session.jsonl";
+
+fn session_path() -> PathBuf {
+    let dir = std::env::var("RUBBERDUX_SESSION_DIR")
+        .unwrap_or_else(|_| DEFAULT_SESSION_DIR.into());
+    PathBuf::from(dir).join(SESSION_FILENAME)
+}
+
+fn load_session(path: &Path) -> Vec<Message> {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+
+    let reader = std::io::BufReader::new(file);
+    let mut history = Vec::new();
+
+    for (i, line) in reader.lines().enumerate() {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                log::warn!("Session line {} read error: {}", i, e);
+                continue;
+            }
+        };
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        match serde_json::from_str::<Message>(&line) {
+            Ok(msg) => history.push(msg),
+            Err(e) => log::warn!("Session line {} parse error: {}", i, e),
+        }
+    }
+
+    log::info!("Restored {} messages from session {:?}", history.len(), path);
+    history
+}
+
+fn append_to_session(path: &Path, message: &Message) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let mut file = match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            log::error!("Failed to open session file {:?}: {}", path, e);
+            return;
+        }
+    };
+
+    match serde_json::to_string(message) {
+        Ok(json) => {
+            if writeln!(file, "{}", json).is_err() {
+                log::error!("Failed to write to session file");
+            }
+        }
+        Err(e) => log::error!("Failed to serialize message: {}", e),
+    }
+}
 
 pub async fn run(
     mut rx: mpsc::Receiver<UserMessage>,
@@ -15,14 +82,16 @@ pub async fn run(
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_BEST_PERFORMANCE_TOKENS);
 
-    log::info!(
-        "Agent loop started (model: {}, best_performance_tokens: {})",
-        client.model(),
-        best_perf_tokens
-    );
-
-    let mut history: Vec<Message> = Vec::new();
+    let session_file = session_path();
+    let mut history: Vec<Message> = load_session(&session_file);
     let mut last_prompt_tokens: usize = 0;
+
+    log::info!(
+        "Agent loop started (model: {}, best_performance_tokens: {}, history: {} messages)",
+        client.model(),
+        best_perf_tokens,
+        history.len()
+    );
 
     while let Some(msg) = rx.recv().await {
         let interpreted = &msg.interpreted;
@@ -39,9 +108,11 @@ pub async fn run(
 
         // Silent messages (e.g. reactions) — append to history, don't call LLM
         if is_silent {
-            history.push(Message::User {
+            let user_msg = Message::User {
                 content: UserContent::Text(text_preview.clone()),
-            });
+            };
+            append_to_session(&session_file, &user_msg);
+            history.push(user_msg);
             continue;
         }
 
@@ -91,14 +162,20 @@ pub async fn run(
                     text_preview.clone()
                 };
 
-                history.push(Message::User {
+                let user_msg = Message::User {
                     content: UserContent::Text(history_text),
-                });
-                history.push(Message::Assistant {
+                };
+                let asst_msg = Message::Assistant {
                     content: Some(response_text.clone()),
                     tool_calls: None,
                     partial: None,
-                });
+                };
+
+                append_to_session(&session_file, &user_msg);
+                append_to_session(&session_file, &asst_msg);
+
+                history.push(user_msg);
+                history.push(asst_msg);
 
                 AgentResponse {
                     text: response_text,

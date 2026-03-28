@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::tool::ToolDefinition;
-use super::{Message, MoonshotClient};
+use super::{Message, MoonshotClient, UserContent};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatRequest {
