@@ -279,11 +279,20 @@ pub async fn run(
 /// the `id` attribute is inserted into the existing tag.
 /// Otherwise, the content is wrapped in a new tag.
 pub fn inject_assistant_message_id(text: &mut String, msg_id: i32) {
-    let tag = "<telegram-message from=\"assistant\" to=\"user\">";
-    if let Some(pos) = text.find(tag) {
-        let insert_pos = pos + "<telegram-message from=\"assistant\" to=\"user\"".len();
+    let tag_prefix = "<telegram-message from=\"assistant\" to=\"user\"";
+
+    // Already has an id — idempotent, do nothing
+    if text.contains(&format!("{} id=\"", tag_prefix)) {
+        return;
+    }
+
+    // Has the tag without id — inject id attribute
+    let tag_with_close = format!("{}>", tag_prefix);
+    if let Some(pos) = text.find(&tag_with_close) {
+        let insert_pos = pos + tag_prefix.len();
         text.insert_str(insert_pos, &format!(" id=\"{}\"", msg_id));
     } else {
+        // No tag from model — wrap the whole content
         *text = format!(
             "<telegram-message from=\"assistant\" to=\"user\" id=\"{}\">{}</telegram-message>",
             msg_id, text
@@ -376,6 +385,19 @@ mod tests {
         assert_eq!(text.matches("</telegram-message>").count(), 1);
         // Should contain the id
         assert!(text.contains("id=\"42\""));
+    }
+
+    #[test]
+    fn test_inject_id_idempotent_when_called_twice() {
+        // Bug reproduction: __update_assistant_id arrives twice for the same message
+        let mut text = "<telegram-message from=\"assistant\" to=\"user\">Hello!</telegram-message>".to_owned();
+        inject_assistant_message_id(&mut text, 106);
+        inject_assistant_message_id(&mut text, 106);
+
+        // Must still have exactly one opening and one closing tag
+        assert_eq!(text.matches("<telegram-message").count(), 1, "Double injection created nested tags: {}", text);
+        assert_eq!(text.matches("</telegram-message>").count(), 1);
+        assert!(text.contains("id=\"106\""));
     }
 
     #[test]
