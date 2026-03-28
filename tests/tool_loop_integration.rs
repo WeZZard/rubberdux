@@ -1,3 +1,4 @@
+use serial_test::serial;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -226,6 +227,7 @@ async fn test_bash_tool_sync() {
 
 /// Test: bash tool background execution returns immediately with task info.
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn test_bash_tool_background() {
     let args = serde_json::json!({
         "command": "echo bg_test",
@@ -645,6 +647,7 @@ async fn test_mixed_sync_background_tool_calls() {
 /// Test: background task output file can be read by read_file tool
 /// This tests the complete lifecycle: spawn background → wait → read output.
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn test_background_task_output_readable() {
     // Launch a background task
     let bg_args = serde_json::json!({
