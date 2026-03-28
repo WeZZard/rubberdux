@@ -15,6 +15,8 @@ pub struct FunctionDefinition {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
     pub id: String,
     pub r#type: String,
     pub function: FunctionCall,

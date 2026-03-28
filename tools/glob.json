@@ -1,0 +1,21 @@
+{
+  "type": "function",
+  "function": {
+    "name": "glob",
+    "description": "Find files matching a glob pattern. Returns matching file paths.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "description": "Glob pattern to match (e.g. '**/*.rs', 'src/**/*.ts')"
+        },
+        "path": {
+          "type": "string",
+          "description": "Directory to search in. Defaults to current directory."
+        }
+      },
+      "required": ["pattern"]
+    }
+  }
+}

@@ -113,11 +113,18 @@ pub async fn run(
                 if let (Ok(msg_id), Ok(idx)) = (msg_id_str.parse::<i32>(), idx_str.parse::<usize>()) {
                     if let Some(Message::Assistant { content, .. }) = history.get_mut(idx) {
                         if let Some(text) = content {
-                            let wrapped = format!(
-                                "<telegram-message from=\"assistant\" to=\"user\" id=\"{}\">{}</telegram-message>",
-                                msg_id, text
-                            );
-                            *text = wrapped;
+                            // Inject id into existing <telegram-message from="assistant"> tag
+                            let tag = "<telegram-message from=\"assistant\" to=\"user\">";
+                            if let Some(pos) = text.find(tag) {
+                                let insert_pos = pos + "<telegram-message from=\"assistant\" to=\"user\"".len();
+                                text.insert_str(insert_pos, &format!(" id=\"{}\"", msg_id));
+                            } else {
+                                // No tag from model — wrap the whole content
+                                *text = format!(
+                                    "<telegram-message from=\"assistant\" to=\"user\" id=\"{}\">{}</telegram-message>",
+                                    msg_id, text
+                                );
+                            }
                             append_to_session(&session_file, &history[idx]);
                             log::debug!("Updated assistant message at index {} with id={}", idx, msg_id);
                         }
@@ -152,66 +159,107 @@ pub async fn run(
             last_prompt_tokens = last_prompt_tokens.saturating_sub(last_prompt_tokens / 10);
         }
 
-        let messages = client.build_messages(&system_prompt, &history, interpreted);
+        // Store user message in history
+        let history_text = if has_attachments {
+            format!("{} [with {} attachment(s)]", text_preview, interpreted.attachments.len())
+        } else {
+            text_preview.clone()
+        };
 
-        let result = client.chat(messages).await;
-        log::info!("LLM responded for: {}", text_preview);
+        let user_msg = Message::User {
+            content: UserContent::Text(history_text),
+        };
+        append_to_session(&session_file, &user_msg);
+        history.push(user_msg);
 
-        let response = match result {
-            Ok(chat_response) => {
-                last_prompt_tokens = chat_response.usage.prompt_tokens;
-                log::debug!(
-                    "Token usage: prompt={}, completion={}, total={}, cached={}",
-                    chat_response.usage.prompt_tokens,
-                    chat_response.usage.completion_tokens,
-                    chat_response.usage.total_tokens,
-                    chat_response.usage.cached_tokens,
-                );
+        // Tool use loop: call LLM, execute tools, repeat until finish_reason="stop"
+        let tools = crate::tool::load_tool_definitions(&crate::tool::tools_dir());
+        let mut collected_text = String::new();
 
-                let response_text = chat_response
-                    .choices
-                    .first()
-                    .map(|c| c.message.content_text())
-                    .filter(|t| !t.is_empty())
-                    .map(|t| t.to_owned())
-                    .unwrap_or_else(|| "(empty response)".into());
+        loop {
+            let messages = client.build_messages_from_history(&system_prompt, &history);
 
-                // Store text-only in history (no base64 data — too large)
-                let history_text = if has_attachments {
-                    format!("{} [with {} attachment(s)]", text_preview, interpreted.attachments.len())
-                } else {
-                    text_preview.clone()
-                };
+            let result = client.chat(messages, Some(tools.clone())).await;
 
-                let user_msg = Message::User {
-                    content: UserContent::Text(history_text),
-                };
-                let asst_msg = Message::Assistant {
-                    content: Some(response_text.clone()),
-                    tool_calls: None,
-                    partial: None,
-                };
+            match result {
+                Ok(chat_response) => {
+                    last_prompt_tokens = chat_response.usage.prompt_tokens;
+                    log::debug!(
+                        "Token usage: prompt={}, completion={}, total={}, cached={}",
+                        chat_response.usage.prompt_tokens,
+                        chat_response.usage.completion_tokens,
+                        chat_response.usage.total_tokens,
+                        chat_response.usage.cached_tokens,
+                    );
 
-                append_to_session(&session_file, &user_msg);
-                // Assistant message persisted later when __update_assistant_id arrives with Telegram ID
+                    let choice = match chat_response.choices.first() {
+                        Some(c) => c,
+                        None => {
+                            collected_text.push_str("(empty response)");
+                            break;
+                        }
+                    };
 
-                history.push(user_msg);
-                history.push(asst_msg);
+                    // Keep only the latest text (final response replaces intermediate)
+                    let text = choice.message.content_text();
+                    if !text.is_empty() {
+                        collected_text = text.to_owned();
+                    }
 
-                let asst_index = history.len() - 1;
+                    // Append assistant message to history (preserves reasoning_content + tool_calls)
+                    let asst_msg = choice.message.clone();
+                    let is_final = choice.finish_reason == "stop";
 
-                AgentResponse {
-                    text: response_text,
-                    history_index: asst_index,
+                    // Persist intermediate messages (with tool_calls) immediately.
+                    // Final message deferred until __update_assistant_id arrives with Telegram ID.
+                    if !is_final {
+                        append_to_session(&session_file, &asst_msg);
+                    }
+                    history.push(asst_msg);
+
+                    if is_final {
+                        log::info!("LLM finished for: {}", text_preview);
+                        break;
+                    }
+
+                    // Execute tool calls
+                    if let Some(tool_calls) = choice.message.tool_calls() {
+                        log::info!("Executing {} tool call(s)", tool_calls.len());
+                        for call in tool_calls {
+                            log::info!("Tool call: {}({})", call.function.name, call.function.arguments);
+                            let result = crate::tool::execute_tool(
+                                &call.function.name,
+                                &call.function.arguments,
+                            )
+                            .await;
+
+                            if result.is_error {
+                                log::warn!("Tool error: {}", result.content);
+                            }
+
+                            let tool_msg = Message::Tool {
+                                tool_call_id: call.id.clone(),
+                                content: result.content,
+                            };
+                            append_to_session(&session_file, &tool_msg);
+                            history.push(tool_msg);
+                        }
+                    }
+                    // Loop back for next LLM call with tool results
+                }
+                Err(e) => {
+                    log::error!("LLM call failed: {}", e);
+                    collected_text = format!("Sorry, I encountered an error: {}", e);
+                    break;
                 }
             }
-            Err(e) => {
-                log::error!("LLM call failed: {}", e);
-                AgentResponse {
-                    text: format!("Sorry, I encountered an error: {}", e),
-                    history_index: 0,
-                }
-            }
+        }
+
+        let asst_index = history.len() - 1;
+
+        let response = AgentResponse {
+            text: collected_text,
+            history_index: asst_index,
         };
 
         if let Some(reply_tx) = msg.reply_tx {
@@ -240,11 +288,11 @@ mod tests {
     fn test_eviction_removes_oldest_pairs() {
         let mut history = vec![
             Message::User { content: UserContent::Text("old1".into()) },
-            Message::Assistant { content: Some("reply1".into()), tool_calls: None, partial: None },
+            Message::Assistant { content: Some("reply1".into()), reasoning_content: None, tool_calls: None, partial: None },
             Message::User { content: UserContent::Text("old2".into()) },
-            Message::Assistant { content: Some("reply2".into()), tool_calls: None, partial: None },
+            Message::Assistant { content: Some("reply2".into()), reasoning_content: None, tool_calls: None, partial: None },
             Message::User { content: UserContent::Text("recent".into()) },
-            Message::Assistant { content: Some("reply3".into()), tool_calls: None, partial: None },
+            Message::Assistant { content: Some("reply3".into()), reasoning_content: None, tool_calls: None, partial: None },
         ];
 
         assert!(evict_oldest_pair(&mut history));
@@ -258,7 +306,7 @@ mod tests {
     fn test_no_eviction_under_threshold() {
         let history = vec![
             Message::User { content: UserContent::Text("hello".into()) },
-            Message::Assistant { content: Some("hi".into()), tool_calls: None, partial: None },
+            Message::Assistant { content: Some("hi".into()), reasoning_content: None, tool_calls: None, partial: None },
         ];
 
         let last_prompt_tokens: usize = 100;

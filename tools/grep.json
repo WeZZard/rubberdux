@@ -1,0 +1,29 @@
+{
+  "type": "function",
+  "function": {
+    "name": "grep",
+    "description": "Search for a regex pattern in file contents. Uses ripgrep (rg) if available, falls back to grep.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "description": "Regular expression pattern to search for"
+        },
+        "path": {
+          "type": "string",
+          "description": "File or directory to search in. Defaults to current directory."
+        },
+        "glob": {
+          "type": "string",
+          "description": "File pattern filter (e.g. '*.rs', '*.py')"
+        },
+        "include_line_numbers": {
+          "type": "boolean",
+          "description": "Include line numbers in output. Defaults to true."
+        }
+      },
+      "required": ["pattern"]
+    }
+  }
+}

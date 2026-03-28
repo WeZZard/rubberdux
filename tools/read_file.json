@@ -1,0 +1,25 @@
+{
+  "type": "function",
+  "function": {
+    "name": "read_file",
+    "description": "Read the contents of a file. Returns content with line numbers. Use offset and limit for large files.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "Absolute path to the file to read"
+        },
+        "offset": {
+          "type": "number",
+          "description": "Line number to start reading from (1-indexed). Optional."
+        },
+        "limit": {
+          "type": "number",
+          "description": "Maximum number of lines to read. Defaults to 2000."
+        }
+      },
+      "required": ["file_path"]
+    }
+  }
+}

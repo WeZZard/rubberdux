@@ -1,0 +1,25 @@
+{
+  "type": "function",
+  "function": {
+    "name": "bash",
+    "description": "Execute a bash command. Set run_in_background=true for long-running commands (network requests, builds, heavy computation). When run_in_background is true, the result contains a task ID and output file path. Check the output file later with read_file. Do NOT immediately check background task outputs — let the user continue the conversation.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "The bash command to execute"
+        },
+        "run_in_background": {
+          "type": "boolean",
+          "description": "Set to true for long-running commands (network requests, builds, recursive searches). Defaults to false."
+        },
+        "timeout": {
+          "type": "number",
+          "description": "Timeout in milliseconds. Defaults to 120000 (2 minutes)."
+        }
+      },
+      "required": ["command"]
+    }
+  }
+}

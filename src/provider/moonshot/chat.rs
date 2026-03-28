@@ -52,13 +52,17 @@ pub struct Usage {
 }
 
 impl MoonshotClient {
-    pub async fn chat(&self, messages: Vec<Message>) -> Result<ChatResponse, crate::error::Error> {
+    pub async fn chat(
+        &self,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Result<ChatResponse, crate::error::Error> {
         let request = ChatRequest {
             model: self.model().to_owned(),
             messages,
             temperature: None,
             max_completion_tokens: None,
-            tools: None,
+            tools,
             response_format: None,
             thinking: None,
         };

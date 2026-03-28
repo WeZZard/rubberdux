@@ -1,0 +1,25 @@
+{
+  "type": "function",
+  "function": {
+    "name": "edit_file",
+    "description": "Edit a file by replacing an exact string match. The old_string must match exactly (including whitespace and indentation).",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "Absolute path to the file to edit"
+        },
+        "old_string": {
+          "type": "string",
+          "description": "Exact text to find and replace. Must be unique in the file."
+        },
+        "new_string": {
+          "type": "string",
+          "description": "Text to replace old_string with"
+        }
+      },
+      "required": ["file_path", "old_string", "new_string"]
+    }
+  }
+}

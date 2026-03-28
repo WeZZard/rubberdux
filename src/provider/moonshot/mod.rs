@@ -21,6 +21,8 @@ pub enum Message {
     Assistant {
         content: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<ToolCall>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         partial: Option<bool>,
@@ -74,6 +76,13 @@ impl Message {
             },
             Message::Assistant { content, .. } => content.as_deref().unwrap_or(""),
             Message::Tool { content, .. } => content,
+        }
+    }
+
+    pub fn tool_calls(&self) -> Option<&Vec<ToolCall>> {
+        match self {
+            Message::Assistant { tool_calls, .. } => tool_calls.as_ref(),
+            _ => None,
         }
     }
 
@@ -165,6 +174,21 @@ impl MoonshotClient {
         msgs
     }
 
+    /// Builds messages from history only (no new user input). Used in the tool use loop
+    /// where user input is already in history.
+    pub fn build_messages_from_history(
+        &self,
+        system_prompt: &str,
+        history: &[Message],
+    ) -> Vec<Message> {
+        let mut msgs = Vec::with_capacity(history.len() + 1);
+        msgs.push(Message::System {
+            content: system_prompt.to_owned(),
+        });
+        msgs.extend_from_slice(history);
+        msgs
+    }
+
     pub(crate) fn http(&self) -> &reqwest::Client {
         &self.http
     }
@@ -200,6 +224,7 @@ mod tests {
 
         let asst = Message::Assistant {
             content: Some("Hi!".into()),
+            reasoning_content: None,
             tool_calls: None,
             partial: None,
         };
@@ -283,6 +308,7 @@ mod tests {
             },
             Message::Assistant {
                 content: Some("Reply".into()),
+                reasoning_content: None,
                 tool_calls: None,
                 partial: None,
             },

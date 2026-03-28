@@ -4,6 +4,7 @@ mod error;
 mod markdown;
 mod prompt;
 mod provider;
+mod tool;
 
 use teloxide::prelude::*;
 
