@@ -3,8 +3,14 @@ pub enum Error {
     #[error("telegram error: {0}")]
     Telegram(#[from] teloxide::RequestError),
 
-    #[error("openai error: {0}")]
-    OpenAI(#[from] async_openai::error::OpenAIError),
+    #[error("provider HTTP error: {0}")]
+    ProviderHttp(#[from] reqwest::Error),
+
+    #[error("provider API error (status {status}): {body}")]
+    ProviderApi { status: u16, body: String },
+
+    #[error("provider error: {0}")]
+    Provider(String),
 
     #[error("prompt load error: {0}")]
     PromptLoad(#[from] std::io::Error),

@@ -3,6 +3,7 @@ mod channel;
 mod error;
 mod markdown;
 mod prompt;
+mod provider;
 
 use teloxide::prelude::*;
 
@@ -22,9 +23,12 @@ async fn main() {
 
     log::info!("Loaded system prompt from {:?}", prompt_dir);
 
+    let client = provider::moonshot::MoonshotClient::from_env();
+    log::info!("Moonshot client initialized (model: {})", client.model());
+
     let (tx, rx) = tokio::sync::mpsc::channel(32);
 
-    tokio::spawn(agent::runtime::chat::run(rx, system_prompt));
+    tokio::spawn(agent::runtime::chat::run(rx, client, system_prompt));
 
     let bot_token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_else(|_| {
         log::error!("TELEGRAM_BOT_TOKEN is not set");
