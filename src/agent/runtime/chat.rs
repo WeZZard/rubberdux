@@ -113,18 +113,7 @@ pub async fn run(
                 if let (Ok(msg_id), Ok(idx)) = (msg_id_str.parse::<i32>(), idx_str.parse::<usize>()) {
                     if let Some(Message::Assistant { content, .. }) = history.get_mut(idx) {
                         if let Some(text) = content {
-                            // Inject id into existing <telegram-message from="assistant"> tag
-                            let tag = "<telegram-message from=\"assistant\" to=\"user\">";
-                            if let Some(pos) = text.find(tag) {
-                                let insert_pos = pos + "<telegram-message from=\"assistant\" to=\"user\"".len();
-                                text.insert_str(insert_pos, &format!(" id=\"{}\"", msg_id));
-                            } else {
-                                // No tag from model — wrap the whole content
-                                *text = format!(
-                                    "<telegram-message from=\"assistant\" to=\"user\" id=\"{}\">{}</telegram-message>",
-                                    msg_id, text
-                                );
-                            }
+                            inject_assistant_message_id(text, msg_id);
                             append_to_session(&session_file, &history[idx]);
                             log::debug!("Updated assistant message at index {} with id={}", idx, msg_id);
                         }
@@ -270,6 +259,23 @@ pub async fn run(
     log::info!("Agent loop shutting down");
 }
 
+/// Injects a Telegram message ID into an assistant message's content.
+/// If the content already has a `<telegram-message from="assistant" to="user">` tag,
+/// the `id` attribute is inserted into the existing tag.
+/// Otherwise, the content is wrapped in a new tag.
+pub fn inject_assistant_message_id(text: &mut String, msg_id: i32) {
+    let tag = "<telegram-message from=\"assistant\" to=\"user\">";
+    if let Some(pos) = text.find(tag) {
+        let insert_pos = pos + "<telegram-message from=\"assistant\" to=\"user\"".len();
+        text.insert_str(insert_pos, &format!(" id=\"{}\"", msg_id));
+    } else {
+        *text = format!(
+            "<telegram-message from=\"assistant\" to=\"user\" id=\"{}\">{}</telegram-message>",
+            msg_id, text
+        );
+    }
+}
+
 fn evict_oldest_pair(history: &mut Vec<Message>) -> bool {
     if history.len() >= 2 {
         history.remove(0);
@@ -314,6 +320,85 @@ mod tests {
         let best_perf_tokens: usize = 153_600;
 
         assert!(last_prompt_tokens + estimated_new <= best_perf_tokens);
+        assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn test_inject_id_into_existing_telegram_tag() {
+        // Model already wrapped its response in <telegram-message> tags
+        let mut text = "<telegram-message from=\"assistant\" to=\"user\">Hello!</telegram-message>".to_owned();
+        inject_assistant_message_id(&mut text, 73);
+
+        assert_eq!(
+            text,
+            "<telegram-message from=\"assistant\" to=\"user\" id=\"73\">Hello!</telegram-message>"
+        );
+        // Must NOT create nested tags
+        assert_eq!(text.matches("<telegram-message").count(), 1);
+        assert_eq!(text.matches("</telegram-message>").count(), 1);
+    }
+
+    #[test]
+    fn test_inject_id_wraps_plain_text() {
+        // Model responded with plain text (no telegram-message tag)
+        let mut text = "Hello!".to_owned();
+        inject_assistant_message_id(&mut text, 73);
+
+        assert_eq!(
+            text,
+            "<telegram-message from=\"assistant\" to=\"user\" id=\"73\">Hello!</telegram-message>"
+        );
+    }
+
+    #[test]
+    fn test_inject_id_does_not_double_nest() {
+        // Simulate what happened before the fix: model wraps, then we wrap again
+        let mut text = "<telegram-message from=\"assistant\" to=\"user\">Some content</telegram-message>".to_owned();
+        inject_assistant_message_id(&mut text, 42);
+
+        // Should have exactly one opening and one closing tag
+        assert_eq!(text.matches("<telegram-message").count(), 1);
+        assert_eq!(text.matches("</telegram-message>").count(), 1);
+        // Should contain the id
+        assert!(text.contains("id=\"42\""));
+    }
+
+    #[test]
+    fn test_inject_id_preserves_content_with_inner_tags() {
+        // Model response that contains other XML-like content inside
+        let mut text = "<telegram-message from=\"assistant\" to=\"user\">Here is a <b>bold</b> word</telegram-message>".to_owned();
+        inject_assistant_message_id(&mut text, 99);
+
+        assert!(text.contains("id=\"99\""));
+        assert!(text.contains("<b>bold</b>"));
+        assert_eq!(text.matches("<telegram-message").count(), 1);
+    }
+
+    #[test]
+    fn test_inject_id_into_history_modifies_in_place() {
+        // Simulate the full flow: history has an assistant message, we inject the ID
+        let mut history = vec![
+            Message::User { content: UserContent::Text("Hello".into()) },
+            Message::Assistant {
+                content: Some("<telegram-message from=\"assistant\" to=\"user\">Hi there!</telegram-message>".into()),
+                reasoning_content: None,
+                tool_calls: None,
+                partial: None,
+            },
+        ];
+
+        // Simulate __update_assistant_id for index 1, msg_id 55
+        if let Some(Message::Assistant { content, .. }) = history.get_mut(1) {
+            if let Some(text) = content {
+                inject_assistant_message_id(text, 55);
+            }
+        }
+
+        let asst_content = history[1].content_text();
+        assert!(asst_content.contains("id=\"55\""));
+        assert_eq!(asst_content.matches("<telegram-message").count(), 1);
+
+        // History length unchanged — modified in place, not appended
         assert_eq!(history.len(), 2);
     }
 }
