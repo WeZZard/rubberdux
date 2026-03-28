@@ -160,7 +160,7 @@ fn parse_whisper_json(json_str: &str) -> Result<String, String> {
             // Parse timestamp: "00:00:01,220" → seconds as f64
             let from_ts = token["timestamps"]["from"]
                 .as_str()
-                .and_then(|s| parse_timestamp(s));
+                .and_then(parse_timestamp);
 
             match from_ts {
                 Some(t) => result.push_str(&format!("<w t=\"{:.2}\">{}</w>\n", t, trimmed)),

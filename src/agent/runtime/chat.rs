@@ -28,12 +28,22 @@ pub async fn run(
         let interpreted = &msg.interpreted;
         let text_preview = &interpreted.text;
         let has_attachments = !interpreted.attachments.is_empty();
+        let is_silent = msg.reply_tx.is_none();
 
         log::info!(
-            "Processing message: {} (attachments: {})",
+            "Processing message: {} (attachments: {}, silent: {})",
             text_preview,
-            interpreted.attachments.len()
+            interpreted.attachments.len(),
+            is_silent
         );
+
+        // Silent messages (e.g. reactions) — append to history, don't call LLM
+        if is_silent {
+            history.push(Message::User {
+                content: UserContent::Text(text_preview.clone()),
+            });
+            continue;
+        }
 
         // Evict oldest pairs if approaching the best performance threshold
         let estimated_new = text_preview.len() / 4;
@@ -102,7 +112,9 @@ pub async fn run(
             }
         };
 
-        let _ = msg.reply_tx.send(response);
+        if let Some(reply_tx) = msg.reply_tx {
+            let _ = reply_tx.send(response);
+        }
     }
 
     log::info!("Agent loop shutting down");

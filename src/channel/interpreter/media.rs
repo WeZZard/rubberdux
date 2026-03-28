@@ -116,8 +116,8 @@ pub async fn interpret_document(
         .unwrap_or("unknown");
 
     // For image/video documents, treat as media
-    if mime.starts_with("image/") {
-        if let Some(data) = download_file(bot, &document.file.id).await {
+    if mime.starts_with("image/")
+        && let Some(data) = download_file(bot, &document.file.id).await {
             let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
             return InterpretedMessage {
                 text: caption.unwrap_or("").to_owned(),
@@ -127,10 +127,9 @@ pub async fn interpret_document(
                 }],
             };
         }
-    }
 
-    if mime.starts_with("video/") {
-        if let Some(data) = download_file(bot, &document.file.id).await {
+    if mime.starts_with("video/")
+        && let Some(data) = download_file(bot, &document.file.id).await {
             let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
             return InterpretedMessage {
                 text: caption.unwrap_or("").to_owned(),
@@ -140,7 +139,6 @@ pub async fn interpret_document(
                 }],
             };
         }
-    }
 
     // For other documents, note the filename
     let caption_text = caption.unwrap_or("");

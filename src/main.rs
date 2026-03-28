@@ -16,12 +16,12 @@ async fn main() {
     log::info!("Starting rubberdux...");
 
     let prompt_dir = prompt::prompt_dir();
-    let system_prompt = prompt::load_system_prompt(&prompt_dir).unwrap_or_else(|e| {
-        log::error!("Failed to load system prompt from {:?}: {}", prompt_dir, e);
-        std::process::exit(1);
-    });
+    let prompt_parts = prompt::load_prompt_parts(&prompt_dir);
 
-    log::info!("Loaded system prompt from {:?}", prompt_dir);
+    let channel_partial = channel::adapter::telegram::channel_prompt();
+    let system_prompt = prompt::compose_system_prompt(&prompt_parts, Some(channel_partial));
+
+    log::info!("Composed system prompt ({} chars)", system_prompt.len());
 
     let client = provider::moonshot::MoonshotClient::from_env();
     log::info!("Moonshot client initialized (model: {})", client.model());

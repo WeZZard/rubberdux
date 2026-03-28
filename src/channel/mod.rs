@@ -5,7 +5,7 @@ use interpreter::InterpretedMessage;
 
 pub struct UserMessage {
     pub interpreted: InterpretedMessage,
-    pub reply_tx: tokio::sync::oneshot::Sender<AgentResponse>,
+    pub reply_tx: Option<tokio::sync::oneshot::Sender<AgentResponse>>,
 }
 
 pub struct AgentResponse {
