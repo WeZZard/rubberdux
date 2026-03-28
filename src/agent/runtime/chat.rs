@@ -163,7 +163,7 @@ pub async fn run(
 
         // Tool use loop: call LLM, execute tools, repeat until finish_reason="stop"
         let tools = crate::tool::load_tool_definitions(&crate::tool::tools_dir());
-        let mut collected_text = String::new();
+        let reply_tx = msg.reply_tx;
 
         loop {
             let messages = client.build_messages_from_history(&system_prompt, &history);
@@ -184,27 +184,48 @@ pub async fn run(
                     let choice = match chat_response.choices.first() {
                         Some(c) => c,
                         None => {
-                            collected_text.push_str("(empty response)");
+                            if let Some(tx) = &reply_tx {
+                                let _ = tx.send(AgentResponse {
+                                    text: "(empty response)".into(),
+                                    history_index: history.len().saturating_sub(1),
+                                    is_final: true,
+                                }).await;
+                            }
                             break;
                         }
                     };
 
-                    // Keep only the latest text (final response replaces intermediate)
-                    let text = choice.message.content_text();
-                    if !text.is_empty() {
-                        collected_text = text.to_owned();
-                    }
-
-                    // Append assistant message to history (preserves reasoning_content + tool_calls)
-                    let asst_msg = choice.message.clone();
                     let is_final = choice.finish_reason == "stop";
+                    let text = choice.message.content_text().to_owned();
 
-                    // Persist intermediate messages (with tool_calls) immediately.
-                    // Final message deferred until __update_assistant_id arrives with Telegram ID.
+                    // Append assistant message to history
+                    let asst_msg = choice.message.clone();
                     if !is_final {
                         append_to_session(&session_file, &asst_msg);
                     }
                     history.push(asst_msg);
+
+                    let asst_index = history.len() - 1;
+
+                    // Send text to channel immediately (intermediate or final)
+                    if !text.is_empty() {
+                        if let Some(tx) = &reply_tx {
+                            let _ = tx.send(AgentResponse {
+                                text: text.clone(),
+                                history_index: asst_index,
+                                is_final,
+                            }).await;
+                        }
+                    } else if is_final {
+                        // Final response with no text — still signal completion
+                        if let Some(tx) = &reply_tx {
+                            let _ = tx.send(AgentResponse {
+                                text: String::new(),
+                                history_index: asst_index,
+                                is_final: true,
+                            }).await;
+                        }
+                    }
 
                     if is_final {
                         log::info!("LLM finished for: {}", text_preview);
@@ -234,25 +255,19 @@ pub async fn run(
                             history.push(tool_msg);
                         }
                     }
-                    // Loop back for next LLM call with tool results
                 }
                 Err(e) => {
                     log::error!("LLM call failed: {}", e);
-                    collected_text = format!("Sorry, I encountered an error: {}", e);
+                    if let Some(tx) = &reply_tx {
+                        let _ = tx.send(AgentResponse {
+                            text: format!("Sorry, I encountered an error: {}", e),
+                            history_index: history.len().saturating_sub(1),
+                            is_final: true,
+                        }).await;
+                    }
                     break;
                 }
             }
-        }
-
-        let asst_index = history.len() - 1;
-
-        let response = AgentResponse {
-            text: collected_text,
-            history_index: asst_index,
-        };
-
-        if let Some(reply_tx) = msg.reply_tx {
-            let _ = reply_tx.send(response);
         }
     }
 

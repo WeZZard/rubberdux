@@ -76,7 +76,7 @@ async fn handle_message(
         interpreted.attachments.len()
     );
 
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentResponse>();
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<AgentResponse>(16);
 
     let user_message = UserMessage {
         interpreted,
@@ -94,79 +94,81 @@ async fn handle_message(
         .send_chat_action(msg.chat.id, teloxide::types::ChatAction::Typing)
         .await;
 
-    match reply_rx.await {
-        Ok(response) => {
-            // Parse structured model output
-            let reply_text = extract_reply(&response.text);
-            let reactions = extract_reactions(&response.text);
+    while let Some(response) = reply_rx.recv().await {
+        // Parse structured model output
+        let reply_text = extract_reply(&response.text);
+        let reactions = extract_reactions(&response.text);
 
-            // Send reactions
-            for (emoji, message_id) in &reactions {
-                let reaction = ReactionType::Emoji {
-                    emoji: emoji.clone(),
-                };
-                let result = bot
-                    .set_message_reaction(
-                        Recipient::Id(msg.chat.id),
-                        teloxide::types::MessageId(*message_id),
-                    )
-                    .reaction(vec![reaction])
-                    .await;
+        // Send reactions
+        for (emoji, message_id) in &reactions {
+            let reaction = ReactionType::Emoji {
+                emoji: emoji.clone(),
+            };
+            let result = bot
+                .set_message_reaction(
+                    Recipient::Id(msg.chat.id),
+                    teloxide::types::MessageId(*message_id),
+                )
+                .reaction(vec![reaction])
+                .await;
 
-                if let Err(e) = result {
-                    log::warn!("Failed to set reaction: {}", e);
-                }
+            if let Err(e) = result {
+                log::warn!("Failed to set reaction: {}", e);
             }
+        }
 
-            // Send reply message and capture sent message ID
-            let reply_to_send = if let Some(text) = reply_text {
-                Some(text)
-            } else if reactions.is_empty() {
-                Some(response.text.clone())
-            } else {
-                None
+        // Send reply message and capture sent message ID
+        let reply_to_send = if let Some(text) = reply_text {
+            Some(text)
+        } else if reactions.is_empty() {
+            Some(response.text.clone())
+        } else {
+            None
+        };
+
+        if let Some(text) = reply_to_send {
+            let formatted = crate::markdown::telegram::format(&text);
+            log::debug!("Raw model reply:\n{}", text);
+            log::debug!("Formatted for Telegram:\n{}", formatted);
+
+            let sent_msg = bot
+                .send_message(msg.chat.id, &formatted)
+                .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                .await;
+
+            let sent_msg = match sent_msg {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    log::warn!("MarkdownV2 send failed ({}), retrying without parse_mode", e);
+                    bot.send_message(msg.chat.id, &text).await.ok()
+                }
             };
 
-            if let Some(text) = reply_to_send {
-                let formatted = crate::markdown::telegram::format(&text);
-                log::debug!("Raw model reply:\n{}", text);
-                log::debug!("Formatted for Telegram:\n{}", formatted);
-
-                let sent_msg = bot
-                    .send_message(msg.chat.id, &formatted)
-                    .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-                    .await;
-
-                let sent_msg = match sent_msg {
-                    Ok(m) => Some(m),
-                    Err(e) => {
-                        log::warn!("MarkdownV2 send failed ({}), retrying without parse_mode", e);
-                        bot.send_message(msg.chat.id, &text).await.ok()
-                    }
+            // Report bot-sent message ID back to agent loop
+            if let Some(sent) = sent_msg {
+                let update_text = format!(
+                    "__update_assistant_id:{}:{}",
+                    sent.id.0, response.history_index
+                );
+                let update_msg = UserMessage {
+                    interpreted: crate::channel::interpreter::InterpretedMessage {
+                        text: update_text,
+                        attachments: vec![],
+                    },
+                    reply_tx: None,
                 };
-
-                // Report bot-sent message ID back to agent loop
-                if let Some(sent) = sent_msg {
-                    let update_text = format!(
-                        "__update_assistant_id:{}:{}",
-                        sent.id.0, response.history_index
-                    );
-                    let update_msg = UserMessage {
-                        interpreted: crate::channel::interpreter::InterpretedMessage {
-                            text: update_text,
-                            attachments: vec![],
-                        },
-                        reply_tx: None,
-                    };
-                    let _ = tx.send(update_msg).await;
-                }
+                let _ = tx.send(update_msg).await;
             }
         }
-        Err(_) => {
-            log::error!("Agent dropped the reply channel");
-            bot.send_message(msg.chat.id, "Sorry, failed to get a response.")
-                .await?;
+
+        if response.is_final {
+            break;
         }
+
+        // Show typing indicator between intermediate messages
+        let _ = bot
+            .send_chat_action(msg.chat.id, teloxide::types::ChatAction::Typing)
+            .await;
     }
 
     Ok(())
