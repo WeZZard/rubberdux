@@ -2,6 +2,7 @@ use teloxide::prelude::*;
 use teloxide::types::{MessageReactionUpdated, ReactionType, Recipient};
 use tokio::sync::mpsc;
 
+use super::markup::{self, Document, MessageElement, Node};
 use super::parser::{self, Segment};
 use crate::channel::interpreter;
 use crate::channel::{AgentResponse, UserMessage};
@@ -73,7 +74,7 @@ async fn handle_message(
                 }
                 Segment::TelegramMessage { content } => {
                     has_reply = true;
-                    let formatted = crate::markdown::telegram::format(content);
+                    let formatted = super::markdown::format(content);
                     log::debug!("Raw model reply:\n{}", content);
                     log::debug!("Formatted for Telegram:\n{}", formatted);
 
@@ -117,7 +118,7 @@ async fn handle_message(
         // Fallback: if no telegram-message tags found, send raw text
         if !has_reply && segments.iter().all(|s| !matches!(s, Segment::TelegramReaction { .. })) {
             if !response.text.is_empty() {
-                let formatted = crate::markdown::telegram::format(&response.text);
+                let formatted = super::markdown::format(&response.text);
                 log::debug!("Raw LLM response (no tags):\n{}", response.text);
 
                 let sent_msg = bot
@@ -181,4 +182,128 @@ pub async fn run(bot: Bot, tx: mpsc::Sender<UserMessage>) {
         .build()
         .dispatch()
         .await;
+}
+
+/// Injects a Telegram message ID into an assistant message's content.
+/// If the content already has a `<telegram-message from="assistant" to="user">` tag,
+/// the `id` attribute is inserted into the existing tag.
+/// Otherwise, the content is wrapped in a new tag.
+pub fn inject_assistant_message_id(text: &mut String, msg_id: i32) {
+    let mut doc = markup::parse(text);
+
+    let mut found = false;
+    for node in &mut doc.nodes {
+        if let Node::Message(el) = node
+            && el.from == "assistant" && el.to == "user"
+        {
+            if el.id.is_some() {
+                return; // Already has id — idempotent
+            }
+            el.id = Some(msg_id.to_string());
+            found = true;
+            break;
+        }
+    }
+
+    if found {
+        *text = markup::serialize(&doc);
+    } else {
+        // No matching tag — wrap entire content
+        let wrapped = Document {
+            nodes: vec![Node::Message(MessageElement {
+                from: "assistant".into(),
+                to: "user".into(),
+                id: Some(msg_id.to_string()),
+                date: None,
+                content: text.clone(),
+            })],
+        };
+        *text = markup::serialize(&wrapped);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::moonshot::{Message, UserContent};
+
+    #[test]
+    fn test_inject_id_into_existing_telegram_tag() {
+        let mut text = "<telegram-message from=\"assistant\" to=\"user\">Hello!</telegram-message>".to_owned();
+        inject_assistant_message_id(&mut text, 73);
+
+        assert_eq!(
+            text,
+            "<telegram-message from=\"assistant\" to=\"user\" id=\"73\">Hello!</telegram-message>"
+        );
+        assert_eq!(text.matches("<telegram-message").count(), 1);
+        assert_eq!(text.matches("</telegram-message>").count(), 1);
+    }
+
+    #[test]
+    fn test_inject_id_wraps_plain_text() {
+        let mut text = "Hello!".to_owned();
+        inject_assistant_message_id(&mut text, 73);
+
+        assert_eq!(
+            text,
+            "<telegram-message from=\"assistant\" to=\"user\" id=\"73\">Hello!</telegram-message>"
+        );
+    }
+
+    #[test]
+    fn test_inject_id_does_not_double_nest() {
+        let mut text = "<telegram-message from=\"assistant\" to=\"user\">Some content</telegram-message>".to_owned();
+        inject_assistant_message_id(&mut text, 42);
+
+        assert_eq!(text.matches("<telegram-message").count(), 1);
+        assert_eq!(text.matches("</telegram-message>").count(), 1);
+        assert!(text.contains("id=\"42\""));
+    }
+
+    #[test]
+    fn test_inject_id_idempotent_when_called_twice() {
+        let mut text = "<telegram-message from=\"assistant\" to=\"user\">Hello!</telegram-message>".to_owned();
+        inject_assistant_message_id(&mut text, 106);
+        inject_assistant_message_id(&mut text, 106);
+
+        assert_eq!(text.matches("<telegram-message").count(), 1, "Double injection created nested tags: {}", text);
+        assert_eq!(text.matches("</telegram-message>").count(), 1);
+        assert!(text.contains("id=\"106\""));
+    }
+
+    #[test]
+    fn test_inject_id_preserves_content_with_inner_tags() {
+        let mut text = "<telegram-message from=\"assistant\" to=\"user\">Here is a <b>bold</b> word</telegram-message>".to_owned();
+        inject_assistant_message_id(&mut text, 99);
+
+        assert!(text.contains("id=\"99\""));
+        assert!(text.contains("<b>bold</b>"));
+        assert_eq!(text.matches("<telegram-message").count(), 1);
+    }
+
+    #[test]
+    fn test_inject_id_into_history_modifies_in_place() {
+        let mut history = vec![
+            Message::User { content: UserContent::Text("Hello".into()) },
+            Message::Assistant {
+                content: Some("<telegram-message from=\"assistant\" to=\"user\">Hi there!</telegram-message>".into()),
+                reasoning_content: None,
+                tool_calls: None,
+                partial: None,
+            },
+        ];
+
+        if let Some(Message::Assistant { content, .. }) = history.get_mut(1) {
+            if let Some(text) = content {
+                inject_assistant_message_id(text, 55);
+            }
+        }
+
+        let asst_content = history[1].content_text();
+        assert!(asst_content.contains("id=\"55\""));
+        assert_eq!(asst_content.matches("<telegram-message").count(), 1);
+
+        assert_eq!(history.len(), 2);
+    }
 }

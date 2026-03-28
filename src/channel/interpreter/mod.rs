@@ -4,6 +4,8 @@ pub mod voice;
 
 use teloxide::prelude::*;
 
+use crate::channel::adapter::markup::{self, Document, MessageElement, Node, ReactionElement};
+
 #[derive(Debug, Clone)]
 pub struct InterpretedMessage {
     pub text: String,
@@ -20,11 +22,17 @@ pub enum Attachment {
 fn wrap_telegram_message(msg: &Message, inner: InterpretedMessage) -> InterpretedMessage {
     let id = msg.id.0;
     let date = msg.date.to_string();
+    let doc = Document {
+        nodes: vec![Node::Message(MessageElement {
+            from: "user".into(),
+            to: "assistant".into(),
+            id: Some(id.to_string()),
+            date: Some(date),
+            content: inner.text,
+        })],
+    };
     InterpretedMessage {
-        text: format!(
-            "<telegram-message from=\"user\" to=\"assistant\" id=\"{}\" date=\"{}\">{}</telegram-message>",
-            id, date, inner.text
-        ),
+        text: markup::serialize(&doc),
         attachments: inner.attachments,
     }
 }
@@ -111,11 +119,17 @@ pub fn interpret_reaction(
         let is_new = !reaction.old_reaction.iter().any(|old| old == new_r);
         if is_new
             && let Some(emoji) = new_r.emoji() {
+                let doc = Document {
+                    nodes: vec![Node::Reaction(ReactionElement {
+                        from: "user".into(),
+                        action: "add".into(),
+                        emoji: emoji.to_string(),
+                        message_id: message_id.to_string(),
+                        date: Some(date.clone()),
+                    })],
+                };
                 results.push(InterpretedMessage {
-                    text: format!(
-                        "<telegram-reaction from=\"user\" action=\"add\" emoji=\"{}\" message-id=\"{}\" date=\"{}\" />",
-                        emoji, message_id, date
-                    ),
+                    text: markup::serialize(&doc),
                     attachments: vec![],
                 });
             }
@@ -126,11 +140,17 @@ pub fn interpret_reaction(
         let is_removed = !reaction.new_reaction.iter().any(|new| new == old_r);
         if is_removed
             && let Some(emoji) = old_r.emoji() {
+                let doc = Document {
+                    nodes: vec![Node::Reaction(ReactionElement {
+                        from: "user".into(),
+                        action: "remove".into(),
+                        emoji: emoji.to_string(),
+                        message_id: message_id.to_string(),
+                        date: Some(date.clone()),
+                    })],
+                };
                 results.push(InterpretedMessage {
-                    text: format!(
-                        "<telegram-reaction from=\"user\" action=\"remove\" emoji=\"{}\" message-id=\"{}\" date=\"{}\" />",
-                        emoji, message_id, date
-                    ),
+                    text: markup::serialize(&doc),
                     attachments: vec![],
                 });
             }

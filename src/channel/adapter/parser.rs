@@ -17,91 +17,35 @@ pub enum Segment {
 /// - Content inside ``` or ` code spans is not parsed for tags
 /// - Everything else is Internal
 pub fn parse_model_output(input: &str) -> Vec<Segment> {
+    use super::markup::{self, Node};
+
+    let doc = markup::parse(input);
     let mut segments = Vec::new();
-    let mut pos = 0;
     let mut internal_buf = String::new();
 
-    while pos < input.len() {
-        let remaining = &input[pos..];
-
-        // Check for fenced code block (```)
-        if remaining.starts_with("```") {
-            let start = pos;
-            pos += 3;
-            // Skip to end of line (language identifier)
-            while pos < input.len() && input.as_bytes()[pos] != b'\n' {
-                pos += 1;
+    for node in doc.nodes {
+        match &node {
+            Node::Message(el) if el.from == "assistant" => {
+                flush_internal(&mut internal_buf, &mut segments);
+                segments.push(Segment::TelegramMessage {
+                    content: el.content.clone(),
+                });
             }
-            // Find closing ```
-            loop {
-                if pos >= input.len() {
-                    break;
+            Node::Reaction(el) if el.from == "assistant" => {
+                flush_internal(&mut internal_buf, &mut segments);
+                if let Ok(message_id) = el.message_id.parse::<i32>() {
+                    segments.push(Segment::TelegramReaction {
+                        emoji: el.emoji.clone(),
+                        message_id,
+                    });
+                } else {
+                    internal_buf.push_str(&markup::serialize_node(&node));
                 }
-                if input[pos..].starts_with("```") {
-                    pos += 3;
-                    break;
-                }
-                pos += 1;
             }
-            internal_buf.push_str(&input[start..pos]);
-            continue;
-        }
-
-        // Check for inline code (`)
-        if remaining.starts_with('`') {
-            let start = pos;
-            pos += 1;
-            while pos < input.len() && input.as_bytes()[pos] != b'`' {
-                pos += 1;
-            }
-            if pos < input.len() {
-                pos += 1; // skip closing `
-            }
-            internal_buf.push_str(&input[start..pos]);
-            continue;
-        }
-
-        // Check for <telegram-message from="assistant"
-        if remaining.starts_with("<telegram-message from=\"assistant\"") {
-            flush_internal(&mut internal_buf, &mut segments);
-
-            match parse_telegram_message(remaining) {
-                Some((segment, consumed)) => {
-                    segments.push(segment);
-                    pos += consumed;
-                    continue;
-                }
-                None => {
-                    // Not a valid tag, consume the '<' as literal
-                    internal_buf.push('<');
-                    pos += 1;
-                    continue;
-                }
+            _ => {
+                internal_buf.push_str(&markup::serialize_node(&node));
             }
         }
-
-        // Check for <telegram-reaction from="assistant"
-        if remaining.starts_with("<telegram-reaction from=\"assistant\"") {
-            flush_internal(&mut internal_buf, &mut segments);
-
-            match parse_telegram_reaction(remaining) {
-                Some((segment, consumed)) => {
-                    segments.push(segment);
-                    pos += consumed;
-                    continue;
-                }
-                None => {
-                    internal_buf.push('<');
-                    pos += 1;
-                    continue;
-                }
-            }
-        }
-
-        // Regular character — advance by one UTF-8 character
-        let ch = remaining.chars().next().unwrap();
-        internal_buf.push(ch);
-        pos += ch.len_utf8();
     }
 
     flush_internal(&mut internal_buf, &mut segments);
@@ -114,53 +58,6 @@ fn flush_internal(buf: &mut String, segments: &mut Vec<Segment>) {
         segments.push(Segment::Internal(trimmed.to_owned()));
     }
     buf.clear();
-}
-
-/// Parses `<telegram-message from="assistant" ...>content</telegram-message>`
-/// Returns (Segment, bytes_consumed)
-fn parse_telegram_message(input: &str) -> Option<(Segment, usize)> {
-    // Find closing > of opening tag
-    let tag_close = input.find('>')?;
-    let content_start = tag_close + 1;
-
-    // Find </telegram-message>
-    let end_tag = "</telegram-message>";
-    let end_pos = input[content_start..].find(end_tag)?;
-    let content = &input[content_start..content_start + end_pos];
-    let total_consumed = content_start + end_pos + end_tag.len();
-
-    Some((
-        Segment::TelegramMessage {
-            content: content.to_owned(),
-        },
-        total_consumed,
-    ))
-}
-
-/// Parses `<telegram-reaction from="assistant" ... />`
-/// Returns (Segment, bytes_consumed)
-fn parse_telegram_reaction(input: &str) -> Option<(Segment, usize)> {
-    // Find closing />
-    let end = input.find("/>")?;
-    let tag_content = &input[..end + 2];
-
-    let emoji = extract_attr_value(tag_content, "emoji")?;
-    let message_id: i32 = extract_attr_value(tag_content, "message-id")?
-        .parse()
-        .ok()?;
-
-    Some((
-        Segment::TelegramReaction { emoji, message_id },
-        end + 2,
-    ))
-}
-
-fn extract_attr_value(tag: &str, name: &str) -> Option<String> {
-    let pattern = format!("{}=\"", name);
-    let start = tag.find(&pattern)?;
-    let value_start = start + pattern.len();
-    let end = tag[value_start..].find('"')?;
-    Some(tag[value_start..value_start + end].to_owned())
 }
 
 #[cfg(test)]

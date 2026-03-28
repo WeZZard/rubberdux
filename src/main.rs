@@ -1,7 +1,6 @@
 mod agent;
 mod channel;
 mod error;
-mod markdown;
 mod prompt;
 mod provider;
 mod tool;

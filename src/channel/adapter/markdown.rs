@@ -201,7 +201,6 @@ mod tests {
         let input = "```json\n{\n  \"name\": \"test\",\n  \"value\": 42\n}\n```\n";
         let result = format(input);
         println!("CODE BLOCK RESULT (repr):\n{:?}", result);
-        // Indentation must be preserved inside code blocks
         assert!(result.contains("  \"name\""), "Indentation should be preserved in code blocks");
     }
 
