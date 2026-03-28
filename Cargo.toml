@@ -19,6 +19,8 @@ dotenvy = "0.15"
 pulldown-cmark = "0.13"
 telegram-markdown-v2 = "0.2"
 base64 = "0.22"
+htmd = "0.1"
+headless_chrome = "1"
 tempfile = "3"
 
 [dev-dependencies]

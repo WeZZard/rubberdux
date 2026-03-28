@@ -3,6 +3,7 @@ pub mod edit;
 pub mod glob;
 pub mod grep;
 pub mod read;
+pub mod web_fetch;
 pub mod write;
 
 use std::path::{Path, PathBuf};
@@ -93,6 +94,7 @@ pub async fn execute_tool(name: &str, arguments: &str) -> ToolResult {
         "edit_file" => edit::execute(&args).await,
         "glob" => glob::execute(&args).await,
         "grep" => grep::execute(&args).await,
+        "web_fetch" => web_fetch::execute(&args).await,
         _ => ToolResult {
             content: format!("Unknown tool: {}", name),
             is_error: true,
@@ -107,7 +109,7 @@ mod tests {
     #[test]
     fn test_load_tool_definitions() {
         let defs = load_tool_definitions(Path::new("./tools"));
-        assert_eq!(defs.len(), 7); // 6 local + 1 builtin ($web_search)
+        assert_eq!(defs.len(), 8); // 7 local + 1 builtin ($web_search)
     }
 
     #[tokio::test]
