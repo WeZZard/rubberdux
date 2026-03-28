@@ -193,7 +193,7 @@ pub async fn run(
                 };
 
                 append_to_session(&session_file, &user_msg);
-                append_to_session(&session_file, &asst_msg);
+                // Assistant message persisted later when __update_assistant_id arrives with Telegram ID
 
                 history.push(user_msg);
                 history.push(asst_msg);
