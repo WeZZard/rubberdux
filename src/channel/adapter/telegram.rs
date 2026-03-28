@@ -2,6 +2,7 @@ use teloxide::prelude::*;
 use teloxide::types::{MessageReactionUpdated, ReactionType, Recipient};
 use tokio::sync::mpsc;
 
+use super::parser::{self, Segment};
 use crate::channel::interpreter;
 use crate::channel::{AgentResponse, UserMessage};
 
@@ -10,57 +11,6 @@ const TELEGRAM_PROMPT: &str = include_str!("telegram_prompt.md");
 /// Returns the Telegram channel prompt partial for system prompt composition.
 pub fn channel_prompt() -> &'static str {
     TELEGRAM_PROMPT
-}
-
-/// Parses model output for `<telegram-message from="assistant" to="user"...>` tags.
-/// Returns the content to send as a Telegram message.
-/// Handles tags with or without an `id` attribute.
-fn extract_reply(text: &str) -> Option<String> {
-    let tag_prefix = "<telegram-message from=\"assistant\" to=\"user\"";
-    let end_tag = "</telegram-message>";
-
-    let start = text.find(tag_prefix)?;
-    // Find the closing `>` of the opening tag (may have attributes like id="...")
-    let tag_close = text[start..].find('>')?;
-    let content_start = start + tag_close + 1;
-    let end = text[content_start..].find(end_tag)?;
-    Some(text[content_start..content_start + end].to_owned())
-}
-
-/// Parses model output for `<telegram-reaction from="assistant"` tags.
-/// Returns (emoji, message_id) pairs.
-fn extract_reactions(text: &str) -> Vec<(String, i32)> {
-    let mut reactions = Vec::new();
-    let tag_prefix = "<telegram-reaction from=\"assistant\"";
-
-    let mut search_from = 0;
-    while let Some(start) = text[search_from..].find(tag_prefix) {
-        let tag_start = search_from + start;
-        if let Some(tag_end) = text[tag_start..].find("/>") {
-            let tag = &text[tag_start..tag_start + tag_end + 2];
-
-            let emoji = extract_attr(tag, "emoji");
-            let message_id = extract_attr(tag, "message-id")
-                .and_then(|s| s.parse::<i32>().ok());
-
-            if let (Some(emoji), Some(mid)) = (emoji, message_id) {
-                reactions.push((emoji, mid));
-            }
-
-            search_from = tag_start + tag_end + 2;
-        } else {
-            break;
-        }
-    }
-    reactions
-}
-
-fn extract_attr(tag: &str, name: &str) -> Option<String> {
-    let pattern = format!("{}=\"", name);
-    let start = tag.find(&pattern)?;
-    let value_start = start + pattern.len();
-    let end = tag[value_start..].find('"')?;
-    Some(tag[value_start..value_start + end].to_owned())
 }
 
 async fn handle_message(
@@ -98,70 +48,89 @@ async fn handle_message(
         .await;
 
     while let Some(response) = reply_rx.recv().await {
-        // Parse structured model output
-        let reply_text = extract_reply(&response.text);
-        let reactions = extract_reactions(&response.text);
+        // Parse structured model output using the recursive descent parser
+        let segments = parser::parse_model_output(&response.text);
 
-        // Send reactions
-        for (emoji, message_id) in &reactions {
-            let reaction = ReactionType::Emoji {
-                emoji: emoji.clone(),
-            };
-            let result = bot
-                .set_message_reaction(
-                    Recipient::Id(msg.chat.id),
-                    teloxide::types::MessageId(*message_id),
-                )
-                .reaction(vec![reaction])
-                .await;
+        let mut has_reply = false;
 
-            if let Err(e) = result {
-                log::warn!("Failed to set reaction: {}", e);
+        for segment in &segments {
+            match segment {
+                Segment::TelegramReaction { emoji, message_id } => {
+                    let reaction = ReactionType::Emoji {
+                        emoji: emoji.clone(),
+                    };
+                    let result = bot
+                        .set_message_reaction(
+                            Recipient::Id(msg.chat.id),
+                            teloxide::types::MessageId(*message_id),
+                        )
+                        .reaction(vec![reaction])
+                        .await;
+
+                    if let Err(e) = result {
+                        log::warn!("Failed to set reaction: {}", e);
+                    }
+                }
+                Segment::TelegramMessage { content } => {
+                    has_reply = true;
+                    let formatted = crate::markdown::telegram::format(content);
+                    log::debug!("Raw model reply:\n{}", content);
+                    log::debug!("Formatted for Telegram:\n{}", formatted);
+
+                    let sent_msg = bot
+                        .send_message(msg.chat.id, &formatted)
+                        .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                        .await;
+
+                    let sent_msg = match sent_msg {
+                        Ok(m) => Some(m),
+                        Err(e) => {
+                            log::warn!("MarkdownV2 send failed ({}), retrying without parse_mode", e);
+                            bot.send_message(msg.chat.id, content).await.ok()
+                        }
+                    };
+
+                    // Report bot-sent message ID back to agent loop (final messages only)
+                    if response.is_final {
+                        if let Some(sent) = sent_msg {
+                            let update_text = format!(
+                                "__update_assistant_id:{}:{}",
+                                sent.id.0, response.history_index
+                            );
+                            let update_msg = UserMessage {
+                                interpreted: crate::channel::interpreter::InterpretedMessage {
+                                    text: update_text,
+                                    attachments: vec![],
+                                },
+                                reply_tx: None,
+                            };
+                            let _ = tx.send(update_msg).await;
+                        }
+                    }
+                }
+                Segment::Internal(_) => {
+                    // Internal reasoning — not sent to user
+                }
             }
         }
 
-        // Send reply message and capture sent message ID
-        let reply_to_send = if let Some(text) = reply_text {
-            Some(text)
-        } else if reactions.is_empty() {
-            Some(response.text.clone())
-        } else {
-            None
-        };
+        // Fallback: if no telegram-message tags found, send raw text
+        if !has_reply && segments.iter().all(|s| !matches!(s, Segment::TelegramReaction { .. })) {
+            if !response.text.is_empty() {
+                let formatted = crate::markdown::telegram::format(&response.text);
+                log::debug!("Raw LLM response (no tags):\n{}", response.text);
 
-        if let Some(text) = reply_to_send {
-            let formatted = crate::markdown::telegram::format(&text);
-            log::debug!("Raw model reply:\n{}", text);
-            log::debug!("Formatted for Telegram:\n{}", formatted);
+                let sent_msg = bot
+                    .send_message(msg.chat.id, &formatted)
+                    .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                    .await;
 
-            let sent_msg = bot
-                .send_message(msg.chat.id, &formatted)
-                .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-                .await;
-
-            let sent_msg = match sent_msg {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    log::warn!("MarkdownV2 send failed ({}), retrying without parse_mode", e);
-                    bot.send_message(msg.chat.id, &text).await.ok()
-                }
-            };
-
-            // Report bot-sent message ID back to agent loop (final messages only)
-            if response.is_final {
-                if let Some(sent) = sent_msg {
-                    let update_text = format!(
-                        "__update_assistant_id:{}:{}",
-                        sent.id.0, response.history_index
-                    );
-                    let update_msg = UserMessage {
-                        interpreted: crate::channel::interpreter::InterpretedMessage {
-                            text: update_text,
-                            attachments: vec![],
-                        },
-                        reply_tx: None,
-                    };
-                    let _ = tx.send(update_msg).await;
+                match sent_msg {
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::warn!("MarkdownV2 send failed ({}), retrying without parse_mode", e);
+                        let _ = bot.send_message(msg.chat.id, &response.text).await;
+                    }
                 }
             }
         }
@@ -199,71 +168,6 @@ async fn handle_reaction(
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_extract_reply_strips_telegram_tags() {
-        let text = "<telegram-message from=\"assistant\" to=\"user\">Hello world!</telegram-message>";
-        let reply = extract_reply(text);
-        assert_eq!(reply, Some("Hello world!".to_owned()));
-    }
-
-    #[test]
-    fn test_extract_reply_with_surrounding_reasoning() {
-        let text = "Let me think about this.\n<telegram-message from=\"assistant\" to=\"user\">The answer is 42.</telegram-message>\nSome internal notes.";
-        let reply = extract_reply(text);
-        assert_eq!(reply, Some("The answer is 42.".to_owned()));
-    }
-
-    #[test]
-    fn test_extract_reply_returns_none_for_plain_text() {
-        let text = "Just some plain text without tags.";
-        let reply = extract_reply(text);
-        assert_eq!(reply, None);
-    }
-
-    #[test]
-    fn test_extract_reply_with_id_attribute() {
-        // After ID injection, the tag may have an id attribute
-        let text = "<telegram-message from=\"assistant\" to=\"user\" id=\"73\">Hello!</telegram-message>";
-        let reply = extract_reply(text);
-        // Should still extract the content even with the id attribute
-        assert_eq!(reply, Some("Hello!".to_owned()), "extract_reply should handle tags with id attribute");
-    }
-
-    #[test]
-    fn test_extract_reply_with_multiline_content() {
-        let text = "<telegram-message from=\"assistant\" to=\"user\">Line 1\nLine 2\n**Bold**</telegram-message>";
-        let reply = extract_reply(text);
-        assert_eq!(reply, Some("Line 1\nLine 2\n**Bold**".to_owned()));
-    }
-
-    #[test]
-    fn test_extract_reactions_parses_emoji_and_message_id() {
-        let text = "<telegram-reaction from=\"assistant\" action=\"add\" emoji=\"👍\" message-id=\"42\" />";
-        let reactions = extract_reactions(text);
-        assert_eq!(reactions.len(), 1);
-        assert_eq!(reactions[0].0, "👍");
-        assert_eq!(reactions[0].1, 42);
-    }
-
-    #[test]
-    fn test_extract_reactions_multiple() {
-        let text = "<telegram-reaction from=\"assistant\" action=\"add\" emoji=\"👍\" message-id=\"42\" />\n<telegram-reaction from=\"assistant\" action=\"add\" emoji=\"❤️\" message-id=\"43\" />";
-        let reactions = extract_reactions(text);
-        assert_eq!(reactions.len(), 2);
-    }
-
-    #[test]
-    fn test_extract_reactions_ignores_user_reactions() {
-        let text = "<telegram-reaction from=\"user\" action=\"add\" emoji=\"👍\" message-id=\"42\" />";
-        let reactions = extract_reactions(text);
-        assert_eq!(reactions.len(), 0);
-    }
 }
 
 pub async fn run(bot: Bot, tx: mpsc::Sender<UserMessage>) {
