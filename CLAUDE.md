@@ -6,7 +6,8 @@
 cargo check          # type-check
 cargo build          # debug build
 cargo build --release # release build
-cargo test           # run tests
+cargo test           # run unit tests
+cargo test --test tool_loop_integration -- --test-threads=1  # integration tests (sequential)
 cargo clippy         # lint
 
 # Run (requires TELEGRAM_BOT_TOKEN env var)
