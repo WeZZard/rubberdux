@@ -77,6 +77,7 @@ pub async fn run(
     mut rx: mpsc::Receiver<UserMessage>,
     client: Arc<MoonshotClient>,
     system_prompt: String,
+    web_search_prompt: String,
 ) {
     let best_perf_tokens: usize = std::env::var("RUBBERDUX_LLM_BEST_PERFORMANCE_TOKENS")
         .ok()
@@ -254,6 +255,7 @@ pub async fn run(
                                 Some(crate::tool::ToolContext {
                                     client: client.clone(),
                                     system_prompt: system_prompt.clone(),
+                                    web_search_prompt: web_search_prompt.clone(),
                                     last_user_query,
                                     assistant_message: choice.message.clone(),
                                     tool_call: call.clone(),

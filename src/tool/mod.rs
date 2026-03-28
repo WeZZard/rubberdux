@@ -23,6 +23,7 @@ pub struct ToolResult {
 pub struct ToolContext {
     pub client: Arc<MoonshotClient>,
     pub system_prompt: String,
+    pub web_search_prompt: String,
     pub last_user_query: String,
     pub assistant_message: Message,
     pub tool_call: ToolCall,
@@ -154,7 +155,7 @@ async fn execute_web_search_background(
         // Build one-shot messages: [system, user_query, assistant(tool_calls), tool(search_args)]
         let messages = vec![
             Message::System {
-                content: ctx.system_prompt,
+                content: ctx.web_search_prompt,
             },
             Message::User {
                 content: UserContent::Text(ctx.last_user_query),

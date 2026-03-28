@@ -35,3 +35,18 @@ pub fn compose_system_prompt(parts: &[String], channel_partial: Option<&str>) ->
     }
     prompt
 }
+
+/// Loads the web search system prompt from the prompt directory.
+pub fn load_web_search_prompt(prompt_dir: &Path) -> String {
+    let path = prompt_dir.join("WEB_SEARCH.md");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            log::info!("Loaded web search prompt: {:?}", path);
+            content
+        }
+        Err(e) => {
+            log::error!("Failed to load web search prompt {:?}: {}", path, e);
+            panic!("WEB_SEARCH.md is required");
+        }
+    }
+}
