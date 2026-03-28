@@ -134,6 +134,20 @@ pub struct MoonshotClient {
 }
 
 impl MoonshotClient {
+    pub fn new(
+        http: reqwest::Client,
+        base_url: String,
+        api_key: String,
+        model: String,
+    ) -> Self {
+        Self {
+            http,
+            base_url,
+            api_key,
+            model,
+        }
+    }
+
     pub fn from_env() -> Self {
         let base_url = std::env::var("RUBBERDUX_LLM_BASE_URL")
             .unwrap_or_else(|_| "https://api.moonshot.ai/v1".into());
