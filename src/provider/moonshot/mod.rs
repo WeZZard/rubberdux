@@ -5,7 +5,7 @@ pub mod token;
 pub mod tool;
 
 use serde::{Deserialize, Serialize};
-use tool::ToolCall;
+use tool::{FunctionDefinition, ToolCall, ToolDefinition};
 
 use crate::channel::interpreter::{Attachment, InterpretedMessage};
 
@@ -173,6 +173,19 @@ impl MoonshotClient {
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// Returns the platform-provided builtin tools (e.g. $web_search).
+    /// These are server-side tools executed by the Kimi platform, not locally.
+    fn platform_builtins() -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            r#type: "builtin_function".to_owned(),
+            function: FunctionDefinition {
+                name: "$web_search".to_owned(),
+                description: None,
+                parameters: None,
+            },
+        }]
     }
 
     pub fn build_messages(

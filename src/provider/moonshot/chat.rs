@@ -57,6 +57,17 @@ impl MoonshotClient {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<ChatResponse, crate::error::Error> {
+        // Append platform builtin tools to the user-provided tools
+        let tools = {
+            let mut all_tools = tools.unwrap_or_default();
+            all_tools.extend(Self::platform_builtins());
+            if all_tools.is_empty() {
+                None
+            } else {
+                Some(all_tools)
+            }
+        };
+
         let request = ChatRequest {
             model: self.model().to_owned(),
             messages,

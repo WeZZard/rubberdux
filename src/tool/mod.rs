@@ -109,7 +109,7 @@ mod tests {
     #[test]
     fn test_load_tool_definitions() {
         let defs = load_tool_definitions(Path::new("./tools"));
-        assert_eq!(defs.len(), 8); // 7 local + 1 builtin ($web_search)
+        assert_eq!(defs.len(), 7); // 7 local tools (web_search is now a platform builtin)
     }
 
     #[tokio::test]
