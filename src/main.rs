@@ -1,6 +1,7 @@
 mod agent;
 mod channel;
 mod error;
+mod markdown;
 mod prompt;
 
 use teloxide::prelude::*;

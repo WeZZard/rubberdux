@@ -29,9 +29,25 @@ async fn handle_message(
         return Ok(());
     }
 
+    let _ = bot
+        .send_chat_action(msg.chat.id, teloxide::types::ChatAction::Typing)
+        .await;
+
     match reply_rx.await {
         Ok(response) => {
-            bot.send_message(msg.chat.id, &response.text).await?;
+            let formatted = crate::markdown::telegram::format(&response.text);
+            log::debug!("Raw LLM response:\n{}", response.text);
+            log::debug!("Formatted for Telegram:\n{}", formatted);
+
+            let send_result = bot
+                .send_message(msg.chat.id, &formatted)
+                .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                .await;
+
+            if let Err(e) = send_result {
+                log::warn!("MarkdownV2 send failed ({}), retrying without parse_mode", e);
+                bot.send_message(msg.chat.id, &response.text).await?;
+            }
         }
         Err(_) => {
             log::error!("Agent dropped the reply channel");
