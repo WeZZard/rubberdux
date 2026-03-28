@@ -96,7 +96,22 @@ impl MoonshotClient {
             });
         }
 
-        let chat_response: ChatResponse = response.json().await?;
+        let mut chat_response: ChatResponse = response.json().await?;
+
+        // Ensure reasoning_content is present on assistant messages.
+        // Kimi requires it when thinking mode is enabled, but some responses
+        // (e.g. builtin $web_search) don't include it.
+        for choice in &mut chat_response.choices {
+            if let Message::Assistant {
+                reasoning_content, ..
+            } = &mut choice.message
+            {
+                if reasoning_content.is_none() {
+                    *reasoning_content = Some(String::new());
+                }
+            }
+        }
+
         Ok(chat_response)
     }
 }
