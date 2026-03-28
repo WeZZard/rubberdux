@@ -12,14 +12,17 @@ pub fn channel_prompt() -> &'static str {
     TELEGRAM_PROMPT
 }
 
-/// Parses model output for `<telegram-message from="assistant" to="user">` tags.
+/// Parses model output for `<telegram-message from="assistant" to="user"...>` tags.
 /// Returns the content to send as a Telegram message.
+/// Handles tags with or without an `id` attribute.
 fn extract_reply(text: &str) -> Option<String> {
-    let start_tag = "<telegram-message from=\"assistant\" to=\"user\">";
+    let tag_prefix = "<telegram-message from=\"assistant\" to=\"user\"";
     let end_tag = "</telegram-message>";
 
-    let start = text.find(start_tag)?;
-    let content_start = start + start_tag.len();
+    let start = text.find(tag_prefix)?;
+    // Find the closing `>` of the opening tag (may have attributes like id="...")
+    let tag_close = text[start..].find('>')?;
+    let content_start = start + tag_close + 1;
     let end = text[content_start..].find(end_tag)?;
     Some(text[content_start..content_start + end].to_owned())
 }
@@ -196,6 +199,71 @@ async fn handle_reaction(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_reply_strips_telegram_tags() {
+        let text = "<telegram-message from=\"assistant\" to=\"user\">Hello world!</telegram-message>";
+        let reply = extract_reply(text);
+        assert_eq!(reply, Some("Hello world!".to_owned()));
+    }
+
+    #[test]
+    fn test_extract_reply_with_surrounding_reasoning() {
+        let text = "Let me think about this.\n<telegram-message from=\"assistant\" to=\"user\">The answer is 42.</telegram-message>\nSome internal notes.";
+        let reply = extract_reply(text);
+        assert_eq!(reply, Some("The answer is 42.".to_owned()));
+    }
+
+    #[test]
+    fn test_extract_reply_returns_none_for_plain_text() {
+        let text = "Just some plain text without tags.";
+        let reply = extract_reply(text);
+        assert_eq!(reply, None);
+    }
+
+    #[test]
+    fn test_extract_reply_with_id_attribute() {
+        // After ID injection, the tag may have an id attribute
+        let text = "<telegram-message from=\"assistant\" to=\"user\" id=\"73\">Hello!</telegram-message>";
+        let reply = extract_reply(text);
+        // Should still extract the content even with the id attribute
+        assert_eq!(reply, Some("Hello!".to_owned()), "extract_reply should handle tags with id attribute");
+    }
+
+    #[test]
+    fn test_extract_reply_with_multiline_content() {
+        let text = "<telegram-message from=\"assistant\" to=\"user\">Line 1\nLine 2\n**Bold**</telegram-message>";
+        let reply = extract_reply(text);
+        assert_eq!(reply, Some("Line 1\nLine 2\n**Bold**".to_owned()));
+    }
+
+    #[test]
+    fn test_extract_reactions_parses_emoji_and_message_id() {
+        let text = "<telegram-reaction from=\"assistant\" action=\"add\" emoji=\"👍\" message-id=\"42\" />";
+        let reactions = extract_reactions(text);
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].0, "👍");
+        assert_eq!(reactions[0].1, 42);
+    }
+
+    #[test]
+    fn test_extract_reactions_multiple() {
+        let text = "<telegram-reaction from=\"assistant\" action=\"add\" emoji=\"👍\" message-id=\"42\" />\n<telegram-reaction from=\"assistant\" action=\"add\" emoji=\"❤️\" message-id=\"43\" />";
+        let reactions = extract_reactions(text);
+        assert_eq!(reactions.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_reactions_ignores_user_reactions() {
+        let text = "<telegram-reaction from=\"user\" action=\"add\" emoji=\"👍\" message-id=\"42\" />";
+        let reactions = extract_reactions(text);
+        assert_eq!(reactions.len(), 0);
+    }
 }
 
 pub async fn run(bot: Bot, tx: mpsc::Sender<UserMessage>) {
