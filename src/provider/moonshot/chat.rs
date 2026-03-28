@@ -106,8 +106,8 @@ impl MoonshotClient {
                 reasoning_content, ..
             } = &mut choice.message
             {
-                if reasoning_content.is_none() {
-                    *reasoning_content = Some(String::new());
+                if reasoning_content.is_none() || reasoning_content.as_ref().is_some_and(|s| s.is_empty()) {
+                    *reasoning_content = Some("(tool call)".to_owned());
                 }
             }
         }

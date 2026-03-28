@@ -324,6 +324,84 @@ mod tests {
     }
 
     #[test]
+    fn test_assistant_reasoning_content_always_serialized() {
+        // When reasoning_content is Some(""), it must serialize as "reasoning_content": ""
+        // not be omitted — Kimi requires it for thinking mode
+        let msg = Message::Assistant {
+            content: Some("".into()),
+            reasoning_content: Some("".into()),
+            tool_calls: None,
+            partial: None,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert!(
+            json.get("reasoning_content").is_some(),
+            "reasoning_content must be present even when empty: {}",
+            serde_json::to_string_pretty(&json).unwrap()
+        );
+        assert_eq!(json["reasoning_content"], "");
+    }
+
+    #[test]
+    fn test_assistant_reasoning_content_none_serializes() {
+        // When reasoning_content is None, check what happens
+        let msg = Message::Assistant {
+            content: Some("Hello".into()),
+            reasoning_content: None,
+            tool_calls: None,
+            partial: None,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        // With #[serde(default)], None serializes as null
+        // Kimi needs it present (even as null or ""), not omitted
+        let has_field = json.get("reasoning_content").is_some();
+        println!("reasoning_content when None: {:?}", json.get("reasoning_content"));
+        // This test documents current behavior
+        assert!(has_field, "reasoning_content should be present (not omitted) since we removed skip_serializing_if");
+    }
+
+    #[test]
+    fn test_builtin_tool_call_roundtrip() {
+        // Simulate the $web_search flow:
+        // 1. API returns assistant with tool_calls and no reasoning_content
+        // 2. We deserialize, ensure reasoning_content is Some("")
+        // 3. We serialize back — reasoning_content must be present
+        let api_response = r#"{
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "tool_abc",
+                "type": "builtin_function",
+                "function": {
+                    "name": "$web_search",
+                    "arguments": "{\"search_result\":{\"search_id\":\"123\"}}"
+                }
+            }]
+        }"#;
+
+        let mut msg: Message = serde_json::from_str(api_response).unwrap();
+
+        // Simulate the fix: ensure reasoning_content is present and non-empty
+        if let Message::Assistant { reasoning_content, .. } = &mut msg {
+            if reasoning_content.is_none() || reasoning_content.as_ref().is_some_and(|s| s.is_empty()) {
+                *reasoning_content = Some("(tool call)".to_owned());
+            }
+        }
+
+        // Serialize back
+        let json = serde_json::to_value(&msg).unwrap();
+
+        // reasoning_content MUST be present, a string, and NON-EMPTY
+        // Kimi treats empty string as "missing" and rejects the request
+        assert!(json.get("reasoning_content").is_some(), "reasoning_content must be present");
+        assert!(json["reasoning_content"].is_string(), "reasoning_content must be a string, not null");
+        assert!(!json["reasoning_content"].as_str().unwrap().is_empty(), "reasoning_content must not be empty — Kimi rejects empty string");
+
+        // tool_calls must also be present
+        assert!(json.get("tool_calls").is_some());
+    }
+
+    #[test]
     fn test_build_messages_ordering() {
         let client = MoonshotClient {
             http: reqwest::Client::new(),
