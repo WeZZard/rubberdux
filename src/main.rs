@@ -8,7 +8,9 @@ use teloxide::prelude::*;
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
-    pretty_env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
     log::info!("Starting rubberdux...");
 
     let prompt_dir = prompt::prompt_dir();

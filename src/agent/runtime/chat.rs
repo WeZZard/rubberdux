@@ -11,18 +11,29 @@ use crate::channel::{AgentResponse, UserMessage};
 pub async fn run(mut rx: mpsc::Receiver<UserMessage>, system_prompt: String) {
     let config = OpenAIConfig::new()
         .with_api_base(
-            std::env::var("OPENAI_API_BASE").unwrap_or_else(|_| "https://api.openai.com/v1".into()),
+            std::env::var("RUBBERDUX_LLM_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
         )
-        .with_api_key(std::env::var("OPENAI_API_KEY").unwrap_or_default());
+        .with_api_key(std::env::var("RUBBERDUX_LLM_API_KEY").unwrap_or_default());
 
-    let client = Client::with_config(config);
+    let http_client = {
+        let mut builder = reqwest::ClientBuilder::new();
+        if let Ok(user_agent) = std::env::var("RUBBERDUX_LLM_USER_AGENT") {
+            builder = builder.user_agent(user_agent);
+        }
+        builder.build().expect("failed to build HTTP client")
+    };
+
+    let client = Client::with_config(config).with_http_client(http_client);
     let model =
-        std::env::var("RUBBERDUX_MODEL").unwrap_or_else(|_| "kimi-for-coding".into());
+        std::env::var("RUBBERDUX_LLM_MODEL").unwrap_or_else(|_| "kimi-for-coding".into());
 
     log::info!("Agent loop started (model: {})", model);
 
     while let Some(msg) = rx.recv().await {
+        log::info!("Processing message: {}", msg.text);
         let result = process_message(&client, &model, &system_prompt, &msg.text).await;
+        log::info!("LLM responded for: {}", msg.text);
 
         let response = match result {
             Ok(text) => AgentResponse { text },
