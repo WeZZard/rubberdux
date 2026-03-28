@@ -1,23 +1,63 @@
+use std::sync::OnceLock;
+
 use teloxide::prelude::*;
 use teloxide::types::{Audio, VideoNote, Voice};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use super::InterpretedMessage;
 
-const DEFAULT_WHISPER_LANGUAGE: &str = "auto";
+static WHISPER_CONTEXT: OnceLock<Option<WhisperContext>> = OnceLock::new();
 
-async fn download_to_temp(bot: &Bot, file_id: &str, suffix: &str) -> Option<tempfile::NamedTempFile> {
+fn get_whisper_context() -> Option<&'static WhisperContext> {
+    WHISPER_CONTEXT
+        .get_or_init(|| {
+            let model_path = resolve_model_path();
+            log::info!("Loading whisper model from: {}", model_path);
+            match WhisperContext::new_with_params(&model_path, WhisperContextParameters::default()) {
+                Ok(ctx) => {
+                    log::info!("Whisper model loaded successfully");
+                    Some(ctx)
+                }
+                Err(e) => {
+                    log::error!("Failed to load whisper model from {}: {:?}", model_path, e);
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+fn resolve_model_path() -> String {
+    std::env::var("RUBBERDUX_WHISPER_MODEL").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let default_path = format!(
+            "{}/.local/share/whisper-cpp/models/ggml-large-v3-turbo.bin",
+            home
+        );
+        if std::path::Path::new(&default_path).exists() {
+            return default_path;
+        }
+        let brew_path = "/opt/homebrew/opt/whisper-cpp/share/whisper-cpp/for-tests-ggml-tiny.bin";
+        if std::path::Path::new(brew_path).exists() {
+            return brew_path.to_owned();
+        }
+        default_path
+    })
+}
+
+async fn download_to_temp(
+    bot: &Bot,
+    file_id: &str,
+    suffix: &str,
+) -> Option<tempfile::NamedTempFile> {
     let file = bot.get_file(file_id).await.ok()?;
-    let temp = tempfile::Builder::new()
-        .suffix(suffix)
-        .tempfile()
-        .ok()?;
+    let temp = tempfile::Builder::new().suffix(suffix).tempfile().ok()?;
 
     {
         let mut dst = tokio::fs::File::create(temp.path()).await.ok()?;
         teloxide::net::Download::download_file(bot, &file.path, &mut dst)
             .await
             .ok()?;
-        // dst is dropped here, flushing the write
     }
 
     let metadata = std::fs::metadata(temp.path()).ok()?;
@@ -35,9 +75,11 @@ async fn download_to_temp(bot: &Bot, file_id: &str, suffix: &str) -> Option<temp
     Some(temp)
 }
 
-/// Converts audio to WAV format (16kHz mono) for whisper-cli.
+/// Converts audio to WAV format (16kHz mono) for whisper.
 /// Telegram voice messages use OGG Opus which whisper.cpp cannot decode directly.
-async fn convert_to_wav(input_path: &std::path::Path) -> Result<tempfile::NamedTempFile, String> {
+async fn convert_to_wav(
+    input_path: &std::path::Path,
+) -> Result<tempfile::NamedTempFile, String> {
     let wav_temp = tempfile::Builder::new()
         .suffix(".wav")
         .tempfile()
@@ -67,105 +109,88 @@ async fn convert_to_wav(input_path: &std::path::Path) -> Result<tempfile::NamedT
     Ok(wav_temp)
 }
 
-fn resolve_model_path() -> String {
-    std::env::var("RUBBERDUX_WHISPER_MODEL").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let default_path = format!(
-            "{}/.local/share/whisper-cpp/models/ggml-large-v3-turbo.bin",
-            home
-        );
-        if std::path::Path::new(&default_path).exists() {
-            return default_path;
-        }
-        let brew_path = "/opt/homebrew/opt/whisper-cpp/share/whisper-cpp/for-tests-ggml-tiny.bin";
-        if std::path::Path::new(brew_path).exists() {
-            return brew_path.to_owned();
-        }
-        default_path
-    })
-}
+/// Loads WAV file as f32 PCM samples at 16kHz mono.
+fn load_wav_samples(path: &std::path::Path) -> Result<Vec<f32>, String> {
+    let reader =
+        hound::WavReader::open(path).map_err(|e| format!("Failed to open WAV file: {}", e))?;
 
-async fn transcribe(audio_path: &std::path::Path) -> Result<String, String> {
-    let model_path = resolve_model_path();
-    let language = std::env::var("RUBBERDUX_WHISPER_LANGUAGE")
-        .unwrap_or_else(|_| DEFAULT_WHISPER_LANGUAGE.into());
-
-    let wav_file = convert_to_wav(audio_path).await?;
-
-    // Use JSON full output for word-level timestamps
-    let json_output = tempfile::Builder::new()
-        .suffix("")
-        .tempfile()
-        .map_err(|e| format!("Failed to create temp JSON file: {}", e))?;
-    let json_output_base = json_output.path().to_string_lossy().to_string();
-
-    let output = tokio::process::Command::new("whisper-cli")
-        .arg("-m")
-        .arg(&model_path)
-        .arg("-l")
-        .arg(&language)
-        .arg("-ojf")
-        .arg("-of")
-        .arg(&json_output_base)
-        .arg("-f")
-        .arg(wav_file.path())
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run whisper-cli: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("whisper-cli failed: {}", stderr));
+    let spec = reader.spec();
+    if spec.channels != 1 {
+        return Err(format!("Expected mono audio, got {} channels", spec.channels));
     }
 
-    let json_path = format!("{}.json", json_output_base);
-    let json_content = std::fs::read_to_string(&json_path)
-        .map_err(|e| format!("Failed to read whisper JSON output: {}", e))?;
-    let _ = std::fs::remove_file(&json_path);
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Int => reader
+            .into_samples::<i16>()
+            .filter_map(|s| s.ok())
+            .map(|s| s as f32 / i16::MAX as f32)
+            .collect(),
+        hound::SampleFormat::Float => reader
+            .into_samples::<f32>()
+            .filter_map(|s| s.ok())
+            .collect(),
+    };
 
-    let transcript = parse_whisper_json(&json_content)?;
-    log::debug!("Whisper transcript with timestamps: {}", transcript);
-    Ok(transcript)
+    Ok(samples)
 }
 
-fn parse_whisper_json(json_str: &str) -> Result<String, String> {
-    let data: serde_json::Value =
-        serde_json::from_str(json_str).map_err(|e| format!("Failed to parse whisper JSON: {}", e))?;
+/// Transcribes audio using whisper-rs (in-process, no CLI dependency).
+/// Returns XML-formatted transcript with word-level timestamps.
+async fn transcribe(audio_path: &std::path::Path) -> Result<String, String> {
+    let wav_file = convert_to_wav(audio_path).await?;
+    let samples = load_wav_samples(wav_file.path())?;
 
-    let transcription = data["transcription"]
-        .as_array()
-        .ok_or("No transcription array in whisper output")?;
+    // Run whisper on a blocking thread (it's CPU-intensive)
+    let result = tokio::task::spawn_blocking(move || transcribe_samples(&samples))
+        .await
+        .map_err(|e| format!("Transcription task panicked: {}", e))?;
+
+    result
+}
+
+fn transcribe_samples(samples: &[f32]) -> Result<String, String> {
+    let ctx = get_whisper_context().ok_or("Whisper model not loaded")?;
+
+    let mut state = ctx
+        .create_state()
+        .map_err(|e| format!("Failed to create whisper state: {:?}", e))?;
+
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_language(Some("auto"));
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    params.set_token_timestamps(true);
+
+    state
+        .full(params, samples)
+        .map_err(|e| format!("Whisper inference failed: {:?}", e))?;
+
+    let num_segments = state.full_n_segments().map_err(|e| format!("{:?}", e))?;
 
     let mut result = String::from("<voice-transcript>\n");
 
-    for segment in transcription {
-        let tokens = match segment["tokens"].as_array() {
-            Some(t) => t,
-            None => continue,
-        };
+    for i in 0..num_segments {
+        let num_tokens = state.full_n_tokens(i).map_err(|e| format!("{:?}", e))?;
 
-        for token in tokens {
-            let text = token["text"].as_str().unwrap_or("");
+        for j in 0..num_tokens {
+            let token_text = state
+                .full_get_token_text(i, j)
+                .map_err(|e| format!("{:?}", e))?;
 
-            // Skip special tokens like [_BEG_], [_TT_*], etc.
-            if text.starts_with("[_") {
+            let trimmed = token_text.trim();
+            if trimmed.is_empty() || trimmed.starts_with("[_") {
                 continue;
             }
 
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
+            let token_data = state
+                .full_get_token_data(i, j)
+                .map_err(|e| format!("{:?}", e))?;
 
-            // Parse timestamp: "00:00:01,220" → seconds as f64
-            let from_ts = token["timestamps"]["from"]
-                .as_str()
-                .and_then(parse_timestamp);
+            let t_start = token_data.t0 as f64 * 0.01; // centiseconds to seconds
 
-            match from_ts {
-                Some(t) => result.push_str(&format!("<w t=\"{:.2}\">{}</w>\n", t, trimmed)),
-                None => result.push_str(&format!("{}\n", trimmed)),
-            }
+            result.push_str(&format!("<w t=\"{:.2}\">{}</w>\n", t_start, trimmed));
         }
     }
 
@@ -173,29 +198,18 @@ fn parse_whisper_json(json_str: &str) -> Result<String, String> {
     Ok(result)
 }
 
-fn parse_timestamp(ts: &str) -> Option<f64> {
-    // Format: "00:00:01,220" or "00:00:01.220"
-    let ts = ts.replace(',', ".");
-    let parts: Vec<&str> = ts.split(':').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let hours: f64 = parts[0].parse().ok()?;
-    let minutes: f64 = parts[1].parse().ok()?;
-    let seconds: f64 = parts[2].parse().ok()?;
-    Some(hours * 3600.0 + minutes * 60.0 + seconds)
-}
-
 pub async fn interpret_voice(bot: &Bot, voice: &Voice) -> InterpretedMessage {
     let temp_file = download_to_temp(bot, &voice.file.id, ".ogg").await;
 
     let text = match temp_file {
         Some(temp) => match transcribe(temp.path()).await {
-            Ok(transcription) if !transcription.is_empty() => {
-                log::info!("Voice transcription: {}", transcription);
+            Ok(transcription) if !transcription.contains("<w ") => {
+                "<voice-transcript status=\"empty\" />".into()
+            }
+            Ok(transcription) => {
+                log::info!("Voice transcription completed");
                 transcription
             }
-            Ok(_) => "<voice-transcript status=\"empty\" />".into(),
             Err(e) => {
                 log::error!("Voice transcription failed: {}", e);
                 "<voice-transcript status=\"failed\" />".into()
@@ -218,11 +232,13 @@ pub async fn interpret_audio(bot: &Bot, audio: &Audio) -> InterpretedMessage {
 
     let text = match temp_file {
         Some(temp) => match transcribe(temp.path()).await {
-            Ok(transcription) if !transcription.is_empty() => {
-                log::info!("Audio transcription: {}", transcription);
+            Ok(transcription) if !transcription.contains("<w ") => {
+                "<audio-transcript status=\"empty\" />".into()
+            }
+            Ok(transcription) => {
+                log::info!("Audio transcription completed");
                 transcription
             }
-            Ok(_) => "<audio-transcript status=\"empty\" />".into(),
             Err(e) => {
                 log::error!("Audio transcription failed: {}", e);
                 "<audio-transcript status=\"failed\" />".into()
@@ -245,11 +261,13 @@ pub async fn interpret_video_note(bot: &Bot, video_note: &VideoNote) -> Interpre
 
     let text = match temp_file {
         Some(temp) => match transcribe(temp.path()).await {
-            Ok(transcription) if !transcription.is_empty() => {
-                log::info!("Video note transcription: {}", transcription);
+            Ok(transcription) if !transcription.contains("<w ") => {
+                "<video-note-transcript status=\"empty\" />".into()
+            }
+            Ok(transcription) => {
+                log::info!("Video note transcription completed");
                 transcription
             }
-            Ok(_) => "<video-note-transcript status=\"empty\" />".into(),
             Err(e) => {
                 log::error!("Video note transcription failed: {}", e);
                 "<video-note-transcript status=\"failed\" />".into()
