@@ -61,7 +61,21 @@ pub fn load_tool_definitions(dir: &Path) -> Vec<ToolDefinition> {
     definitions
 }
 
+/// Returns true if the tool is a Kimi builtin function (name starts with $).
+/// Builtin tools are executed server-side — we echo the arguments back as the result.
+pub fn is_builtin_tool(name: &str) -> bool {
+    name.starts_with('$')
+}
+
 pub async fn execute_tool(name: &str, arguments: &str) -> ToolResult {
+    // Kimi builtin functions: echo arguments back for server-side execution
+    if is_builtin_tool(name) {
+        return ToolResult {
+            content: arguments.to_owned(),
+            is_error: false,
+        };
+    }
+
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
         Err(e) => {
@@ -93,7 +107,7 @@ mod tests {
     #[test]
     fn test_load_tool_definitions() {
         let defs = load_tool_definitions(Path::new("./tools"));
-        assert_eq!(defs.len(), 6);
+        assert_eq!(defs.len(), 7); // 6 local + 1 builtin ($web_search)
     }
 
     #[tokio::test]

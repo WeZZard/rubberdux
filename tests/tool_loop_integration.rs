@@ -178,6 +178,7 @@ async fn test_tool_call_loop() {
 
                 history.push(Message::Tool {
                     tool_call_id: call.id.clone(),
+                    name: None,
                     content: result.content,
                 });
             }
@@ -463,6 +464,7 @@ async fn test_background_tool_call_loop() {
 
                 history.push(Message::Tool {
                     tool_call_id: call.id.clone(),
+                    name: None,
                     content: result.content,
                 });
             }
@@ -614,6 +616,7 @@ async fn test_mixed_sync_background_tool_calls() {
 
                 history.push(Message::Tool {
                     tool_call_id: call.id.clone(),
+                    name: None,
                     content: result.content,
                 });
             }
@@ -836,6 +839,7 @@ async fn test_multi_step_tool_chain() {
                     tool::execute_tool(&call.function.name, &call.function.arguments).await;
                 history.push(Message::Tool {
                     tool_call_id: call.id.clone(),
+                    name: None,
                     content: result.content,
                 });
             }

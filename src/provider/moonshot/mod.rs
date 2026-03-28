@@ -29,6 +29,8 @@ pub enum Message {
     },
     Tool {
         tool_call_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         content: String,
     },
 }
@@ -250,6 +252,7 @@ mod tests {
 
         let tool = Message::Tool {
             tool_call_id: "call_123".into(),
+            name: None,
             content: "result".into(),
         };
         let json = serde_json::to_value(&tool).unwrap();

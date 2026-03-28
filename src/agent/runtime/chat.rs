@@ -247,8 +247,15 @@ pub async fn run(
                                 log::warn!("Tool error: {}", result.content);
                             }
 
+                            let tool_name = if crate::tool::is_builtin_tool(&call.function.name) {
+                                Some(call.function.name.clone())
+                            } else {
+                                None
+                            };
+
                             let tool_msg = Message::Tool {
                                 tool_call_id: call.id.clone(),
+                                name: tool_name,
                                 content: result.content,
                             };
                             append_to_session(&session_file, &tool_msg);

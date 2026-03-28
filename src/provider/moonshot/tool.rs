@@ -9,8 +9,10 @@ pub struct ToolDefinition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionDefinition {
     pub name: String,
-    pub description: String,
-    pub parameters: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,9 +36,13 @@ impl ToolDefinition {
             r#type: "function".to_owned(),
             function: FunctionDefinition {
                 name: name.to_owned(),
-                description: description.to_owned(),
-                parameters,
+                description: Some(description.to_owned()),
+                parameters: Some(parameters),
             },
         }
+    }
+
+    pub fn is_builtin(&self) -> bool {
+        self.r#type == "builtin_function"
     }
 }
