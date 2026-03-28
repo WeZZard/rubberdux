@@ -144,20 +144,22 @@ async fn handle_message(
                 }
             };
 
-            // Report bot-sent message ID back to agent loop
-            if let Some(sent) = sent_msg {
-                let update_text = format!(
-                    "__update_assistant_id:{}:{}",
-                    sent.id.0, response.history_index
-                );
-                let update_msg = UserMessage {
-                    interpreted: crate::channel::interpreter::InterpretedMessage {
-                        text: update_text,
-                        attachments: vec![],
-                    },
-                    reply_tx: None,
-                };
-                let _ = tx.send(update_msg).await;
+            // Report bot-sent message ID back to agent loop (final messages only)
+            if response.is_final {
+                if let Some(sent) = sent_msg {
+                    let update_text = format!(
+                        "__update_assistant_id:{}:{}",
+                        sent.id.0, response.history_index
+                    );
+                    let update_msg = UserMessage {
+                        interpreted: crate::channel::interpreter::InterpretedMessage {
+                            text: update_text,
+                            attachments: vec![],
+                        },
+                        reply_tx: None,
+                    };
+                    let _ = tx.send(update_msg).await;
+                }
             }
         }
 
