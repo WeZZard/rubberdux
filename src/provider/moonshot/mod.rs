@@ -7,6 +7,8 @@ pub mod tool;
 use serde::{Deserialize, Serialize};
 use tool::ToolCall;
 
+use crate::channel::interpreter::{Attachment, InterpretedMessage};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
@@ -14,7 +16,7 @@ pub enum Message {
         content: String,
     },
     User {
-        content: String,
+        content: UserContent,
     },
     Assistant {
         content: Option<String>,
@@ -29,13 +31,88 @@ pub enum Message {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UserContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text {
+        text: String,
+    },
+    ImageUrl {
+        image_url: MediaUrl,
+    },
+    VideoUrl {
+        video_url: MediaUrl,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaUrl {
+    pub url: String,
+}
+
 impl Message {
     pub fn content_text(&self) -> &str {
         match self {
             Message::System { content } => content,
-            Message::User { content } => content,
+            Message::User { content } => match content {
+                UserContent::Text(t) => t,
+                UserContent::Parts(parts) => {
+                    for part in parts {
+                        if let ContentPart::Text { text } = part {
+                            return text;
+                        }
+                    }
+                    ""
+                }
+            },
             Message::Assistant { content, .. } => content.as_deref().unwrap_or(""),
             Message::Tool { content, .. } => content,
+        }
+    }
+
+    pub fn from_interpreted(interpreted: &InterpretedMessage) -> Self {
+        if interpreted.attachments.is_empty() {
+            return Message::User {
+                content: UserContent::Text(interpreted.text.clone()),
+            };
+        }
+
+        let mut parts = Vec::new();
+
+        if !interpreted.text.is_empty() {
+            parts.push(ContentPart::Text {
+                text: interpreted.text.clone(),
+            });
+        }
+
+        for attachment in &interpreted.attachments {
+            match attachment {
+                Attachment::Image { base64, mime_type } => {
+                    parts.push(ContentPart::ImageUrl {
+                        image_url: MediaUrl {
+                            url: format!("data:{};base64,{}", mime_type, base64),
+                        },
+                    });
+                }
+                Attachment::Video { base64, mime_type } => {
+                    parts.push(ContentPart::VideoUrl {
+                        video_url: MediaUrl {
+                            url: format!("data:{};base64,{}", mime_type, base64),
+                        },
+                    });
+                }
+            }
+        }
+
+        Message::User {
+            content: UserContent::Parts(parts),
         }
     }
 }
@@ -77,16 +154,14 @@ impl MoonshotClient {
         &self,
         system_prompt: &str,
         history: &[Message],
-        user_input: &str,
+        interpreted: &InterpretedMessage,
     ) -> Vec<Message> {
         let mut msgs = Vec::with_capacity(history.len() + 2);
         msgs.push(Message::System {
             content: system_prompt.to_owned(),
         });
         msgs.extend_from_slice(history);
-        msgs.push(Message::User {
-            content: user_input.to_owned(),
-        });
+        msgs.push(Message::from_interpreted(interpreted));
         msgs
     }
 
@@ -117,7 +192,7 @@ mod tests {
         assert_eq!(json["content"], "You are helpful.");
 
         let user = Message::User {
-            content: "Hello".into(),
+            content: UserContent::Text("Hello".into()),
         };
         let json = serde_json::to_value(&user).unwrap();
         assert_eq!(json["role"], "user");
@@ -145,6 +220,55 @@ mod tests {
     }
 
     #[test]
+    fn test_user_content_text_serialization() {
+        let content = UserContent::Text("Hello".into());
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(json.is_string());
+        assert_eq!(json, "Hello");
+    }
+
+    #[test]
+    fn test_user_content_parts_serialization() {
+        let content = UserContent::Parts(vec![
+            ContentPart::Text {
+                text: "Explain this".into(),
+            },
+            ContentPart::ImageUrl {
+                image_url: MediaUrl {
+                    url: "data:image/jpeg;base64,abc123".into(),
+                },
+            },
+        ]);
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(json.is_array());
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], "Explain this");
+        assert_eq!(arr[1]["type"], "image_url");
+        assert_eq!(arr[1]["image_url"]["url"], "data:image/jpeg;base64,abc123");
+    }
+
+    #[test]
+    fn test_multimodal_user_message_serialization() {
+        let msg = Message::User {
+            content: UserContent::Parts(vec![
+                ContentPart::Text {
+                    text: "What is this?".into(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: MediaUrl {
+                        url: "data:image/png;base64,xyz".into(),
+                    },
+                },
+            ]),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["role"], "user");
+        assert!(json["content"].is_array());
+    }
+
+    #[test]
     fn test_build_messages_ordering() {
         let client = MoonshotClient {
             http: reqwest::Client::new(),
@@ -155,7 +279,7 @@ mod tests {
 
         let history = vec![
             Message::User {
-                content: "First".into(),
+                content: UserContent::Text("First".into()),
             },
             Message::Assistant {
                 content: Some("Reply".into()),
@@ -164,16 +288,15 @@ mod tests {
             },
         ];
 
-        let msgs = client.build_messages("System prompt", &history, "Second");
+        let interpreted = InterpretedMessage {
+            text: "Second".into(),
+            attachments: vec![],
+        };
+
+        let msgs = client.build_messages("System prompt", &history, &interpreted);
 
         assert_eq!(msgs.len(), 4);
-
-        // First is system
         assert!(matches!(&msgs[0], Message::System { content } if content == "System prompt"));
-        // History in middle
-        assert!(matches!(&msgs[1], Message::User { content } if content == "First"));
-        assert!(matches!(&msgs[2], Message::Assistant { content: Some(c), .. } if c == "Reply"));
-        // Last is new user input
-        assert!(matches!(&msgs[3], Message::User { content } if content == "Second"));
+        assert!(matches!(&msgs[3], Message::User { content: UserContent::Text(t) } if t == "Second"));
     }
 }

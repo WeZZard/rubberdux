@@ -1352,6 +1352,7 @@ dependencies = [
 name = "rubberdux"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "dotenvy",
  "env_logger",
  "log",
@@ -1361,6 +1362,7 @@ dependencies = [
  "serde_json",
  "telegram-markdown-v2",
  "teloxide",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]

@@ -1,7 +1,10 @@
 pub mod adapter;
+pub mod interpreter;
+
+use interpreter::InterpretedMessage;
 
 pub struct UserMessage {
-    pub text: String,
+    pub interpreted: InterpretedMessage,
     pub reply_tx: tokio::sync::oneshot::Sender<AgentResponse>,
 }
 

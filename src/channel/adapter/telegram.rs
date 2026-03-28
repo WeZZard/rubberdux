@@ -1,6 +1,7 @@
 use teloxide::prelude::*;
 use tokio::sync::mpsc;
 
+use crate::channel::interpreter;
 use crate::channel::{AgentResponse, UserMessage};
 
 async fn handle_message(
@@ -8,17 +9,21 @@ async fn handle_message(
     msg: Message,
     tx: mpsc::Sender<UserMessage>,
 ) -> Result<(), teloxide::RequestError> {
-    let text = match msg.text() {
-        Some(t) => t,
+    let interpreted = match interpreter::interpret(&bot, &msg).await {
+        Some(m) => m,
         None => return Ok(()),
     };
 
-    log::info!("Received: {}", text);
+    log::info!(
+        "Received: {} (attachments: {})",
+        interpreted.text,
+        interpreted.attachments.len()
+    );
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentResponse>();
 
     let user_message = UserMessage {
-        text: text.to_owned(),
+        interpreted,
         reply_tx,
     };
 
