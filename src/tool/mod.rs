@@ -7,14 +7,25 @@ pub mod web_fetch;
 pub mod write;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::provider::moonshot::tool::ToolDefinition;
+use crate::provider::moonshot::tool::{ToolCall, ToolDefinition};
+use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
 
 const DEFAULT_TOOLS_DIR: &str = "./tools";
 
 pub struct ToolResult {
     pub content: String,
     pub is_error: bool,
+}
+
+/// Context for executing builtin tools that need API access.
+pub struct ToolContext {
+    pub client: Arc<MoonshotClient>,
+    pub system_prompt: String,
+    pub last_user_query: String,
+    pub assistant_message: Message,
+    pub tool_call: ToolCall,
 }
 
 pub fn tools_dir() -> PathBuf {
@@ -68,8 +79,17 @@ pub fn is_builtin_tool(name: &str) -> bool {
     name.starts_with('$')
 }
 
-pub async fn execute_tool(name: &str, arguments: &str) -> ToolResult {
-    // Kimi builtin functions: echo arguments back for server-side execution
+pub async fn execute_tool(
+    name: &str,
+    arguments: &str,
+    context: Option<ToolContext>,
+) -> ToolResult {
+    // $web_search: spawn background one-shot model call
+    if name == "$web_search" {
+        return execute_web_search_background(arguments, context).await;
+    }
+
+    // Other Kimi builtins: echo arguments back
     if is_builtin_tool(name) {
         return ToolResult {
             content: arguments.to_owned(),
@@ -102,6 +122,92 @@ pub async fn execute_tool(name: &str, arguments: &str) -> ToolResult {
     }
 }
 
+async fn execute_web_search_background(
+    arguments: &str,
+    context: Option<ToolContext>,
+) -> ToolResult {
+    let ctx = match context {
+        Some(c) => c,
+        None => {
+            // No context — fall back to echo (synchronous)
+            return ToolResult {
+                content: arguments.to_owned(),
+                is_error: false,
+            };
+        }
+    };
+
+    let task_id = format!("search_{}", generate_task_id());
+    let output_dir = PathBuf::from("./sessions/tasks");
+    let _ = std::fs::create_dir_all(&output_dir);
+
+    let output_path = output_dir.join(format!("{}.output", task_id));
+    let output_path_str = output_path.to_string_lossy().to_string();
+
+    let arguments = arguments.to_owned();
+    let path = output_path.clone();
+    let task_id_clone = task_id.clone();
+
+    tokio::spawn(async move {
+        log::info!("Background web search task {} started", task_id_clone);
+
+        // Build one-shot messages: [system, user_query, assistant(tool_calls), tool(search_args)]
+        let messages = vec![
+            Message::System {
+                content: ctx.system_prompt,
+            },
+            Message::User {
+                content: UserContent::Text(ctx.last_user_query),
+            },
+            ctx.assistant_message,
+            Message::Tool {
+                tool_call_id: ctx.tool_call.id,
+                name: Some("$web_search".to_owned()),
+                content: arguments,
+            },
+        ];
+
+        let result = ctx.client.chat(messages, None).await;
+
+        let output = match result {
+            Ok(response) => {
+                let text = response
+                    .choices
+                    .first()
+                    .map(|c| c.message.content_text().to_owned())
+                    .unwrap_or_else(|| "(empty search result)".into());
+                text
+            }
+            Err(e) => {
+                format!("Web search failed: {}", e)
+            }
+        };
+
+        if let Err(e) = std::fs::write(&path, &output) {
+            log::error!("Failed to write search result: {}", e);
+        }
+
+        log::info!("Background web search task {} completed", task_id_clone);
+    });
+
+    ToolResult {
+        content: format!(
+            "Searching in background with ID: {}. Output is being written to: {}",
+            task_id, output_path_str
+        ),
+        is_error: false,
+    }
+}
+
+fn generate_task_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("{:x}", ts & 0xFFFF_FFFF)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,13 +215,21 @@ mod tests {
     #[test]
     fn test_load_tool_definitions() {
         let defs = load_tool_definitions(Path::new("./tools"));
-        assert_eq!(defs.len(), 7); // 7 local tools (web_search is now a platform builtin)
+        assert_eq!(defs.len(), 7);
     }
 
     #[tokio::test]
     async fn test_unknown_tool_returns_error() {
-        let result = execute_tool("nonexistent", "{}").await;
+        let result = execute_tool("nonexistent", "{}", None).await;
         assert!(result.is_error);
         assert!(result.content.contains("Unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn test_web_search_without_context_echoes_args() {
+        let result = execute_tool("$web_search", "{\"test\": true}", None).await;
+        assert!(!result.is_error);
+        // Without context, falls back to echo
+        assert!(result.content.contains("test"));
     }
 }

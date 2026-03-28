@@ -6,6 +6,8 @@ mod prompt;
 mod provider;
 mod tool;
 
+use std::sync::Arc;
+
 use teloxide::prelude::*;
 
 #[tokio::main]
@@ -24,7 +26,7 @@ async fn main() {
 
     log::info!("Composed system prompt ({} chars)", system_prompt.len());
 
-    let client = provider::moonshot::MoonshotClient::from_env();
+    let client = Arc::new(provider::moonshot::MoonshotClient::from_env());
     log::info!("Moonshot client initialized (model: {})", client.model());
 
     let (tx, rx) = tokio::sync::mpsc::channel(32);

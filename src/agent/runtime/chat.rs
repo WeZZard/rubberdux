@@ -1,6 +1,7 @@
 use std::fs::OpenOptions;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
@@ -74,7 +75,7 @@ fn append_to_session(path: &Path, message: &Message) {
 
 pub async fn run(
     mut rx: mpsc::Receiver<UserMessage>,
-    client: MoonshotClient,
+    client: Arc<MoonshotClient>,
     system_prompt: String,
 ) {
     let best_perf_tokens: usize = std::env::var("RUBBERDUX_LLM_BEST_PERFORMANCE_TOKENS")
@@ -237,9 +238,34 @@ pub async fn run(
                         log::info!("Executing {} tool call(s)", tool_calls.len());
                         for call in tool_calls {
                             log::info!("Tool call: {}({})", call.function.name, call.function.arguments);
+
+                            // Build ToolContext for builtin tools that need API access
+                            let tool_context = if crate::tool::is_builtin_tool(&call.function.name) {
+                                let last_user_query = history.iter().rev()
+                                    .find_map(|m| match m {
+                                        Message::User { content } => Some(match content {
+                                            UserContent::Text(t) => t.clone(),
+                                            UserContent::Parts(_) => "(multimodal)".into(),
+                                        }),
+                                        _ => None,
+                                    })
+                                    .unwrap_or_default();
+
+                                Some(crate::tool::ToolContext {
+                                    client: client.clone(),
+                                    system_prompt: system_prompt.clone(),
+                                    last_user_query,
+                                    assistant_message: choice.message.clone(),
+                                    tool_call: call.clone(),
+                                })
+                            } else {
+                                None
+                            };
+
                             let result = crate::tool::execute_tool(
                                 &call.function.name,
                                 &call.function.arguments,
+                                tool_context,
                             )
                             .await;
 

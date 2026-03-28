@@ -174,7 +174,7 @@ async fn test_tool_call_loop() {
         if let Some(tool_calls) = choice.message.tool_calls() {
             for call in tool_calls {
                 let result =
-                    tool::execute_tool(&call.function.name, &call.function.arguments).await;
+                    tool::execute_tool(&call.function.name, &call.function.arguments, None).await;
 
                 history.push(Message::Tool {
                     tool_call_id: call.id.clone(),
@@ -205,7 +205,7 @@ async fn test_read_file_tool_execution() {
         "file_path": tmp.path().to_str().unwrap()
     });
 
-    let result = tool::execute_tool("read_file", &serde_json::to_string(&args).unwrap()).await;
+    let result = tool::execute_tool("read_file", &serde_json::to_string(&args).unwrap(), None).await;
 
     assert!(!result.is_error);
     assert!(result.content.contains("line1"));
@@ -220,7 +220,7 @@ async fn test_bash_tool_sync() {
         "command": "echo hello_test_output"
     });
 
-    let result = tool::execute_tool("bash", &serde_json::to_string(&args).unwrap()).await;
+    let result = tool::execute_tool("bash", &serde_json::to_string(&args).unwrap(), None).await;
 
     assert!(!result.is_error);
     assert!(result.content.contains("hello_test_output"));
@@ -235,7 +235,7 @@ async fn test_bash_tool_background() {
         "run_in_background": true
     });
 
-    let result = tool::execute_tool("bash", &serde_json::to_string(&args).unwrap()).await;
+    let result = tool::execute_tool("bash", &serde_json::to_string(&args).unwrap(), None).await;
 
     // Should return immediately without waiting for completion
     assert!(!result.is_error);
@@ -281,7 +281,7 @@ async fn test_edit_file_tool() {
         "new_string": "baz qux"
     });
 
-    let result = tool::execute_tool("edit_file", &serde_json::to_string(&args).unwrap()).await;
+    let result = tool::execute_tool("edit_file", &serde_json::to_string(&args).unwrap(), None).await;
 
     assert!(!result.is_error);
 
@@ -448,7 +448,7 @@ async fn test_background_tool_call_loop() {
         if let Some(tool_calls) = choice.message.tool_calls() {
             for call in tool_calls {
                 let result =
-                    tool::execute_tool(&call.function.name, &call.function.arguments).await;
+                    tool::execute_tool(&call.function.name, &call.function.arguments, None).await;
 
                 // Background tool should return immediately with task ID
                 if call.function.arguments.contains("run_in_background") {
@@ -606,7 +606,7 @@ async fn test_mixed_sync_background_tool_calls() {
         if let Some(tool_calls) = choice.message.tool_calls() {
             for call in tool_calls {
                 let result =
-                    tool::execute_tool(&call.function.name, &call.function.arguments).await;
+                    tool::execute_tool(&call.function.name, &call.function.arguments, None).await;
 
                 if call.function.arguments.contains("run_in_background") {
                     bg_tool_result = result.content.clone();
@@ -658,7 +658,7 @@ async fn test_background_task_output_readable() {
         "run_in_background": true
     });
     let bg_result =
-        tool::execute_tool("bash", &serde_json::to_string(&bg_args).unwrap()).await;
+        tool::execute_tool("bash", &serde_json::to_string(&bg_args).unwrap(), None).await;
 
     assert!(!bg_result.is_error);
 
@@ -680,7 +680,7 @@ async fn test_background_task_output_readable() {
             "file_path": output_path
         });
         let read_result =
-            tool::execute_tool("read_file", &serde_json::to_string(&read_args).unwrap()).await;
+            tool::execute_tool("read_file", &serde_json::to_string(&read_args).unwrap(), None).await;
         if !read_result.is_error && read_result.content.contains("lifecycle_test_output") {
             read_content = read_result.content;
             read_ok = true;
@@ -836,7 +836,7 @@ async fn test_multi_step_tool_chain() {
         if let Some(tool_calls) = choice.message.tool_calls() {
             for call in tool_calls {
                 let result =
-                    tool::execute_tool(&call.function.name, &call.function.arguments).await;
+                    tool::execute_tool(&call.function.name, &call.function.arguments, None).await;
                 history.push(Message::Tool {
                     tool_call_id: call.id.clone(),
                     name: None,
