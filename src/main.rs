@@ -1,19 +1,32 @@
+mod agent;
+mod channel;
+mod error;
+mod prompt;
+
 use teloxide::prelude::*;
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok();
     pretty_env_logger::init();
     log::info!("Starting rubberdux...");
 
-    let bot = Bot::from_env();
+    let prompt_dir = prompt::prompt_dir();
+    let system_prompt = prompt::load_system_prompt(&prompt_dir).unwrap_or_else(|e| {
+        log::error!("Failed to load system prompt from {:?}: {}", prompt_dir, e);
+        std::process::exit(1);
+    });
 
-    teloxide::repl(bot, |bot: Bot, msg: Message| async move {
-        if let Some(text) = msg.text() {
-            log::info!("Received: {}", text);
-            bot.send_message(msg.chat.id, format!("Echo: {}", text))
-                .await?;
-        }
-        Ok(())
-    })
-    .await;
+    log::info!("Loaded system prompt from {:?}", prompt_dir);
+
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+
+    tokio::spawn(agent::runtime::chat::run(rx, system_prompt));
+
+    let bot_token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_else(|_| {
+        log::error!("TELEGRAM_BOT_TOKEN is not set");
+        std::process::exit(1);
+    });
+    let bot = Bot::new(bot_token);
+    channel::adapter::telegram::run(bot, tx).await;
 }

@@ -9,8 +9,8 @@ cargo build --release # release build
 cargo test           # run tests
 cargo clippy         # lint
 
-# Run (requires TELOXIDE_TOKEN env var)
-TELOXIDE_TOKEN=<bot_token> cargo run
+# Run (requires TELEGRAM_BOT_TOKEN env var)
+TELEGRAM_BOT_TOKEN=<bot_token> cargo run
 ```
 
 ## Coding Conventions
@@ -21,6 +21,19 @@ TELOXIDE_TOKEN=<bot_token> cargo run
 - Use `log` macros (`log::info!`, `log::error!`) for logging. No `println!` outside of CLI output.
 - Derive `serde::Serialize` and `serde::Deserialize` on all data types that cross boundaries (config, API, storage).
 - Session data is stored as JSONL (one JSON object per line), not JSON arrays.
+### Naming Convention
+
+Name identifiers after domain concepts, not implementation details.
+
+**DO:**
+- Name environment variables and config keys after what the value represents.
+- Name types, functions, and modules after the domain concept they model.
+
+**DO NOT:**
+- Leak framework or library names into public-facing identifiers (env vars, config keys, module names).
+- Use names that would become misleading if the underlying library were swapped.
+
+**The test**: if the name stops making sense when you replace the library, it needs renaming.
 
 ### Path Convention
 
