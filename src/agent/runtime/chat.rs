@@ -106,6 +106,27 @@ pub async fn run(
             is_silent
         );
 
+        // Internal event: update assistant message with bot-sent Telegram ID
+        if let Some(rest) = text_preview.strip_prefix("__update_assistant_id:") {
+            let parts: Vec<&str> = rest.splitn(2, ':').collect();
+            if let (Some(msg_id_str), Some(idx_str)) = (parts.first(), parts.get(1)) {
+                if let (Ok(msg_id), Ok(idx)) = (msg_id_str.parse::<i32>(), idx_str.parse::<usize>()) {
+                    if let Some(Message::Assistant { content, .. }) = history.get_mut(idx) {
+                        if let Some(text) = content {
+                            let wrapped = format!(
+                                "<telegram-message from=\"assistant\" to=\"user\" id=\"{}\">{}</telegram-message>",
+                                msg_id, text
+                            );
+                            *text = wrapped;
+                            append_to_session(&session_file, &history[idx]);
+                            log::debug!("Updated assistant message at index {} with id={}", idx, msg_id);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
         // Silent messages (e.g. reactions) — append to history, don't call LLM
         if is_silent {
             let user_msg = Message::User {
@@ -177,14 +198,18 @@ pub async fn run(
                 history.push(user_msg);
                 history.push(asst_msg);
 
+                let asst_index = history.len() - 1;
+
                 AgentResponse {
                     text: response_text,
+                    history_index: asst_index,
                 }
             }
             Err(e) => {
                 log::error!("LLM call failed: {}", e);
                 AgentResponse {
                     text: format!("Sorry, I encountered an error: {}", e),
+                    history_index: 0,
                 }
             }
         };

@@ -10,4 +10,5 @@ pub struct UserMessage {
 
 pub struct AgentResponse {
     pub text: String,
+    pub history_index: usize,
 }

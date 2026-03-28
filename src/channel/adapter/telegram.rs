@@ -118,34 +118,47 @@ async fn handle_message(
                 }
             }
 
-            // Send reply message
-            if let Some(text) = reply_text {
+            // Send reply message and capture sent message ID
+            let reply_to_send = if let Some(text) = reply_text {
+                Some(text)
+            } else if reactions.is_empty() {
+                Some(response.text.clone())
+            } else {
+                None
+            };
+
+            if let Some(text) = reply_to_send {
                 let formatted = crate::markdown::telegram::format(&text);
                 log::debug!("Raw model reply:\n{}", text);
                 log::debug!("Formatted for Telegram:\n{}", formatted);
 
-                let send_result = bot
+                let sent_msg = bot
                     .send_message(msg.chat.id, &formatted)
                     .parse_mode(teloxide::types::ParseMode::MarkdownV2)
                     .await;
 
-                if let Err(e) = send_result {
-                    log::warn!("MarkdownV2 send failed ({}), retrying without parse_mode", e);
-                    bot.send_message(msg.chat.id, &text).await?;
-                }
-            } else if reactions.is_empty() {
-                // No structured output — fallback: send raw response
-                let formatted = crate::markdown::telegram::format(&response.text);
-                log::debug!("Raw LLM response (no tags):\n{}", response.text);
+                let sent_msg = match sent_msg {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        log::warn!("MarkdownV2 send failed ({}), retrying without parse_mode", e);
+                        bot.send_message(msg.chat.id, &text).await.ok()
+                    }
+                };
 
-                let send_result = bot
-                    .send_message(msg.chat.id, &formatted)
-                    .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-                    .await;
-
-                if let Err(e) = send_result {
-                    log::warn!("MarkdownV2 send failed ({}), retrying without parse_mode", e);
-                    bot.send_message(msg.chat.id, &response.text).await?;
+                // Report bot-sent message ID back to agent loop
+                if let Some(sent) = sent_msg {
+                    let update_text = format!(
+                        "__update_assistant_id:{}:{}",
+                        sent.id.0, response.history_index
+                    );
+                    let update_msg = UserMessage {
+                        interpreted: crate::channel::interpreter::InterpretedMessage {
+                            text: update_text,
+                            attachments: vec![],
+                        },
+                        reply_tx: None,
+                    };
+                    let _ = tx.send(update_msg).await;
                 }
             }
         }
