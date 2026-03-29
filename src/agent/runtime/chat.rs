@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::channel::{AgentResponse, UserMessage};
+use crate::channel::{AgentResponse, ChannelEvent, InternalEvent};
 use crate::provider::moonshot::tool::ToolDefinition;
 use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
 
@@ -78,7 +78,7 @@ fn append_to_session(path: &Path, message: &Message) {
 }
 
 pub async fn run(
-    mut rx: mpsc::Receiver<UserMessage>,
+    mut rx: mpsc::Receiver<ChannelEvent>,
     client: Arc<MoonshotClient>,
     system_prompt: String,
 ) {
@@ -98,88 +98,53 @@ pub async fn run(
         history.len()
     );
 
-    while let Some(msg) = rx.recv().await {
-        let interpreted = &msg.interpreted;
-        let text_preview = &interpreted.text;
-        let has_attachments = !interpreted.attachments.is_empty();
-        let is_silent = msg.reply_tx.is_none();
-
-        log::info!(
-            "Processing message: {} (attachments: {}, silent: {})",
-            text_preview,
-            interpreted.attachments.len(),
-            is_silent
-        );
-
-        // Internal event: update assistant message with bot-sent Telegram ID
-        if let Some(rest) = text_preview.strip_prefix("__update_assistant_id:") {
-            let parts: Vec<&str> = rest.splitn(2, ':').collect();
-            if let (Some(msg_id_str), Some(idx_str)) = (parts.first(), parts.get(1)) {
-                if let (Ok(msg_id), Ok(idx)) = (msg_id_str.parse::<i32>(), idx_str.parse::<usize>())
-                {
-                    if let Some(Message::Assistant { content, .. }) = history.get_mut(idx) {
-                        if let Some(text) = content {
-                            crate::channel::adapter::telegram::inject_assistant_message_id(
-                                text, msg_id,
-                            );
-                            append_to_session(&session_file, &history[idx]);
-                            log::debug!(
-                                "Updated assistant message at index {} with id={}",
-                                idx,
-                                msg_id
-                            );
-                        }
-                    }
-                }
+    while let Some(event) = rx.recv().await {
+        match event {
+            ChannelEvent::InternalEvent(internal) => {
+                handle_internal_event(internal, &mut history, &session_file);
+                continue;
             }
-            continue;
-        }
+            ChannelEvent::UserInput {
+                interpreted,
+                reply_tx,
+            } => {
+                let text_preview = &interpreted.text;
+                let has_attachments = !interpreted.attachments.is_empty();
+                let is_silent = reply_tx.is_none();
 
-        // Silent messages (e.g. reactions) — append to history, don't call LLM
-        if is_silent {
-            let user_msg = Message::User {
-                content: UserContent::Text(text_preview.clone()),
-            };
-            append_to_session(&session_file, &user_msg);
-            history.push(user_msg);
-            continue;
-        }
+                log::info!(
+                    "Processing message: {} (attachments: {}, silent: {})",
+                    text_preview,
+                    interpreted.attachments.len(),
+                    is_silent
+                );
 
-        // Evict oldest pairs if approaching the best performance threshold
-        let estimated_new = text_preview.len() / 4;
-        while last_prompt_tokens + estimated_new > best_perf_tokens
-            && evict_oldest_pair(&mut history)
-        {
-            log::info!(
-                "Evicting oldest message pair (estimated context: {} + {} = {}, threshold: {})",
-                last_prompt_tokens,
-                estimated_new,
-                last_prompt_tokens + estimated_new,
-                best_perf_tokens
-            );
-            last_prompt_tokens = last_prompt_tokens.saturating_sub(last_prompt_tokens / 10);
-        }
+                if is_silent {
+                    append_user_message(text_preview.clone(), &mut history, &session_file);
+                    continue;
+                }
 
-        // Store user message in history
-        let history_text = if has_attachments {
-            format!(
-                "{} [with {} attachment(s)]",
-                text_preview,
-                interpreted.attachments.len()
-            )
-        } else {
-            text_preview.clone()
-        };
+                evict_if_needed(
+                    &mut history,
+                    &mut last_prompt_tokens,
+                    text_preview,
+                    best_perf_tokens,
+                );
 
-        let user_msg = Message::User {
-            content: UserContent::Text(history_text),
-        };
-        append_to_session(&session_file, &user_msg);
-        history.push(user_msg);
+                let history_text = if has_attachments {
+                    format!(
+                        "{} [with {} attachment(s)]",
+                        text_preview,
+                        interpreted.attachments.len()
+                    )
+                } else {
+                    text_preview.clone()
+                };
+                let text_preview = text_preview.clone();
+                append_user_message(history_text, &mut history, &session_file);
 
         // Tool use loop: call LLM, execute tools, repeat until finish_reason="stop"
         let tools = assemble_tool_definitions(&client);
-        let reply_tx = msg.reply_tx;
 
         loop {
             let messages = build_messages(&system_prompt, &history);
@@ -200,15 +165,13 @@ pub async fn run(
                     let choice = match chat_response.choices.first() {
                         Some(c) => c,
                         None => {
-                            if let Some(tx) = &reply_tx {
-                                let _ = tx
-                                    .send(AgentResponse {
-                                        text: "(empty response)".into(),
-                                        history_index: history.len().saturating_sub(1),
-                                        is_final: true,
-                                    })
-                                    .await;
-                            }
+                            send_response(
+                                &reply_tx,
+                                "(empty response)".into(),
+                                history.len().saturating_sub(1),
+                                true,
+                            )
+                            .await;
                             break;
                         }
                     };
@@ -216,7 +179,6 @@ pub async fn run(
                     let is_final = choice.finish_reason == "stop";
                     let text = choice.message.content_text().to_owned();
 
-                    // Append assistant message to history
                     let asst_msg = choice.message.clone();
                     if !is_final {
                         append_to_session(&session_file, &asst_msg);
@@ -225,128 +187,170 @@ pub async fn run(
 
                     let asst_index = history.len() - 1;
 
-                    // Send text to channel immediately (intermediate or final)
-                    if !text.is_empty() {
-                        if let Some(tx) = &reply_tx {
-                            let _ = tx
-                                .send(AgentResponse {
-                                    text: text.clone(),
-                                    history_index: asst_index,
-                                    is_final,
-                                })
-                                .await;
-                        }
-                    } else if is_final {
-                        // Final response with no text — still signal completion
-                        if let Some(tx) = &reply_tx {
-                            let _ = tx
-                                .send(AgentResponse {
-                                    text: String::new(),
-                                    history_index: asst_index,
-                                    is_final: true,
-                                })
-                                .await;
-                        }
-                    }
+                    send_response(&reply_tx, text, asst_index, is_final).await;
 
                     if is_final {
                         log::info!("LLM finished for: {}", text_preview);
                         break;
                     }
 
-                    // Execute tool calls
-                    if let Some(tool_calls) = choice.message.tool_calls() {
-                        log::info!("Executing {} tool call(s)", tool_calls.len());
-                        for call in tool_calls {
-                            log::info!(
-                                "Tool call: {}({})",
-                                call.function.name,
-                                call.function.arguments
-                            );
-
-                            // Route: provider tools → provider, generic tools → tool module
-                            let outcome = if MoonshotClient::is_provider_tool(&call.function.name) {
-                                let last_user_query = history
-                                    .iter()
-                                    .rev()
-                                    .find_map(|m| match m {
-                                        Message::User { content } => Some(match content {
-                                            UserContent::Text(t) => t.clone(),
-                                            UserContent::Parts(_) => "(multimodal)".into(),
-                                        }),
-                                        _ => None,
-                                    })
-                                    .unwrap_or_default();
-
-                                let ctx = crate::provider::moonshot::ToolExecutionContext {
-                                    last_user_query,
-                                    assistant_message: choice.message.clone(),
-                                    tool_call: call.clone(),
-                                };
-
-                                client
-                                    .execute_provider_tool(
-                                        &call.function.name,
-                                        &call.function.arguments,
-                                        &ctx,
-                                    )
-                                    .await
-                            } else {
-                                crate::tool::execute_tool(
-                                    &call.function.name,
-                                    &call.function.arguments,
-                                )
-                                .await
-                            };
-
-                            if let crate::tool::ToolOutcome::Immediate {
-                                ref content,
-                                is_error: true,
-                            } = outcome
-                            {
-                                log::warn!("Tool error: {}", content);
-                            }
-
-                            // Format: provider override first, then default
-                            let content =
-                                MoonshotClient::format_tool_outcome(&call.function.name, &outcome)
-                                    .unwrap_or_else(|| crate::tool::format_tool_outcome(&outcome));
-
-                            let tool_name = if MoonshotClient::is_provider_tool(&call.function.name)
-                            {
-                                Some(call.function.name.clone())
-                            } else {
-                                None
-                            };
-
-                            let tool_msg = Message::Tool {
-                                tool_call_id: call.id.clone(),
-                                name: tool_name,
-                                content,
-                            };
-                            append_to_session(&session_file, &tool_msg);
-                            history.push(tool_msg);
-                        }
-                    }
+                    execute_tool_calls(&client, choice, &mut history, &session_file).await;
                 }
                 Err(e) => {
                     log::error!("LLM call failed: {}", e);
-                    if let Some(tx) = &reply_tx {
-                        let _ = tx
-                            .send(AgentResponse {
-                                text: format!("Sorry, I encountered an error: {}", e),
-                                history_index: history.len().saturating_sub(1),
-                                is_final: true,
-                            })
-                            .await;
-                    }
+                    send_response(
+                        &reply_tx,
+                        format!("Sorry, I encountered an error: {}", e),
+                        history.len().saturating_sub(1),
+                        true,
+                    )
+                    .await;
                     break;
                 }
             }
         }
+            } // ChannelEvent::UserInput
+        } // match event
     }
 
     log::info!("Agent loop shutting down");
+}
+
+async fn send_response(
+    tx: &Option<tokio::sync::mpsc::Sender<AgentResponse>>,
+    text: String,
+    history_index: usize,
+    is_final: bool,
+) {
+    if let Some(tx) = tx {
+        if !text.is_empty() || is_final {
+            let _ = tx
+                .send(AgentResponse {
+                    text,
+                    history_index,
+                    is_final,
+                })
+                .await;
+        }
+    }
+}
+
+async fn execute_tool_calls(
+    client: &MoonshotClient,
+    choice: &crate::provider::moonshot::api::chat::ChatChoice,
+    history: &mut Vec<Message>,
+    session_file: &Path,
+) {
+    let tool_calls = match choice.message.tool_calls() {
+        Some(tc) => tc,
+        None => return,
+    };
+
+    log::info!("Executing {} tool call(s)", tool_calls.len());
+    for call in tool_calls {
+        log::info!("Tool call: {}({})", call.function.name, call.function.arguments);
+
+        let outcome = if MoonshotClient::is_provider_tool(&call.function.name) {
+            let last_user_query = history
+                .iter()
+                .rev()
+                .find_map(|m| match m {
+                    Message::User { content } => Some(match content {
+                        UserContent::Text(t) => t.clone(),
+                        UserContent::Parts(_) => "(multimodal)".into(),
+                    }),
+                    _ => None,
+                })
+                .unwrap_or_default();
+
+            let ctx = crate::provider::moonshot::ToolExecutionContext {
+                last_user_query,
+                assistant_message: choice.message.clone(),
+                tool_call: call.clone(),
+            };
+
+            client
+                .execute_provider_tool(&call.function.name, &call.function.arguments, &ctx)
+                .await
+        } else {
+            crate::tool::execute_tool(&call.function.name, &call.function.arguments).await
+        };
+
+        if let crate::tool::ToolOutcome::Immediate {
+            ref content,
+            is_error: true,
+        } = outcome
+        {
+            log::warn!("Tool error: {}", content);
+        }
+
+        let content = MoonshotClient::format_tool_outcome(&call.function.name, &outcome)
+            .unwrap_or_else(|| crate::tool::format_tool_outcome(&outcome));
+
+        let tool_name = if MoonshotClient::is_provider_tool(&call.function.name) {
+            Some(call.function.name.clone())
+        } else {
+            None
+        };
+
+        let tool_msg = Message::Tool {
+            tool_call_id: call.id.clone(),
+            name: tool_name,
+            content,
+        };
+        append_to_session(session_file, &tool_msg);
+        history.push(tool_msg);
+    }
+}
+
+fn handle_internal_event(event: InternalEvent, history: &mut Vec<Message>, session_file: &Path) {
+    match event {
+        InternalEvent::UpdateAssistantMessageId {
+            history_index,
+            message_id,
+        } => {
+            if let Some(Message::Assistant { content, .. }) = history.get_mut(history_index) {
+                if let Some(text) = content {
+                    crate::channel::adapter::telegram::inject_assistant_message_id(
+                        text, message_id,
+                    );
+                    append_to_session(session_file, &history[history_index]);
+                    log::debug!(
+                        "Updated assistant message at index {} with id={}",
+                        history_index,
+                        message_id
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn append_user_message(text: String, history: &mut Vec<Message>, session_file: &Path) {
+    let msg = Message::User {
+        content: UserContent::Text(text),
+    };
+    append_to_session(session_file, &msg);
+    history.push(msg);
+}
+
+fn evict_if_needed(
+    history: &mut Vec<Message>,
+    last_prompt_tokens: &mut usize,
+    text_preview: &str,
+    best_perf_tokens: usize,
+) {
+    let estimated_new = text_preview.len() / 4;
+    while *last_prompt_tokens + estimated_new > best_perf_tokens && evict_oldest_pair(history) {
+        log::info!(
+            "Evicting oldest message pair (estimated context: {} + {} = {}, threshold: {})",
+            last_prompt_tokens,
+            estimated_new,
+            *last_prompt_tokens + estimated_new,
+            best_perf_tokens
+        );
+        *last_prompt_tokens = last_prompt_tokens.saturating_sub(*last_prompt_tokens / 10);
+    }
 }
 
 fn build_messages(system_prompt: &str, history: &[Message]) -> Vec<Message> {

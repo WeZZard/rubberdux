@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 use super::markup::{self, Document, MessageElement, Node};
 use super::parser::{self, Segment};
 use crate::channel::interpreter;
-use crate::channel::{AgentResponse, UserMessage};
+use crate::channel::{AgentResponse, ChannelEvent, InternalEvent};
 
 const TELEGRAM_PROMPT: &str = include_str!("TELEGRAM.md");
 
@@ -17,7 +17,7 @@ pub fn channel_prompt() -> &'static str {
 async fn handle_message(
     bot: Bot,
     msg: Message,
-    tx: mpsc::Sender<UserMessage>,
+    tx: mpsc::Sender<ChannelEvent>,
 ) -> Result<(), teloxide::RequestError> {
     let interpreted = match interpreter::interpret(&bot, &msg).await {
         Some(m) => m,
@@ -32,12 +32,12 @@ async fn handle_message(
 
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<AgentResponse>(16);
 
-    let user_message = UserMessage {
+    let event = ChannelEvent::UserInput {
         interpreted,
         reply_tx: Some(reply_tx),
     };
 
-    if tx.send(user_message).await.is_err() {
+    if tx.send(event).await.is_err() {
         log::error!("Agent loop channel closed");
         bot.send_message(msg.chat.id, "Sorry, the agent is unavailable.")
             .await?;
@@ -97,18 +97,14 @@ async fn handle_message(
                     // Report bot-sent message ID back to agent loop (final messages only)
                     if response.is_final {
                         if let Some(sent) = sent_msg {
-                            let update_text = format!(
-                                "__update_assistant_id:{}:{}",
-                                sent.id.0, response.history_index
-                            );
-                            let update_msg = UserMessage {
-                                interpreted: crate::channel::interpreter::InterpretedMessage {
-                                    text: update_text,
-                                    attachments: vec![],
-                                },
-                                reply_tx: None,
-                            };
-                            let _ = tx.send(update_msg).await;
+                            let _ = tx
+                                .send(ChannelEvent::InternalEvent(
+                                    InternalEvent::UpdateAssistantMessageId {
+                                        history_index: response.history_index,
+                                        message_id: sent.id.0,
+                                    },
+                                ))
+                                .await;
                         }
                     }
                 }
@@ -161,19 +157,19 @@ async fn handle_message(
 
 async fn handle_reaction(
     reaction: MessageReactionUpdated,
-    tx: mpsc::Sender<UserMessage>,
+    tx: mpsc::Sender<ChannelEvent>,
 ) -> Result<(), teloxide::RequestError> {
     let interpreted_messages = interpreter::interpret_reaction(&reaction);
 
     for interpreted in interpreted_messages {
         log::info!("Reaction event: {}", interpreted.text);
 
-        let user_message = UserMessage {
+        let event = ChannelEvent::UserInput {
             interpreted,
             reply_tx: None,
         };
 
-        if tx.send(user_message).await.is_err() {
+        if tx.send(event).await.is_err() {
             log::error!("Agent loop channel closed (reaction)");
         }
     }
@@ -181,7 +177,7 @@ async fn handle_reaction(
     Ok(())
 }
 
-pub async fn run(bot: Bot, tx: mpsc::Sender<UserMessage>) {
+pub async fn run(bot: Bot, tx: mpsc::Sender<ChannelEvent>) {
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(handle_message))
         .branch(Update::filter_message_reaction_updated().endpoint(handle_reaction));
