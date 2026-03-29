@@ -18,13 +18,13 @@ pub enum ChannelEvent {
 pub enum InternalEvent {
     /// Associates a channel-side message ID with an assistant message in history.
     UpdateAssistantMessageId {
-        history_index: usize,
+        entry_id: usize,
         message_id: i32,
     },
 }
 
 pub struct AgentResponse {
     pub text: String,
-    pub history_index: usize,
+    pub entry_id: usize,
     pub is_final: bool,
 }

@@ -76,8 +76,11 @@ async fn execute_background(command: &str) -> ToolOutcome {
 
     let output_path = output_dir.join(format!("{}.output", task_id));
 
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
     let command = command.to_owned();
     let path = output_path.clone();
+    let tid = task_id.clone();
 
     tokio::spawn(async move {
         let result = tokio::process::Command::new("sh")
@@ -107,9 +110,14 @@ async fn execute_background(command: &str) -> ToolOutcome {
         }
 
         log::info!("Background task {} completed", path.display());
+
+        let _ = tx.send(super::BackgroundTaskResult {
+            task_id: tid,
+            content,
+        });
     });
 
-    ToolOutcome::Background { task_id, output_path }
+    ToolOutcome::Background { task_id, output_path, receiver: rx }
 }
 
 fn generate_task_id() -> String {

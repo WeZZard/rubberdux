@@ -2,7 +2,7 @@
   "type": "function",
   "function": {
     "name": "web_fetch",
-    "description": "Fetch the content of a web page URL and return it as markdown. Uses a headless browser to render JavaScript-heavy pages. This tool always runs in the background. You will be notified automatically when the result is ready — do NOT poll, read output files, or wait for the result. Continue responding to the user.",
+    "description": "Fetch the content of a web page URL and return it as markdown. Uses a headless browser to render JavaScript-heavy pages. This tool runs in the background — the result will be delivered automatically when ready. Respond to the user acknowledging the request is being processed.",
     "parameters": {
       "type": "object",
       "properties": {

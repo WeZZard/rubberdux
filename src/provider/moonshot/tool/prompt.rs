@@ -56,7 +56,7 @@ mod tests {
         let bash = defs.get("bash").expect("bash should be present");
         let desc = bash.function.description.as_deref().unwrap_or("");
         assert!(desc.contains("bash command"), "should contain domain description");
-        assert!(desc.contains("do NOT sleep, poll"), "should contain Kimi behavioral instruction");
+        assert!(desc.contains("delivered to you automatically"), "should contain Kimi behavioral instruction");
     }
 
     #[test]

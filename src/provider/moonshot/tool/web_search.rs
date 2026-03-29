@@ -30,9 +30,12 @@ pub async fn execute(arguments: &str, context: Option<WebSearchContext>) -> Tool
     let _ = std::fs::create_dir_all(&output_dir);
     let output_path = output_dir.join(format!("{}.output", task_id));
 
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
     let arguments = arguments.to_owned();
     let path = output_path.clone();
     let task_id_clone = task_id.clone();
+    let tid = task_id.clone();
 
     tokio::spawn(async move {
         log::info!("Background web search task {} started", task_id_clone);
@@ -70,11 +73,17 @@ pub async fn execute(arguments: &str, context: Option<WebSearchContext>) -> Tool
         }
 
         log::info!("Background web search task {} completed", task_id_clone);
+
+        let _ = tx.send(crate::tool::BackgroundTaskResult {
+            task_id: tid,
+            content: output,
+        });
     });
 
     ToolOutcome::Background {
         task_id,
         output_path,
+        receiver: rx,
     }
 }
 

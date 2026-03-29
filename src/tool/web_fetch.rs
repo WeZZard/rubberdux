@@ -22,8 +22,11 @@ pub async fn execute(args: &serde_json::Value) -> ToolOutcome {
 
     let output_path = output_dir.join(format!("{}.output", task_id));
 
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
     let url = url.to_owned();
     let path = output_path.clone();
+    let tid = task_id.clone();
 
     tokio::task::spawn_blocking(move || {
         let content = match fetch_rendered(&url) {
@@ -36,9 +39,14 @@ pub async fn execute(args: &serde_json::Value) -> ToolOutcome {
         }
 
         log::info!("Background fetch task {} completed", path.display());
+
+        let _ = tx.send(super::BackgroundTaskResult {
+            task_id: tid,
+            content,
+        });
     });
 
-    ToolOutcome::Background { task_id, output_path }
+    ToolOutcome::Background { task_id, output_path, receiver: rx }
 }
 
 fn fetch_rendered(url: &str) -> Result<String, String> {

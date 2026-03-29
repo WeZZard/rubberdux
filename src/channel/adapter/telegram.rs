@@ -94,18 +94,16 @@ async fn handle_message(
                         }
                     };
 
-                    // Report bot-sent message ID back to agent loop (final messages only)
-                    if response.is_final {
-                        if let Some(sent) = sent_msg {
-                            let _ = tx
-                                .send(ChannelEvent::InternalEvent(
-                                    InternalEvent::UpdateAssistantMessageId {
-                                        history_index: response.history_index,
-                                        message_id: sent.id.0,
-                                    },
-                                ))
-                                .await;
-                        }
+                    // Report bot-sent message ID back to agent loop
+                    if let Some(sent) = sent_msg {
+                        let _ = tx
+                            .send(ChannelEvent::InternalEvent(
+                                InternalEvent::UpdateAssistantMessageId {
+                                    entry_id: response.entry_id,
+                                    message_id: sent.id.0,
+                                },
+                            ))
+                            .await;
                     }
                 }
                 Segment::Internal(_) => {

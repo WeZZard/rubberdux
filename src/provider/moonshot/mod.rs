@@ -513,10 +513,12 @@ mod tests {
         dotenvy::dotenv().ok();
 
         // Use the default format_tool_outcome to generate the tool result message
+        let (_tx, _rx) = tokio::sync::oneshot::channel();
         let default_bg_message = crate::tool::format_tool_outcome(
             &crate::tool::ToolOutcome::Background {
                 task_id: "fetch_abc123".into(),
                 output_path: std::path::PathBuf::from("./sessions/tasks/fetch_abc123.output"),
+                receiver: _rx,
             },
         );
 
@@ -545,6 +547,197 @@ mod tests {
             let status = if *polled { "POLLED (bad)" } else { "CLEAN (good)" };
             eprintln!("  {} => {}", label, status);
         }
+        eprintln!("{}\n", "=".repeat(80));
+    }
+
+    /// Experiment: observe whether recursive tool calls form a tree or linked list.
+    ///
+    /// Scenario: user asks for info that requires multiple sources. After each
+    /// tool result, we observe if the model calls ONE tool (linked list) or
+    /// MULTIPLE tools (tree) in the next turn.
+    ///
+    /// Run with: cargo test test_tool_call_recursion_shape -- --nocapture --ignored
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore] // requires real API credentials
+    async fn test_tool_call_recursion_shape() {
+        dotenvy::dotenv().ok();
+        let client = MoonshotClient::from_env();
+        let tools: Vec<_> = client
+            .override_tool_definitions(crate::tool::default_tool_definitions())
+            .into_values()
+            .collect();
+
+        let system_prompt = "You are a helpful assistant.";
+
+        let mut history: Vec<Message> = vec![
+            Message::User {
+                content: UserContent::Text(
+                    "Compare the latest news about Google and Apple. Search for both.".into(),
+                ),
+            },
+        ];
+
+        eprintln!("\n{}", "=".repeat(80));
+        eprintln!("TOOL CALL RECURSION SHAPE EXPERIMENT");
+        eprintln!("{}", "=".repeat(80));
+
+        let max_turns = 6;
+        for turn in 1..=max_turns {
+            let mut messages = vec![Message::System {
+                content: system_prompt.to_owned(),
+            }];
+            messages.extend_from_slice(&history);
+
+            let response = client.chat(messages, Some(tools.clone())).await.unwrap();
+            let choice = &response.choices[0];
+
+            let tool_calls = choice.message.tool_calls();
+            let num_tools = tool_calls.map(|tc| tc.len()).unwrap_or(0);
+
+            eprintln!(
+                "\n  [Turn {}] finish_reason={} tool_calls={}",
+                turn, choice.finish_reason, num_tools
+            );
+
+            if let Some(rc) = choice.message.reasoning_content() {
+                let rc_short = if rc.len() > 200 { &rc[..200] } else { rc };
+                eprintln!("  reasoning: {}...", rc_short);
+            }
+
+            if num_tools > 0 {
+                let tc = tool_calls.unwrap();
+                for (i, call) in tc.iter().enumerate() {
+                    eprintln!(
+                        "    tool[{}]: {}({})",
+                        i,
+                        call.function.name,
+                        &call.function.arguments[..call.function.arguments.len().min(80)]
+                    );
+                }
+
+                // KEY OBSERVATION: does the model call 1 tool or multiple?
+                if num_tools > 1 {
+                    eprintln!("  >>> TREE: model called {} tools in one turn", num_tools);
+                } else {
+                    eprintln!("  >>> CHAIN: model called 1 tool");
+                }
+            } else {
+                let text = choice.message.content_text();
+                let short = if text.len() > 150 { &text[..150] } else { text };
+                eprintln!("  response: {}...", short);
+            }
+
+            history.push(choice.message.clone());
+
+            if choice.finish_reason == "stop" {
+                eprintln!("\n  Model stopped at turn {}", turn);
+                break;
+            }
+
+            // Provide fake tool results for each tool call
+            if let Some(tc) = tool_calls {
+                for call in tc {
+                    let fake_result = format!(
+                        "Search results for {}: Some relevant news articles found.",
+                        call.function.name
+                    );
+                    history.push(Message::Tool {
+                        tool_call_id: call.id.clone(),
+                        name: if call.function.name.starts_with('$') {
+                            Some(call.function.name.clone())
+                        } else {
+                            None
+                        },
+                        content: fake_result,
+                    });
+                    eprintln!("  <- provided fake result for {}", call.function.name);
+                }
+            }
+        }
+
+        eprintln!("\n{}", "=".repeat(80));
+    }
+
+    /// Experiment: verify the Moonshot API accepts multiple Tool messages
+    /// as responses to multiple tool calls in one assistant turn, and the
+    /// model processes all results together in the next turn.
+    ///
+    /// Run with: cargo test test_batch_tool_results -- --nocapture --ignored
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn test_batch_tool_results() {
+        dotenvy::dotenv().ok();
+        let client = MoonshotClient::from_env();
+        let tools: Vec<_> = client
+            .override_tool_definitions(crate::tool::default_tool_definitions())
+            .into_values()
+            .collect();
+
+        // Step 1: Get the model to call multiple tools
+        let mut history: Vec<Message> = vec![Message::User {
+            content: UserContent::Text(
+                "Fetch both https://example.com and https://example.org for me.".into(),
+            ),
+        }];
+
+        let mut messages = vec![Message::System {
+            content: "You are a helpful assistant.".to_owned(),
+        }];
+        messages.extend_from_slice(&history);
+
+        let response = client.chat(messages, Some(tools.clone())).await.unwrap();
+        let choice = &response.choices[0];
+        let tc = choice.message.tool_calls();
+        let num = tc.map(|t| t.len()).unwrap_or(0);
+
+        eprintln!("\n{}", "=".repeat(80));
+        eprintln!("BATCH TOOL RESULTS EXPERIMENT");
+        eprintln!("{}", "=".repeat(80));
+        eprintln!("\nStep 1: Model called {} tools", num);
+
+        if num < 2 {
+            eprintln!("Model didn't call multiple tools. Trying to force it...");
+            // If model called only 1, skip the experiment
+            eprintln!("SKIPPED — model needs to call 2+ tools for this test");
+            return;
+        }
+
+        history.push(choice.message.clone());
+
+        // Step 2: Provide ALL tool results at once
+        let tool_calls = tc.unwrap();
+        for (i, call) in tool_calls.iter().enumerate() {
+            eprintln!("  tool[{}]: {}({})", i, call.function.name, &call.function.arguments[..call.function.arguments.len().min(60)]);
+            let result_content = format!("Content from tool call {}: This is fake content for {}.", i, call.function.name);
+            history.push(Message::Tool {
+                tool_call_id: call.id.clone(),
+                name: if call.function.name.starts_with('$') { Some(call.function.name.clone()) } else { None },
+                content: result_content,
+            });
+        }
+
+        eprintln!("\nStep 2: Provided {} tool results in one batch", tool_calls.len());
+
+        // Step 3: Call the model again — does it see ALL results?
+        let mut messages = vec![Message::System { content: "You are a helpful assistant.".to_owned() }];
+        messages.extend_from_slice(&history);
+
+        let response = client.chat(messages, Some(tools.clone())).await.unwrap();
+        let choice = &response.choices[0];
+
+        eprintln!("\nStep 3: Model response (finish_reason={})", choice.finish_reason);
+        if let Some(rc) = choice.message.reasoning_content() {
+            eprintln!("  reasoning: {}", if rc.len() > 300 { &rc[..300] } else { rc });
+        }
+        let text = choice.message.content_text();
+        eprintln!("  content: {}", if text.len() > 300 { &text[..300] } else { text });
+
+        let new_tc = choice.message.tool_calls().map(|t| t.len()).unwrap_or(0);
+        eprintln!("  new tool_calls: {}", new_tc);
+
+        eprintln!("\nCONCLUSION: API {} batch tool results",
+            if choice.finish_reason == "stop" || new_tc > 0 { "ACCEPTS" } else { "REJECTS" }
+        );
         eprintln!("{}\n", "=".repeat(80));
     }
 }

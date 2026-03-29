@@ -15,12 +15,22 @@ use crate::provider::moonshot::tool::ToolDefinition;
 // ToolOutcome — raw domain result from tool execution
 // ---------------------------------------------------------------------------
 
+/// Result delivered by a background task through its oneshot channel.
+pub struct BackgroundTaskResult {
+    pub task_id: String,
+    pub content: String,
+}
+
 /// Raw outcome from tool execution, before provider-specific formatting.
 pub enum ToolOutcome {
     /// Immediate result with raw content.
     Immediate { content: String, is_error: bool },
     /// Task dispatched to the background.
-    Background { task_id: String, output_path: PathBuf },
+    Background {
+        task_id: String,
+        output_path: PathBuf,
+        receiver: tokio::sync::oneshot::Receiver<BackgroundTaskResult>,
+    },
 }
 
 /// Default formatting for ToolOutcome → Message::Tool content.
@@ -29,8 +39,9 @@ pub fn format_tool_outcome(outcome: &ToolOutcome) -> String {
     match outcome {
         ToolOutcome::Immediate { content, .. } => content.clone(),
         ToolOutcome::Background { task_id, .. } => format!(
-            "Background task {} started. You will be notified automatically \
-             when the result is ready — do not poll or wait for it.",
+            "Background task {} is running. The result will be delivered \
+             to you automatically when ready. Proceed with your response \
+             to the user.",
             task_id
         ),
     }
@@ -145,14 +156,16 @@ mod tests {
 
     #[test]
     fn test_format_tool_outcome_background() {
+        let (_tx, rx) = tokio::sync::oneshot::channel();
         let outcome = ToolOutcome::Background {
             task_id: "bg_abc123".into(),
             output_path: PathBuf::from("./sessions/tasks/bg_abc123.output"),
+            receiver: rx,
         };
         let formatted = format_tool_outcome(&outcome);
         assert!(formatted.contains("bg_abc123"), "should contain task_id");
         assert!(!formatted.contains("sessions/tasks"), "should NOT contain file path");
-        assert!(formatted.contains("notified automatically"), "should tell model it will be notified");
+        assert!(formatted.contains("delivered"), "should tell model result will be delivered");
     }
 
     #[test]

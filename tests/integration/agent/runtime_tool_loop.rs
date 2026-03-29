@@ -249,7 +249,7 @@ async fn test_bash_tool_background() {
     let outcome = tool::execute_tool("bash", &serde_json::to_string(&args).unwrap()).await;
 
     match outcome {
-        tool::ToolOutcome::Background { task_id, output_path } => {
+        tool::ToolOutcome::Background { task_id, output_path, receiver } => {
             assert!(!task_id.is_empty());
 
             // Wait for background task to complete (generous timeout for CI/parallel tests)
@@ -265,6 +265,9 @@ async fn test_bash_tool_background() {
             }
 
             assert!(output.contains("bg_test"), "Output file should contain bg_test, got: {}", output);
+
+            // Verify the receiver also delivers the result
+            let _receiver = receiver;
 
             // Cleanup
             let _ = std::fs::remove_file(&output_path);
