@@ -48,107 +48,106 @@ async fn handle_message(
         .send_chat_action(msg.chat.id, teloxide::types::ChatAction::Typing)
         .await;
 
-    while let Some(response) = reply_rx.recv().await {
-        // Parse structured model output using the recursive descent parser
-        let segments = parser::parse_model_output(&response.text);
+    // Spawn reply handling so this function returns immediately,
+    // freeing the Telegram dispatcher to process new messages.
+    let chat_id = msg.chat.id;
+    tokio::spawn(async move {
+        while let Some(response) = reply_rx.recv().await {
+            let segments = parser::parse_model_output(&response.text);
 
-        let mut has_reply = false;
+            let mut has_reply = false;
 
-        for segment in &segments {
-            match segment {
-                Segment::TelegramReaction { emoji, message_id } => {
-                    let reaction = ReactionType::Emoji {
-                        emoji: emoji.clone(),
-                    };
-                    let result = bot
-                        .set_message_reaction(
-                            Recipient::Id(msg.chat.id),
-                            teloxide::types::MessageId(*message_id),
-                        )
-                        .reaction(vec![reaction])
-                        .await;
+            for segment in &segments {
+                match segment {
+                    Segment::TelegramReaction { emoji, message_id } => {
+                        let reaction = ReactionType::Emoji {
+                            emoji: emoji.clone(),
+                        };
+                        let result = bot
+                            .set_message_reaction(
+                                Recipient::Id(chat_id),
+                                teloxide::types::MessageId(*message_id),
+                            )
+                            .reaction(vec![reaction])
+                            .await;
 
-                    if let Err(e) = result {
-                        log::warn!("Failed to set reaction: {}", e);
+                        if let Err(e) = result {
+                            log::warn!("Failed to set reaction: {}", e);
+                        }
                     }
+                    Segment::TelegramMessage { content } => {
+                        has_reply = true;
+                        let formatted = super::markdown::format(content);
+                        log::debug!("Raw model reply:\n{}", content);
+                        log::debug!("Formatted for Telegram:\n{}", formatted);
+
+                        let sent_msg = bot
+                            .send_message(chat_id, &formatted)
+                            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                            .await;
+
+                        let sent_msg = match sent_msg {
+                            Ok(m) => Some(m),
+                            Err(e) => {
+                                log::warn!(
+                                    "MarkdownV2 send failed ({}), retrying without parse_mode",
+                                    e
+                                );
+                                bot.send_message(chat_id, content).await.ok()
+                            }
+                        };
+
+                        if let Some(sent) = sent_msg {
+                            let _ = tx
+                                .send(ChannelEvent::InternalEvent(
+                                    InternalEvent::UpdateAssistantMessageId {
+                                        entry_id: response.entry_id,
+                                        message_id: sent.id.0,
+                                    },
+                                ))
+                                .await;
+                        }
+                    }
+                    Segment::Internal(_) => {}
                 }
-                Segment::TelegramMessage { content } => {
-                    has_reply = true;
-                    let formatted = super::markdown::format(content);
-                    log::debug!("Raw model reply:\n{}", content);
-                    log::debug!("Formatted for Telegram:\n{}", formatted);
+            }
+
+            if !has_reply
+                && segments
+                    .iter()
+                    .all(|s| !matches!(s, Segment::TelegramReaction { .. }))
+            {
+                if !response.text.is_empty() {
+                    let formatted = super::markdown::format(&response.text);
+                    log::debug!("Raw LLM response (no tags):\n{}", response.text);
 
                     let sent_msg = bot
-                        .send_message(msg.chat.id, &formatted)
+                        .send_message(chat_id, &formatted)
                         .parse_mode(teloxide::types::ParseMode::MarkdownV2)
                         .await;
 
-                    let sent_msg = match sent_msg {
-                        Ok(m) => Some(m),
+                    match sent_msg {
+                        Ok(_) => {}
                         Err(e) => {
                             log::warn!(
                                 "MarkdownV2 send failed ({}), retrying without parse_mode",
                                 e
                             );
-                            bot.send_message(msg.chat.id, content).await.ok()
+                            let _ = bot.send_message(chat_id, &response.text).await;
                         }
-                    };
-
-                    // Report bot-sent message ID back to agent loop
-                    if let Some(sent) = sent_msg {
-                        let _ = tx
-                            .send(ChannelEvent::InternalEvent(
-                                InternalEvent::UpdateAssistantMessageId {
-                                    entry_id: response.entry_id,
-                                    message_id: sent.id.0,
-                                },
-                            ))
-                            .await;
-                    }
-                }
-                Segment::Internal(_) => {
-                    // Internal reasoning — not sent to user
-                }
-            }
-        }
-
-        // Fallback: if no telegram-message tags found, send raw text
-        if !has_reply
-            && segments
-                .iter()
-                .all(|s| !matches!(s, Segment::TelegramReaction { .. }))
-        {
-            if !response.text.is_empty() {
-                let formatted = super::markdown::format(&response.text);
-                log::debug!("Raw LLM response (no tags):\n{}", response.text);
-
-                let sent_msg = bot
-                    .send_message(msg.chat.id, &formatted)
-                    .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-                    .await;
-
-                match sent_msg {
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::warn!(
-                            "MarkdownV2 send failed ({}), retrying without parse_mode",
-                            e
-                        );
-                        let _ = bot.send_message(msg.chat.id, &response.text).await;
                     }
                 }
             }
-        }
 
-        if response.is_final {
-            break;
-        }
+            if response.is_final {
+                break;
+            }
 
-        // Show typing indicator between intermediate messages
-        let _ = bot
-            .send_chat_action(msg.chat.id, teloxide::types::ChatAction::Typing)
-            .await;
-    }
+            let _ = bot
+                .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
+                .await;
+        }
+    });
 
     Ok(())
 }

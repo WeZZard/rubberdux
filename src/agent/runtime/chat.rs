@@ -12,9 +12,32 @@ use crate::provider::moonshot::tool::ToolDefinition;
 use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
 use crate::tool::BackgroundTaskResult;
 
-struct PendingTaskMeta {
-    asst_entry_id: usize,
+/// Result of a single LLM tool turn.
+enum TurnResult {
+    /// Model stopped (finish_reason="stop"). Send response to user.
+    Done { text: String, entry_id: usize },
+    /// Sync tools executed, need another LLM call immediately.
+    Continue,
+    /// Background tasks dispatched. Wait for all to complete.
+    Pending { asst_entry_id: usize, task_ids: Vec<String> },
+}
+
+/// Runtime state for a group of background tasks from one LLM turn.
+struct TaskGroup {
     reply_tx: tokio::sync::mpsc::Sender<AgentResponse>,
+    asst_entry_id: usize,
+    remaining: usize,
+    completed_results: Vec<BackgroundTaskResult>,
+}
+
+/// A conversation that needs the next LLM step. Persists across select! iterations.
+/// Accumulates background task IDs until the model stops, then creates one TaskGroup.
+struct ActiveConversation {
+    reply_tx: tokio::sync::mpsc::Sender<AgentResponse>,
+    /// Background task IDs accumulated across multiple tool turns.
+    pending_task_ids: Vec<String>,
+    /// The assistant entry that first dispatched background tasks (for TaskGroup).
+    first_bg_asst_entry_id: Option<usize>,
 }
 
 const DEFAULT_BEST_PERFORMANCE_TOKENS: usize = 153_600;
@@ -148,213 +171,58 @@ fn append_entry_to_session(path: &Path, entry: &Entry) {
     }
 }
 
-pub async fn run(
-    mut rx: mpsc::Receiver<ChannelEvent>,
-    client: Arc<MoonshotClient>,
-    system_prompt: String,
-) {
-    let best_perf_tokens: usize = std::env::var("RUBBERDUX_LLM_BEST_PERFORMANCE_TOKENS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_BEST_PERFORMANCE_TOKENS);
-
-    let session_file = session_path();
-    let mut history = load_session(&session_file, &system_prompt);
-    let mut last_prompt_tokens: usize = 0;
-
-    let (bg_tx, mut bg_rx) = tokio::sync::mpsc::channel::<BackgroundTaskResult>(32);
-    let mut pending_tasks: HashMap<String, PendingTaskMeta> = HashMap::new();
-
-    log::info!(
-        "Agent loop started (model: {}, best_performance_tokens: {}, history: {} messages)",
-        client.model(),
-        best_perf_tokens,
-        history.len()
-    );
-
-    loop {
-        tokio::select! {
-            Some(event) = rx.recv() => {
-                match event {
-                    ChannelEvent::InternalEvent(internal) => {
-                        handle_internal_event(internal, &mut history, &session_file);
-                    }
-                    ChannelEvent::UserInput {
-                        interpreted,
-                        reply_tx,
-                    } => {
-                        let text_preview = &interpreted.text;
-                        let has_attachments = !interpreted.attachments.is_empty();
-                        let is_silent = reply_tx.is_none();
-
-                        log::info!(
-                            "Processing message: {} (attachments: {}, silent: {})",
-                            text_preview,
-                            interpreted.attachments.len(),
-                            is_silent
-                        );
-
-                        if is_silent {
-                            append_user_message(text_preview.clone(), &mut history, &session_file);
-                            continue;
-                        }
-
-                        let reply_tx = match reply_tx {
-                            Some(tx) => tx,
-                            None => continue,
-                        };
-
-                        evict_if_needed(
-                            &mut history,
-                            &mut last_prompt_tokens,
-                            text_preview,
-                            best_perf_tokens,
-                        );
-
-                        let history_text = if has_attachments {
-                            format!(
-                                "{} [with {} attachment(s)]",
-                                text_preview,
-                                interpreted.attachments.len()
-                            )
-                        } else {
-                            text_preview.clone()
-                        };
-                        let text_preview = text_preview.clone();
-                        append_user_message(history_text, &mut history, &session_file);
-
-                        // Tool use loop: call LLM, execute tools, repeat until finish_reason="stop"
-                        let tools = assemble_tool_definitions(&client);
-
-                        loop {
-                            let messages = history.messages();
-                            let result = client.chat(messages, Some(tools.clone())).await;
-
-                            match result {
-                                Ok(chat_response) => {
-                                    last_prompt_tokens = chat_response.usage.prompt_tokens;
-                                    log::debug!(
-                                        "Token usage: prompt={}, completion={}, total={}, cached={}",
-                                        chat_response.usage.prompt_tokens,
-                                        chat_response.usage.completion_tokens,
-                                        chat_response.usage.total_tokens,
-                                        chat_response.usage.cached_tokens,
-                                    );
-
-                                    let choice = match chat_response.choices.first() {
-                                        Some(c) => c,
-                                        None => {
-                                            send_response(
-                                                &reply_tx,
-                                                "(empty response)".into(),
-                                                history.last_id().unwrap_or(0),
-                                                true,
-                                            )
-                                            .await;
-                                            break;
-                                        }
-                                    };
-
-                                    let model_done = choice.finish_reason == "stop";
-                                    let is_final = model_done && pending_tasks.is_empty();
-                                    let text = choice.message.content_text().to_owned();
-
-                                    let parent_id = history.last_id().unwrap_or(0);
-                                    let asst_msg = choice.message.clone();
-                                    let asst_entry_id = history.push_assistant(parent_id, asst_msg);
-                                    if !model_done {
-                                        append_entry_to_session(
-                                            &session_file,
-                                            history.get(asst_entry_id).unwrap(),
-                                        );
-                                    }
-
-                                    send_response(&reply_tx, text, asst_entry_id, is_final).await;
-
-                                    if model_done {
-                                        log::info!("LLM finished for: {}", text_preview);
-                                        break;
-                                    }
-
-                                    execute_tool_calls(
-                                        &client,
-                                        choice,
-                                        asst_entry_id,
-                                        &mut history,
-                                        &session_file,
-                                        &bg_tx,
-                                        &mut pending_tasks,
-                                        &reply_tx,
-                                    )
-                                    .await;
-                                }
-                                Err(e) => {
-                                    log::error!("LLM call failed: {}", e);
-                                    send_response(
-                                        &reply_tx,
-                                        format!("Sorry, I encountered an error: {}", e),
-                                        history.last_id().unwrap_or(0),
-                                        true,
-                                    )
-                                    .await;
-                                    break;
-                                }
-                            }
-                        }
-                    } // ChannelEvent::UserInput
-                } // match event
-            }
-            Some(bg_result) = bg_rx.recv() => {
-                handle_background_completion(
-                    &client,
-                    &mut history,
-                    &mut pending_tasks,
-                    bg_result,
-                    &session_file,
-                    &bg_tx,
-                ).await;
-            }
-            else => break,
-        }
-    }
-
-    log::info!("Agent loop shutting down");
-}
-
-async fn send_response(
-    tx: &tokio::sync::mpsc::Sender<AgentResponse>,
-    text: String,
-    entry_id: usize,
-    is_final: bool,
-) {
-    if !text.is_empty() || is_final {
-        let _ = tx
-            .send(AgentResponse {
-                text,
-                entry_id,
-                is_final,
-            })
-            .await;
-    }
-}
-
-async fn execute_tool_calls(
+async fn run_tool_turn(
     client: &MoonshotClient,
-    choice: &crate::provider::moonshot::api::chat::ChatChoice,
-    asst_entry_id: usize,
     history: &mut EntryHistory,
     session_file: &Path,
+    tools: &[ToolDefinition],
     bg_tx: &tokio::sync::mpsc::Sender<BackgroundTaskResult>,
-    pending_tasks: &mut HashMap<String, PendingTaskMeta>,
-    reply_tx: &tokio::sync::mpsc::Sender<AgentResponse>,
-) {
+) -> Result<TurnResult, crate::error::Error> {
+    let messages = history.messages();
+    let chat_response = client.chat(messages, Some(tools.to_vec())).await?;
+
+    log::debug!(
+        "Token usage: prompt={}, completion={}, total={}, cached={}",
+        chat_response.usage.prompt_tokens,
+        chat_response.usage.completion_tokens,
+        chat_response.usage.total_tokens,
+        chat_response.usage.cached_tokens,
+    );
+
+    let choice = match chat_response.choices.first() {
+        Some(c) => c,
+        None => {
+            return Ok(TurnResult::Done {
+                text: "(empty response)".into(),
+                entry_id: history.last_id().unwrap_or(0),
+            });
+        }
+    };
+
+    let model_done = choice.finish_reason == "stop";
+    let text = choice.message.content_text().to_owned();
+
+    let parent_id = history.last_id().unwrap_or(0);
+    let asst_entry_id = history.push_assistant(parent_id, choice.message.clone());
+    if !model_done {
+        append_entry_to_session(session_file, history.get(asst_entry_id).unwrap());
+    }
+
+    if model_done {
+        return Ok(TurnResult::Done { text, entry_id: asst_entry_id });
+    }
+
+    // Execute tool calls -- separate sync from background
     let tool_calls = match choice.message.tool_calls() {
-        Some(tc) => tc,
-        None => return,
+        Some(tc) => tc.clone(),
+        None => return Ok(TurnResult::Continue),
     };
 
     log::info!("Executing {} tool call(s)", tool_calls.len());
-    for call in tool_calls {
+
+    let mut bg_task_ids = Vec::new();
+
+    for call in &tool_calls {
         log::info!("Tool call: {}({})", call.function.name, call.function.arguments);
 
         let outcome = if MoonshotClient::is_provider_tool(&call.function.name) {
@@ -384,20 +252,16 @@ async fn execute_tool_calls(
             crate::tool::execute_tool(&call.function.name, &call.function.arguments).await
         };
 
-        // Format first -- this only borrows
+        // Format first (borrows outcome)
         let formatted = MoonshotClient::format_tool_outcome(&call.function.name, &outcome)
             .unwrap_or_else(|| crate::tool::format_tool_outcome(&outcome));
 
-        // Log errors
-        if let crate::tool::ToolOutcome::Immediate {
-            ref content,
-            is_error: true,
-        } = outcome
-        {
+        // Check for errors
+        if let crate::tool::ToolOutcome::Immediate { ref content, is_error: true } = outcome {
             log::warn!("Tool error: {}", content);
         }
 
-        // Register background relay if applicable (moves receiver out)
+        // Extract background receiver if applicable
         if let crate::tool::ToolOutcome::Background { task_id, receiver, .. } = outcome {
             let bg_tx_clone = bg_tx.clone();
             tokio::spawn(async move {
@@ -405,18 +269,15 @@ async fn execute_tool_calls(
                     let _ = bg_tx_clone.send(result).await;
                 }
             });
-            pending_tasks.insert(task_id, PendingTaskMeta {
-                asst_entry_id,
-                reply_tx: reply_tx.clone(),
-            });
+            bg_task_ids.push(task_id);
         }
 
+        // Create and persist Tool entry
         let tool_name = if MoonshotClient::is_provider_tool(&call.function.name) {
             Some(call.function.name.clone())
         } else {
             None
         };
-
         let tool_msg = Message::Tool {
             tool_call_id: call.id.clone(),
             name: tool_name,
@@ -425,100 +286,267 @@ async fn execute_tool_calls(
         let tool_entry_id = history.push_tool(asst_entry_id, tool_msg);
         append_entry_to_session(session_file, history.get(tool_entry_id).unwrap());
     }
+
+    if bg_task_ids.is_empty() {
+        Ok(TurnResult::Continue)
+    } else {
+        Ok(TurnResult::Pending { asst_entry_id, task_ids: bg_task_ids })
+    }
 }
 
-async fn handle_background_completion(
+async fn run_until_done_or_pending(
     client: &MoonshotClient,
     history: &mut EntryHistory,
-    pending_tasks: &mut HashMap<String, PendingTaskMeta>,
-    result: BackgroundTaskResult,
     session_file: &Path,
+    tools: &[ToolDefinition],
     bg_tx: &tokio::sync::mpsc::Sender<BackgroundTaskResult>,
-) {
-    let meta = match pending_tasks.remove(&result.task_id) {
-        Some(m) => m,
-        None => {
-            log::warn!("Received result for unknown background task: {}", result.task_id);
-            return;
+) -> Result<TurnResult, crate::error::Error> {
+    loop {
+        let result = run_tool_turn(client, history, session_file, tools, bg_tx).await?;
+        match result {
+            TurnResult::Continue => continue,
+            other => return Ok(other),
         }
-    };
+    }
+}
 
-    log::info!("Background task {} completed ({} bytes)", result.task_id, result.content.len());
+pub async fn run(
+    mut rx: mpsc::Receiver<ChannelEvent>,
+    client: Arc<MoonshotClient>,
+    system_prompt: String,
+) {
+    let best_perf_tokens: usize = std::env::var("RUBBERDUX_LLM_BEST_PERFORMANCE_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_BEST_PERFORMANCE_TOKENS);
 
-    let task_id = result.task_id;
+    let session_file = session_path();
+    let mut history = load_session(&session_file, &system_prompt);
+    let mut last_prompt_tokens: usize = 0;
 
-    // Inject the result as a User message (system-injected context).
-    // We can't use Message::Tool because the API requires every Tool message
-    // to match a tool_call_id from a preceding Assistant message, and the
-    // original tool call already has its "you will be notified" response.
-    let context_msg = Message::User {
-        content: UserContent::Text(format!(
-            "[Background task {} completed]\n{}",
-            task_id, result.content
-        )),
-    };
-    let context_entry_id = history.push_user(context_msg);
-    append_entry_to_session(session_file, history.get(context_entry_id).unwrap());
+    log::info!(
+        "Agent loop started (model: {}, best_performance_tokens: {}, history: {} messages)",
+        client.model(),
+        best_perf_tokens,
+        history.len()
+    );
 
-    // Run a tool loop to let the model synthesize a response
-    let tools = assemble_tool_definitions(client);
+    let (bg_tx, mut bg_rx) = tokio::sync::mpsc::channel::<BackgroundTaskResult>(32);
+    let mut active_groups: HashMap<usize, TaskGroup> = HashMap::new();
+    let mut task_to_group: HashMap<String, usize> = HashMap::new();
+    let mut active_conversation: Option<ActiveConversation> = None;
+    // Notify channel: signals the select! loop that an active conversation needs driving.
+    // Send a signal to trigger branch 3. Buffered so sends never block.
+    let (conv_notify_tx, mut conv_notify_rx) = tokio::sync::mpsc::channel::<()>(16);
 
     loop {
-        let messages = history.messages();
-        let chat_result = client.chat(messages, Some(tools.clone())).await;
+        tokio::select! {
+            // Branch 1: Channel events (user messages, internal events)
+            Some(event) = rx.recv() => {
+                match event {
+                    ChannelEvent::InternalEvent(internal) => {
+                        handle_internal_event(internal, &mut history, &session_file);
+                    }
+                    ChannelEvent::UserInput { interpreted, reply_tx } => {
+                        let text_preview = interpreted.text.clone();
+                        let has_attachments = !interpreted.attachments.is_empty();
+                        let is_silent = reply_tx.is_none();
 
-        match chat_result {
-            Ok(chat_response) => {
-                let choice = match chat_response.choices.first() {
-                    Some(c) => c,
+                        log::info!(
+                            "Processing message: {} (attachments: {}, silent: {})",
+                            text_preview,
+                            interpreted.attachments.len(),
+                            is_silent
+                        );
+
+                        if is_silent {
+                            append_user_message(text_preview, &mut history, &session_file);
+                            continue;
+                        }
+
+                        let reply_tx = match reply_tx {
+                            Some(tx) => tx,
+                            None => continue,
+                        };
+
+                        evict_if_needed(
+                            &mut history,
+                            &mut last_prompt_tokens,
+                            &text_preview,
+                            best_perf_tokens,
+                        );
+
+                        let history_text = if has_attachments {
+                            format!("{} [with {} attachment(s)]", text_preview, interpreted.attachments.len())
+                        } else {
+                            text_preview.clone()
+                        };
+                        append_user_message(history_text, &mut history, &session_file);
+
+                        // If there's an active conversation with pending bg tasks,
+                        // finalize its TaskGroup before starting a new conversation.
+                        if let Some(prev) = active_conversation.take() {
+                            if !prev.pending_task_ids.is_empty() {
+                                let asst_entry_id = prev.first_bg_asst_entry_id.unwrap_or(0);
+                                for tid in &prev.pending_task_ids {
+                                    task_to_group.insert(tid.clone(), asst_entry_id);
+                                }
+                                active_groups.insert(asst_entry_id, TaskGroup {
+                                    reply_tx: prev.reply_tx,
+                                    asst_entry_id,
+                                    remaining: prev.pending_task_ids.len(),
+                                    completed_results: Vec::new(),
+                                });
+                            }
+                        }
+
+                        // Start a new conversation — next select! iteration will drive it
+                        active_conversation = Some(ActiveConversation {
+                            reply_tx,
+                            pending_task_ids: Vec::new(),
+                            first_bg_asst_entry_id: None,
+                        });
+                        let _ = conv_notify_tx.send(()).await;
+                    }
+                }
+            }
+
+            // Branch 2: Background task completions
+            Some(bg_result) = bg_rx.recv() => {
+                let group_key = match task_to_group.remove(&bg_result.task_id) {
+                    Some(k) => k,
                     None => {
-                        send_response(
-                            &meta.reply_tx,
-                            "(empty response)".into(),
-                            history.last_id().unwrap_or(0),
-                            true,
-                        )
-                        .await;
-                        break;
+                        log::warn!("Received result for unknown task: {}", bg_result.task_id);
+                        continue;
                     }
                 };
 
-                let model_done = choice.finish_reason == "stop";
-                let is_final = model_done && pending_tasks.is_empty();
-                let text = choice.message.content_text().to_owned();
+                let group = match active_groups.get_mut(&group_key) {
+                    Some(g) => g,
+                    None => {
+                        log::warn!("No active group for key {}", group_key);
+                        continue;
+                    }
+                };
 
-                let parent_id = history.last_id().unwrap_or(0);
-                let asst_entry_id = history.push_assistant(parent_id, choice.message.clone());
-                if !model_done {
-                    append_entry_to_session(session_file, history.get(asst_entry_id).unwrap());
+                log::info!(
+                    "Background task {} completed ({} bytes), {}/{} in group",
+                    bg_result.task_id,
+                    bg_result.content.len(),
+                    group.completed_results.len() + 1,
+                    group.remaining + group.completed_results.len(),
+                );
+
+                group.completed_results.push(bg_result);
+                group.remaining -= 1;
+
+                if group.remaining > 0 {
+                    continue;
                 }
 
-                send_response(&meta.reply_tx, text, asst_entry_id, is_final).await;
+                // Group complete! Batch all results and start a conversation to process them.
+                let group = active_groups.remove(&group_key).unwrap();
 
-                if model_done {
-                    log::info!("Background task {} response delivered", task_id);
-                    break;
+                for result in &group.completed_results {
+                    let msg = Message::User {
+                        content: UserContent::Text(format!(
+                            "[Background task {} completed]\n{}",
+                            result.task_id, result.content
+                        )),
+                    };
+                    let entry_id = history.push_user(msg);
+                    append_entry_to_session(&session_file, history.get(entry_id).unwrap());
                 }
 
-                // Execute any tool calls (may spawn more background tasks)
-                execute_tool_calls(
-                    client, choice, asst_entry_id, history, session_file,
-                    bg_tx, pending_tasks, &meta.reply_tx,
-                )
-                .await;
+                // Drive the conversation from the next select! iteration
+                active_conversation = Some(ActiveConversation {
+                    reply_tx: group.reply_tx,
+                    pending_task_ids: Vec::new(),
+                    first_bg_asst_entry_id: None,
+                });
+                let _ = conv_notify_tx.send(()).await;
             }
-            Err(e) => {
-                log::error!("LLM call for background task failed: {}", e);
-                send_response(
-                    &meta.reply_tx,
-                    format!("Sorry, I encountered an error processing a background task: {}", e),
-                    history.last_id().unwrap_or(0),
-                    true,
-                )
-                .await;
-                break;
+
+            // Branch 3: Drive active conversation one step at a time
+            Some(()) = conv_notify_rx.recv(), if active_conversation.is_some() => {
+                let tools = assemble_tool_definitions(&client);
+
+                let turn_result = run_tool_turn(
+                    &client, &mut history, &session_file, &tools, &bg_tx,
+                ).await;
+
+                match turn_result {
+                    Ok(TurnResult::Done { text, entry_id }) => {
+                        let conv = active_conversation.take().unwrap();
+
+                        if conv.pending_task_ids.is_empty() {
+                            // No background tasks — truly final
+                            let is_final = active_groups.is_empty();
+                            send_response(&conv.reply_tx, text, entry_id, is_final).await;
+                        } else {
+                            // Background tasks accumulated — create ONE group, send non-final response
+                            let asst_entry_id = conv.first_bg_asst_entry_id.unwrap_or(entry_id);
+                            for tid in &conv.pending_task_ids {
+                                task_to_group.insert(tid.clone(), asst_entry_id);
+                            }
+                            active_groups.insert(asst_entry_id, TaskGroup {
+                                reply_tx: conv.reply_tx.clone(),
+                                asst_entry_id,
+                                remaining: conv.pending_task_ids.len(),
+                                completed_results: Vec::new(),
+                            });
+                            send_response(&conv.reply_tx, text, entry_id, false).await;
+                        }
+                        log::info!("LLM conversation completed");
+                    }
+                    Ok(TurnResult::Continue) => {
+                        // Sync tools executed — need another LLM call.
+                        let _ = conv_notify_tx.send(()).await;
+                    }
+                    Ok(TurnResult::Pending { asst_entry_id, task_ids }) => {
+                        // Accumulate background tasks — don't create a group yet.
+                        // The model needs to keep running until it stops.
+                        let conv = active_conversation.as_mut().unwrap();
+                        if conv.first_bg_asst_entry_id.is_none() {
+                            conv.first_bg_asst_entry_id = Some(asst_entry_id);
+                        }
+                        conv.pending_task_ids.extend(task_ids);
+                        let _ = conv_notify_tx.send(()).await;
+                    }
+                    Err(e) => {
+                        let conv = active_conversation.take().unwrap();
+                        log::error!("LLM call failed: {}", e);
+                        send_response(
+                            &conv.reply_tx,
+                            format!("Sorry, I encountered an error: {}", e),
+                            history.last_id().unwrap_or(0),
+                            true,
+                        ).await;
+                    }
+                }
             }
+
+            else => break,
         }
+    }
+
+    log::info!("Agent loop shutting down");
+}
+
+async fn send_response(
+    tx: &tokio::sync::mpsc::Sender<AgentResponse>,
+    text: String,
+    entry_id: usize,
+    is_final: bool,
+) {
+    if !text.is_empty() || is_final {
+        let _ = tx
+            .send(AgentResponse {
+                text,
+                entry_id,
+                is_final,
+            })
+            .await;
     }
 }
 
