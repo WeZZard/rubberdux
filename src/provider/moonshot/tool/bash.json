@@ -2,13 +2,13 @@
   "type": "function",
   "function": {
     "name": "bash",
-    "description": "Execute a bash command. For commands that may take more than 2 seconds (network requests, builds, package installs, recursive file searches, compilation), you MUST set run_in_background=true. When run_in_background is true, the command runs asynchronously and the result contains a task ID and output file path. You can check the output file later with read_file when the user asks. Do NOT use sleep to wait for background tasks. Do NOT poll or retry background task outputs. Report the task ID to the user and move on.",
+    "description": "Execute a bash command. For commands that may take more than 2 seconds (network requests, builds, package installs, recursive file searches, compilation), you MUST set run_in_background=true. When run_in_background is true, you will be notified automatically when the command completes — do NOT sleep, poll, read output files, or wait for the result. Continue with other work or respond to the user.",
     "parameters": {
       "type": "object",
       "properties": {
         "command": {
           "type": "string",
-          "description": "The bash command to execute. Do not use sleep to create delays for long-running commands."
+          "description": "The bash command to execute"
         },
         "run_in_background": {
           "type": "boolean",

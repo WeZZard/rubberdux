@@ -164,7 +164,7 @@ pub async fn run(
         history.push(user_msg);
 
         // Tool use loop: call LLM, execute tools, repeat until finish_reason="stop"
-        let tools = crate::tool::load_tool_definitions(&crate::tool::tools_dir());
+        let tools = client.tool_definitions();
         let reply_tx = msg.reply_tx;
 
         loop {
@@ -240,8 +240,8 @@ pub async fn run(
                         for call in tool_calls {
                             log::info!("Tool call: {}({})", call.function.name, call.function.arguments);
 
-                            // Build ToolContext for builtin tools that need API access
-                            let tool_context = if crate::tool::is_builtin_tool(&call.function.name) {
+                            // Route: provider tools → provider, generic tools → tool module
+                            let outcome = if MoonshotClient::is_provider_tool(&call.function.name) {
                                 let last_user_query = history.iter().rev()
                                     .find_map(|m| match m {
                                         Message::User { content } => Some(match content {
@@ -252,30 +252,34 @@ pub async fn run(
                                     })
                                     .unwrap_or_default();
 
-                                Some(crate::tool::ToolContext {
-                                    client: client.clone(),
-                                    system_prompt: system_prompt.clone(),
+                                let ctx = crate::provider::moonshot::ToolExecutionContext {
                                     web_search_prompt: web_search_prompt.clone(),
                                     last_user_query,
                                     assistant_message: choice.message.clone(),
                                     tool_call: call.clone(),
-                                })
+                                };
+
+                                client.execute_provider_tool(
+                                    &call.function.name,
+                                    &call.function.arguments,
+                                    &ctx,
+                                ).await
                             } else {
-                                None
+                                crate::tool::execute_tool(
+                                    &call.function.name,
+                                    &call.function.arguments,
+                                ).await
                             };
 
-                            let result = crate::tool::execute_tool(
-                                &call.function.name,
-                                &call.function.arguments,
-                                tool_context,
-                            )
-                            .await;
-
-                            if result.is_error {
-                                log::warn!("Tool error: {}", result.content);
+                            if let crate::tool::ToolOutcome::Immediate { ref content, is_error: true } = outcome {
+                                log::warn!("Tool error: {}", content);
                             }
 
-                            let tool_name = if crate::tool::is_builtin_tool(&call.function.name) {
+                            // Format: provider override first, then default
+                            let content = MoonshotClient::format_tool_outcome(&call.function.name, &outcome)
+                                .unwrap_or_else(|| crate::tool::format_tool_outcome(&outcome));
+
+                            let tool_name = if MoonshotClient::is_provider_tool(&call.function.name) {
                                 Some(call.function.name.clone())
                             } else {
                                 None
@@ -284,7 +288,7 @@ pub async fn run(
                             let tool_msg = Message::Tool {
                                 tool_call_id: call.id.clone(),
                                 name: tool_name,
-                                content: result.content,
+                                content,
                             };
                             append_to_session(&session_file, &tool_msg);
                             history.push(tool_msg);

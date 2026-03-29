@@ -1,4 +1,4 @@
-use super::Message;
+use super::super::Message;
 
 pub fn prefill_message(leading_text: &str) -> Message {
     Message::Assistant {

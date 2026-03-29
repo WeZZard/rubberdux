@@ -1,3 +1,6 @@
+pub mod prompt;
+pub mod web_search;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

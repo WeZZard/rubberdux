@@ -1,23 +1,15 @@
-use super::ToolResult;
+use super::ToolOutcome;
 
-pub async fn execute(args: &serde_json::Value) -> ToolResult {
+pub async fn execute(args: &serde_json::Value) -> ToolOutcome {
     let command = match args["command"].as_str() {
         Some(c) => c,
         None => {
-            return ToolResult {
+            return ToolOutcome::Immediate {
                 content: "Missing required parameter: command".into(),
                 is_error: true,
             }
         }
     };
-
-    // Reject commands that start with sleep — polling is not allowed
-    if command.trim_start().starts_with("sleep") {
-        return ToolResult {
-            content: "Error: do not use sleep to wait for long-running commands. Use run_in_background=true instead and let the user check results later.".into(),
-            is_error: true,
-        };
-    }
 
     let run_in_bg = args["run_in_background"].as_bool().unwrap_or(false);
     let timeout_ms = args["timeout"].as_u64().unwrap_or(120_000);
@@ -29,7 +21,7 @@ pub async fn execute(args: &serde_json::Value) -> ToolResult {
     }
 }
 
-async fn execute_sync(command: &str, timeout_ms: u64) -> ToolResult {
+async fn execute_sync(command: &str, timeout_ms: u64) -> ToolOutcome {
     let timeout = std::time::Duration::from_millis(timeout_ms);
 
     let result = tokio::time::timeout(
@@ -61,29 +53,28 @@ async fn execute_sync(command: &str, timeout_ms: u64) -> ToolResult {
                 content = "(no output)".into();
             }
 
-            ToolResult {
+            ToolOutcome::Immediate {
                 content,
                 is_error: !output.status.success(),
             }
         }
-        Ok(Err(e)) => ToolResult {
+        Ok(Err(e)) => ToolOutcome::Immediate {
             content: format!("Failed to execute command: {}", e),
             is_error: true,
         },
-        Err(_) => ToolResult {
+        Err(_) => ToolOutcome::Immediate {
             content: format!("Command timed out after {}ms", timeout_ms),
             is_error: true,
         },
     }
 }
 
-async fn execute_background(command: &str) -> ToolResult {
+async fn execute_background(command: &str) -> ToolOutcome {
     let task_id = format!("bg_{}", generate_task_id());
     let output_dir = std::path::PathBuf::from("./sessions/tasks");
     let _ = std::fs::create_dir_all(&output_dir);
 
     let output_path = output_dir.join(format!("{}.output", task_id));
-    let output_path_str = output_path.to_string_lossy().to_string();
 
     let command = command.to_owned();
     let path = output_path.clone();
@@ -118,13 +109,7 @@ async fn execute_background(command: &str) -> ToolResult {
         log::info!("Background task {} completed", path.display());
     });
 
-    ToolResult {
-        content: format!(
-            "Command running in background with ID: {}. Output is being written to: {}",
-            task_id, output_path_str
-        ),
-        is_error: false,
-    }
+    ToolOutcome::Background { task_id, output_path }
 }
 
 fn generate_task_id() -> String {

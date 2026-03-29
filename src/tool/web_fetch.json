@@ -2,7 +2,7 @@
   "type": "function",
   "function": {
     "name": "web_fetch",
-    "description": "Fetch the content of a web page URL and return it as markdown. Uses a headless browser to render JavaScript-heavy pages. Returns the full rendered content converted to markdown.",
+    "description": "Fetch the content of a web page URL and return it as markdown. Uses a headless browser to render JavaScript-heavy pages. Always runs in the background.",
     "parameters": {
       "type": "object",
       "properties": {

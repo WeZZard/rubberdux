@@ -1,0 +1,25 @@
+{
+  "type": "function",
+  "function": {
+    "name": "bash",
+    "description": "Execute a bash command. Supports synchronous and background execution with configurable timeouts.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "The bash command to execute"
+        },
+        "run_in_background": {
+          "type": "boolean",
+          "description": "Run the command in the background. Returns immediately with a task ID. Defaults to false."
+        },
+        "timeout": {
+          "type": "number",
+          "description": "Timeout in milliseconds for synchronous commands. Defaults to 120000 (2 minutes)."
+        }
+      },
+      "required": ["command"]
+    }
+  }
+}

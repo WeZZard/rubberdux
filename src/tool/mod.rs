@@ -6,102 +6,77 @@ pub mod read;
 pub mod web_fetch;
 pub mod write;
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 
-use crate::provider::moonshot::tool::{ToolCall, ToolDefinition};
-use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
+use crate::provider::moonshot::tool::ToolDefinition;
 
-const DEFAULT_TOOLS_DIR: &str = "./tools";
+// ---------------------------------------------------------------------------
+// ToolOutcome — raw domain result from tool execution
+// ---------------------------------------------------------------------------
+
+/// Raw outcome from tool execution, before provider-specific formatting.
+pub enum ToolOutcome {
+    /// Immediate result with raw content.
+    Immediate { content: String, is_error: bool },
+    /// Task dispatched to the background.
+    Background { task_id: String, output_path: PathBuf },
+}
+
+/// Default formatting for ToolOutcome → Message::Tool content.
+/// Sensible default: no file paths exposed, "you will be notified" for background tasks.
+pub fn format_tool_outcome(outcome: &ToolOutcome) -> String {
+    match outcome {
+        ToolOutcome::Immediate { content, .. } => content.clone(),
+        ToolOutcome::Background { task_id, .. } => format!(
+            "Background task {} started. You will be notified automatically \
+             when the result is ready — do not poll or wait for it.",
+            task_id
+        ),
+    }
+}
+
+/// Loads default tool definitions from embedded JSON files.
+pub fn default_tool_definitions() -> Vec<ToolDefinition> {
+    const BASH_JSON: &str = include_str!("bash.json");
+    const WEB_FETCH_JSON: &str = include_str!("web_fetch.json");
+    const READ_FILE_JSON: &str = include_str!("read_file.json");
+    const WRITE_FILE_JSON: &str = include_str!("write_file.json");
+    const EDIT_FILE_JSON: &str = include_str!("edit_file.json");
+    const GLOB_JSON: &str = include_str!("glob.json");
+    const GREP_JSON: &str = include_str!("grep.json");
+
+    [
+        BASH_JSON,
+        WEB_FETCH_JSON,
+        READ_FILE_JSON,
+        WRITE_FILE_JSON,
+        EDIT_FILE_JSON,
+        GLOB_JSON,
+        GREP_JSON,
+    ]
+    .iter()
+    .filter_map(|json| serde_json::from_str(json).ok())
+    .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Legacy ToolResult — used by tools that haven't migrated to ToolOutcome yet
+// ---------------------------------------------------------------------------
 
 pub struct ToolResult {
     pub content: String,
     pub is_error: bool,
 }
 
-/// Context for executing builtin tools that need API access.
-pub struct ToolContext {
-    pub client: Arc<MoonshotClient>,
-    pub system_prompt: String,
-    pub web_search_prompt: String,
-    pub last_user_query: String,
-    pub assistant_message: Message,
-    pub tool_call: ToolCall,
-}
+// ---------------------------------------------------------------------------
+// Generic tool execution
+// ---------------------------------------------------------------------------
 
-pub fn tools_dir() -> PathBuf {
-    std::env::var("RUBBERDUX_TOOLS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_TOOLS_DIR))
-}
-
-pub fn load_tool_definitions(dir: &Path) -> Vec<ToolDefinition> {
-    let mut definitions = Vec::new();
-
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            log::error!("Failed to read tools directory {:?}: {}", dir, e);
-            return definitions;
-        }
-    };
-
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-
-        match std::fs::read_to_string(&path) {
-            Ok(content) => match serde_json::from_str::<ToolDefinition>(&content) {
-                Ok(def) => {
-                    log::info!("Loaded tool definition: {} from {:?}", def.function.name, path);
-                    definitions.push(def);
-                }
-                Err(e) => log::warn!("Failed to parse tool definition {:?}: {}", path, e),
-            },
-            Err(e) => log::warn!("Failed to read tool definition {:?}: {}", path, e),
-        }
-    }
-
-    definitions.sort_by(|a, b| a.function.name.cmp(&b.function.name));
-    log::info!("Loaded {} tool definitions", definitions.len());
-    definitions
-}
-
-/// Returns true if the tool is a Kimi builtin function (name starts with $).
-/// Builtin tools are executed server-side — we echo the arguments back as the result.
-pub fn is_builtin_tool(name: &str) -> bool {
-    name.starts_with('$')
-}
-
-pub async fn execute_tool(
-    name: &str,
-    arguments: &str,
-    context: Option<ToolContext>,
-) -> ToolResult {
-    // $web_search: spawn background one-shot model call
-    if name == "$web_search" {
-        return execute_web_search_background(arguments, context).await;
-    }
-
-    // Other Kimi builtins: echo arguments back
-    if is_builtin_tool(name) {
-        return ToolResult {
-            content: arguments.to_owned(),
-            is_error: false,
-        };
-    }
-
+pub async fn execute_tool(name: &str, arguments: &str) -> ToolOutcome {
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
         Err(e) => {
-            return ToolResult {
+            return ToolOutcome::Immediate {
                 content: format!("Failed to parse tool arguments: {}", e),
                 is_error: true,
             }
@@ -110,97 +85,35 @@ pub async fn execute_tool(
 
     match name {
         "bash" => bash::execute(&args).await,
-        "read_file" => read::execute(&args).await,
-        "write_file" => write::execute(&args).await,
-        "edit_file" => edit::execute(&args).await,
-        "glob" => glob::execute(&args).await,
-        "grep" => grep::execute(&args).await,
         "web_fetch" => web_fetch::execute(&args).await,
-        _ => ToolResult {
+        "read_file" => {
+            let r = read::execute(&args).await;
+            ToolOutcome::Immediate { content: r.content, is_error: r.is_error }
+        }
+        "write_file" => {
+            let r = write::execute(&args).await;
+            ToolOutcome::Immediate { content: r.content, is_error: r.is_error }
+        }
+        "edit_file" => {
+            let r = edit::execute(&args).await;
+            ToolOutcome::Immediate { content: r.content, is_error: r.is_error }
+        }
+        "glob" => {
+            let r = glob::execute(&args).await;
+            ToolOutcome::Immediate { content: r.content, is_error: r.is_error }
+        }
+        "grep" => {
+            let r = grep::execute(&args).await;
+            ToolOutcome::Immediate { content: r.content, is_error: r.is_error }
+        }
+        _ => ToolOutcome::Immediate {
             content: format!("Unknown tool: {}", name),
             is_error: true,
         },
     }
 }
 
-async fn execute_web_search_background(
-    arguments: &str,
-    context: Option<ToolContext>,
-) -> ToolResult {
-    let ctx = match context {
-        Some(c) => c,
-        None => {
-            // No context — fall back to echo (synchronous)
-            return ToolResult {
-                content: arguments.to_owned(),
-                is_error: false,
-            };
-        }
-    };
-
-    let task_id = format!("search_{}", generate_task_id());
-    let output_dir = PathBuf::from("./sessions/tasks");
-    let _ = std::fs::create_dir_all(&output_dir);
-
-    let output_path = output_dir.join(format!("{}.output", task_id));
-    let output_path_str = output_path.to_string_lossy().to_string();
-
-    let arguments = arguments.to_owned();
-    let path = output_path.clone();
-    let task_id_clone = task_id.clone();
-
-    tokio::spawn(async move {
-        log::info!("Background web search task {} started", task_id_clone);
-
-        // Build one-shot messages: [system, user_query, assistant(tool_calls), tool(search_args)]
-        let messages = vec![
-            Message::System {
-                content: ctx.web_search_prompt,
-            },
-            Message::User {
-                content: UserContent::Text(ctx.last_user_query),
-            },
-            ctx.assistant_message,
-            Message::Tool {
-                tool_call_id: ctx.tool_call.id,
-                name: Some("$web_search".to_owned()),
-                content: arguments,
-            },
-        ];
-
-        let result = ctx.client.chat(messages, None).await;
-
-        let output = match result {
-            Ok(response) => {
-                let text = response
-                    .choices
-                    .first()
-                    .map(|c| c.message.content_text().to_owned())
-                    .unwrap_or_else(|| "(empty search result)".into());
-                text
-            }
-            Err(e) => {
-                format!("Web search failed: {}", e)
-            }
-        };
-
-        if let Err(e) = std::fs::write(&path, &output) {
-            log::error!("Failed to write search result: {}", e);
-        }
-
-        log::info!("Background web search task {} completed", task_id_clone);
-    });
-
-    ToolResult {
-        content: format!(
-            "Searching in background with ID: {}. Output is being written to: {}",
-            task_id, output_path_str
-        ),
-        is_error: false,
-    }
-}
-
-fn generate_task_id() -> String {
+pub(crate) fn generate_task_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -213,24 +126,46 @@ fn generate_task_id() -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_load_tool_definitions() {
-        let defs = load_tool_definitions(Path::new("./tools"));
-        assert_eq!(defs.len(), 7);
-    }
-
     #[tokio::test]
     async fn test_unknown_tool_returns_error() {
-        let result = execute_tool("nonexistent", "{}", None).await;
-        assert!(result.is_error);
-        assert!(result.content.contains("Unknown tool"));
+        let outcome = execute_tool("nonexistent", "{}").await;
+        match outcome {
+            ToolOutcome::Immediate { content, is_error } => {
+                assert!(is_error);
+                assert!(content.contains("Unknown tool"));
+            }
+            _ => panic!("Expected Immediate outcome"),
+        }
     }
 
-    #[tokio::test]
-    async fn test_web_search_without_context_echoes_args() {
-        let result = execute_tool("$web_search", "{\"test\": true}", None).await;
-        assert!(!result.is_error);
-        // Without context, falls back to echo
-        assert!(result.content.contains("test"));
+    #[test]
+    fn test_format_tool_outcome_immediate() {
+        let outcome = ToolOutcome::Immediate {
+            content: "file contents here".into(),
+            is_error: false,
+        };
+        assert_eq!(format_tool_outcome(&outcome), "file contents here");
+    }
+
+    #[test]
+    fn test_format_tool_outcome_background() {
+        let outcome = ToolOutcome::Background {
+            task_id: "bg_abc123".into(),
+            output_path: PathBuf::from("./sessions/tasks/bg_abc123.output"),
+        };
+        let formatted = format_tool_outcome(&outcome);
+        assert!(formatted.contains("bg_abc123"), "should contain task_id");
+        assert!(!formatted.contains("sessions/tasks"), "should NOT contain file path");
+        assert!(formatted.contains("notified automatically"), "should tell model it will be notified");
+    }
+
+    #[test]
+    fn test_default_tool_definitions() {
+        let defs = default_tool_definitions();
+        assert_eq!(defs.len(), 7);
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        assert!(names.contains(&"bash"));
+        assert!(names.contains(&"web_fetch"));
+        assert!(names.contains(&"read_file"));
     }
 }

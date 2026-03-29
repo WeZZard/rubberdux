@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{Message, MoonshotClient};
+use super::super::{Message, MoonshotClient};
 
 #[derive(Serialize)]
 struct EstimateRequest {

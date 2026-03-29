@@ -1,7 +1,4 @@
-pub mod chat;
-pub mod file;
-pub mod partial;
-pub mod token;
+pub mod api;
 pub mod tool;
 
 use serde::{Deserialize, Serialize};
@@ -88,6 +85,13 @@ impl Message {
         }
     }
 
+    pub fn reasoning_content(&self) -> Option<&str> {
+        match self {
+            Message::Assistant { reasoning_content, .. } => reasoning_content.as_deref(),
+            _ => None,
+        }
+    }
+
     pub fn from_interpreted(interpreted: &InterpretedMessage) -> Self {
         if interpreted.attachments.is_empty() {
             return Message::User {
@@ -126,6 +130,14 @@ impl Message {
             content: UserContent::Parts(parts),
         }
     }
+}
+
+/// Context for executing provider-owned tools.
+pub struct ToolExecutionContext {
+    pub web_search_prompt: String,
+    pub last_user_query: String,
+    pub assistant_message: Message,
+    pub tool_call: ToolCall,
 }
 
 pub struct MoonshotClient {
@@ -175,17 +187,49 @@ impl MoonshotClient {
         &self.model
     }
 
-    /// Returns the platform-provided builtin tools (e.g. $web_search).
-    /// These are server-side tools executed by the Kimi platform, not locally.
-    fn platform_builtins() -> Vec<ToolDefinition> {
-        vec![ToolDefinition {
-            r#type: "builtin_function".to_owned(),
-            function: FunctionDefinition {
-                name: "$web_search".to_owned(),
-                description: None,
-                parameters: None,
+    /// Assembles tool definitions with provider-first JSON resolution.
+    pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        tool::prompt::tool_definitions()
+    }
+
+    /// Returns true if this tool is owned by the provider.
+    pub fn is_provider_tool(name: &str) -> bool {
+        tool::prompt::is_provider_tool(name)
+    }
+
+    /// Executes a provider-owned tool.
+    pub async fn execute_provider_tool(
+        &self,
+        name: &str,
+        arguments: &str,
+        ctx: &ToolExecutionContext,
+    ) -> crate::tool::ToolOutcome {
+        match name {
+            "$web_search" => {
+                let ws_ctx = tool::web_search::WebSearchContext {
+                    client: std::sync::Arc::new(MoonshotClient::new(
+                        self.http.clone(),
+                        self.base_url.clone(),
+                        self.api_key.clone(),
+                        self.model.clone(),
+                    )),
+                    web_search_prompt: ctx.web_search_prompt.clone(),
+                    last_user_query: ctx.last_user_query.clone(),
+                    assistant_message: ctx.assistant_message.clone(),
+                    tool_call: ctx.tool_call.clone(),
+                };
+                tool::web_search::execute(arguments, Some(ws_ctx)).await
+            }
+            _ => crate::tool::ToolOutcome::Immediate {
+                content: format!("Unknown provider tool: {}", name),
+                is_error: true,
             },
-        }]
+        }
+    }
+
+    /// Optional format override. Returns None to use default.
+    pub fn format_tool_outcome(name: &str, outcome: &crate::tool::ToolOutcome) -> Option<String> {
+        tool::prompt::format_tool_outcome(name, outcome)
     }
 
     pub fn build_messages(
@@ -432,5 +476,130 @@ mod tests {
         assert_eq!(msgs.len(), 4);
         assert!(matches!(&msgs[0], Message::System { content } if content == "System prompt"));
         assert!(matches!(&msgs[3], Message::User { content: UserContent::Text(t) } if t == "Second"));
+    }
+
+    /// Shared harness: builds history with a given tool result message,
+    /// calls real Moonshot API, and returns whether the model tried to poll.
+    async fn run_background_tool_result_trial(
+        label: &str,
+        tool_result_content: &str,
+    ) -> bool {
+        let client = MoonshotClient::from_env();
+        let tools = client.tool_definitions();
+        let system_prompt = "You are a helpful assistant.";
+
+        let mut history: Vec<Message> = vec![
+            Message::User {
+                content: UserContent::Text("Fetch https://example.com for me".into()),
+            },
+            Message::Assistant {
+                content: Some("Let me fetch that page for you.".into()),
+                reasoning_content: Some("The user wants me to fetch a URL.".into()),
+                tool_calls: Some(vec![tool::ToolCall {
+                    index: Some(0),
+                    id: "tool_fetch_001".into(),
+                    r#type: "function".into(),
+                    function: tool::FunctionCall {
+                        name: "web_fetch".into(),
+                        arguments: "{\"url\": \"https://example.com\"}".into(),
+                    },
+                }]),
+                partial: None,
+            },
+            Message::Tool {
+                tool_call_id: "tool_fetch_001".into(),
+                name: None,
+                content: tool_result_content.into(),
+            },
+        ];
+
+        eprintln!("\n{}", "=".repeat(80));
+        eprintln!("=== TRIAL: {} ===", label);
+        eprintln!("Tool result: {:?}", tool_result_content);
+        eprintln!("{}", "=".repeat(80));
+
+        let mut polled = false;
+        let max_iterations = 3;
+        for iteration in 1..=max_iterations {
+            let messages = client.build_messages_from_history(system_prompt, &history);
+
+            let response = client.chat(messages, Some(tools.clone())).await.unwrap();
+            let choice = &response.choices[0];
+
+            eprintln!("\n  [Call #{}] finish_reason={}", iteration, choice.finish_reason);
+            if let Some(rc) = choice.message.reasoning_content() {
+                eprintln!("  reasoning: {}", rc);
+            }
+
+            history.push(choice.message.clone());
+
+            if choice.finish_reason == "stop" {
+                let text = choice.message.content_text();
+                eprintln!("  STOPPED: {}", if text.len() > 120 { &text[..120] } else { text });
+                break;
+            }
+
+            if let Some(tool_calls) = choice.message.tool_calls() {
+                for call in tool_calls {
+                    eprintln!("  TOOL CALL: {}({})", call.function.name, call.function.arguments);
+                    polled = true;
+
+                    // Don't actually execute — return a generic error to prevent infinite loops
+                    history.push(Message::Tool {
+                        tool_call_id: call.id.clone(),
+                        name: None,
+                        content: "Error: this operation is not available.".into(),
+                    });
+                }
+            }
+        }
+
+        eprintln!("  RESULT: polled={}\n", polled);
+        polled
+    }
+
+    /// Tests multiple tool result message variants against the real Moonshot API
+    /// to find which ones prevent the model from polling background task output.
+    ///
+    /// Run with: cargo test test_debug_background_tool_model_call -- --nocapture --ignored
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore] // requires real API credentials
+    async fn test_debug_background_tool_model_call() {
+        dotenvy::dotenv().ok();
+
+        // Use the default format_tool_outcome to generate the tool result message
+        let default_bg_message = crate::tool::format_tool_outcome(
+            &crate::tool::ToolOutcome::Background {
+                task_id: "fetch_abc123".into(),
+                output_path: std::path::PathBuf::from("./sessions/tasks/fetch_abc123.output"),
+            },
+        );
+
+        let trials = vec![
+            (
+                "Default format_tool_outcome (no file path)",
+                default_bg_message.as_str(),
+            ),
+        ];
+
+        eprintln!("\n{}\n", "=".repeat(80));
+        eprintln!("BACKGROUND TOOL RESULT — MODEL BEHAVIOR TRIALS");
+        eprintln!("Testing {} variants against real Moonshot API", trials.len());
+        eprintln!("\n{}", "=".repeat(80));
+
+        let mut results = Vec::new();
+        for (label, content) in &trials {
+            let polled = run_background_tool_result_trial(label, content).await;
+            results.push((label, polled));
+        }
+
+        eprintln!("\n{}", "=".repeat(80));
+        eprintln!("SUMMARY");
+        eprintln!("{}", "=".repeat(80));
+        for (label, polled) in &results {
+            let status = if *polled { "POLLED (bad)" } else { "CLEAN (good)" };
+            eprintln!("  {} => {}", label, status);
+        }
+        eprintln!("{}\n", "=".repeat(80));
     }
 }

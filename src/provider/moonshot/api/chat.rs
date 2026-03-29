@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use super::tool::ToolDefinition;
-use super::{Message, MoonshotClient, UserContent};
+use super::super::tool::ToolDefinition;
+use super::super::{Message, MoonshotClient, UserContent};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatRequest {
@@ -57,16 +57,9 @@ impl MoonshotClient {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<ChatResponse, crate::error::Error> {
-        // Append platform builtin tools to the user-provided tools
-        let tools = {
-            let mut all_tools = tools.unwrap_or_default();
-            all_tools.extend(Self::platform_builtins());
-            if all_tools.is_empty() {
-                None
-            } else {
-                Some(all_tools)
-            }
-        };
+        // Tool definitions are assembled by the provider's tool_definitions() method.
+        // The caller passes the complete tool list — no internal merging needed.
+        let tools = tools.filter(|t| !t.is_empty());
 
         let request = ChatRequest {
             model: self.model().to_owned(),

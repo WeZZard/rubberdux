@@ -139,7 +139,7 @@ async fn test_tool_call_loop() {
         "test-model".into(),
     );
 
-    let tools = tool::load_tool_definitions(std::path::Path::new("./tools"));
+    let tools = tool::default_tool_definitions();
 
     let mut history: Vec<Message> = vec![
         Message::User {
@@ -173,13 +173,14 @@ async fn test_tool_call_loop() {
         // Execute tool calls
         if let Some(tool_calls) = choice.message.tool_calls() {
             for call in tool_calls {
-                let result =
-                    tool::execute_tool(&call.function.name, &call.function.arguments, None).await;
+                let outcome =
+                    tool::execute_tool(&call.function.name, &call.function.arguments).await;
+                let content = tool::format_tool_outcome(&outcome);
 
                 history.push(Message::Tool {
                     tool_call_id: call.id.clone(),
                     name: None,
-                    content: result.content,
+                    content,
                 });
             }
         }
@@ -205,12 +206,17 @@ async fn test_read_file_tool_execution() {
         "file_path": tmp.path().to_str().unwrap()
     });
 
-    let result = tool::execute_tool("read_file", &serde_json::to_string(&args).unwrap(), None).await;
+    let outcome = tool::execute_tool("read_file", &serde_json::to_string(&args).unwrap()).await;
 
-    assert!(!result.is_error);
-    assert!(result.content.contains("line1"));
-    assert!(result.content.contains("line2"));
-    assert!(result.content.contains("line3"));
+    match outcome {
+        tool::ToolOutcome::Immediate { content, is_error } => {
+            assert!(!is_error);
+            assert!(content.contains("line1"));
+            assert!(content.contains("line2"));
+            assert!(content.contains("line3"));
+        }
+        _ => panic!("Expected Immediate"),
+    }
 }
 
 /// Test: bash tool sync execution
@@ -220,10 +226,15 @@ async fn test_bash_tool_sync() {
         "command": "echo hello_test_output"
     });
 
-    let result = tool::execute_tool("bash", &serde_json::to_string(&args).unwrap(), None).await;
+    let outcome = tool::execute_tool("bash", &serde_json::to_string(&args).unwrap()).await;
 
-    assert!(!result.is_error);
-    assert!(result.content.contains("hello_test_output"));
+    match outcome {
+        tool::ToolOutcome::Immediate { content, is_error } => {
+            assert!(!is_error);
+            assert!(content.contains("hello_test_output"));
+        }
+        _ => panic!("Expected Immediate"),
+    }
 }
 
 /// Test: bash tool background execution returns immediately with task info.
@@ -235,38 +246,31 @@ async fn test_bash_tool_background() {
         "run_in_background": true
     });
 
-    let result = tool::execute_tool("bash", &serde_json::to_string(&args).unwrap(), None).await;
+    let outcome = tool::execute_tool("bash", &serde_json::to_string(&args).unwrap()).await;
 
-    // Should return immediately without waiting for completion
-    assert!(!result.is_error);
-    assert!(result.content.contains("Command running in background"));
-    assert!(result.content.contains("Output is being written to"));
+    match outcome {
+        tool::ToolOutcome::Background { task_id, output_path } => {
+            assert!(!task_id.is_empty());
 
-    // Extract output path
-    let output_path = result
-        .content
-        .split("Output is being written to: ")
-        .nth(1)
-        .unwrap()
-        .trim()
-        .to_owned();
-
-    // Wait for background task to complete (generous timeout for CI/parallel tests)
-    let mut output = String::new();
-    for _ in 0..100 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        if let Ok(content) = std::fs::read_to_string(&output_path) {
-            if !content.is_empty() {
-                output = content;
-                break;
+            // Wait for background task to complete (generous timeout for CI/parallel tests)
+            let mut output = String::new();
+            for _ in 0..100 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if let Ok(content) = std::fs::read_to_string(&output_path) {
+                    if !content.is_empty() {
+                        output = content;
+                        break;
+                    }
+                }
             }
+
+            assert!(output.contains("bg_test"), "Output file should contain bg_test, got: {}", output);
+
+            // Cleanup
+            let _ = std::fs::remove_file(&output_path);
         }
+        _ => panic!("Expected Background"),
     }
-
-    assert!(output.contains("bg_test"), "Output file should contain bg_test, got: {}", output);
-
-    // Cleanup
-    let _ = std::fs::remove_file(&output_path);
 }
 
 /// Test: edit tool str_replace
@@ -281,9 +285,12 @@ async fn test_edit_file_tool() {
         "new_string": "baz qux"
     });
 
-    let result = tool::execute_tool("edit_file", &serde_json::to_string(&args).unwrap(), None).await;
+    let outcome = tool::execute_tool("edit_file", &serde_json::to_string(&args).unwrap()).await;
 
-    assert!(!result.is_error);
+    match &outcome {
+        tool::ToolOutcome::Immediate { is_error, .. } => assert!(!is_error),
+        _ => panic!("Expected Immediate"),
+    }
 
     let content = std::fs::read_to_string(tmp.path()).unwrap();
     assert!(content.contains("baz qux"));
@@ -417,7 +424,7 @@ async fn test_background_tool_call_loop() {
         "test-model".into(),
     );
 
-    let tools = tool::load_tool_definitions(std::path::Path::new("./tools"));
+    let tools = tool::default_tool_definitions();
 
     let mut history: Vec<Message> = vec![Message::User {
         content: UserContent::Text("Build my project".into()),
@@ -447,25 +454,22 @@ async fn test_background_tool_call_loop() {
 
         if let Some(tool_calls) = choice.message.tool_calls() {
             for call in tool_calls {
-                let result =
-                    tool::execute_tool(&call.function.name, &call.function.arguments, None).await;
+                let outcome =
+                    tool::execute_tool(&call.function.name, &call.function.arguments).await;
 
-                // Background tool should return immediately with task ID
+                // Background tool should return Background variant
                 if call.function.arguments.contains("run_in_background") {
                     assert!(
-                        result.content.contains("Command running in background"),
-                        "Background tool should return task ID immediately"
-                    );
-                    assert!(
-                        result.content.contains("Output is being written to"),
-                        "Background tool should report output file path"
+                        matches!(&outcome, tool::ToolOutcome::Background { .. }),
+                        "Background tool should return Background variant"
                     );
                 }
 
+                let content = tool::format_tool_outcome(&outcome);
                 history.push(Message::Tool {
                     tool_call_id: call.id.clone(),
                     name: None,
-                    content: result.content,
+                    content,
                 });
             }
         }
@@ -485,7 +489,7 @@ async fn test_background_tool_call_loop() {
 
     // Verify the tool result in history contains the background task info
     if let Message::Tool { content, .. } = &history[2] {
-        assert!(content.contains("Command running in background"));
+        assert!(content.contains("Background task"), "Expected background task info, got: {}", content);
     } else {
         panic!("Expected Tool message at index 2");
     }
@@ -573,15 +577,15 @@ async fn test_mixed_sync_background_tool_calls() {
         "test-model".into(),
     );
 
-    let tools = tool::load_tool_definitions(std::path::Path::new("./tools"));
+    let tools = tool::default_tool_definitions();
 
     let mut history: Vec<Message> = vec![Message::User {
         content: UserContent::Text("Show date and build project".into()),
     }];
 
     let mut final_text = String::new();
-    let mut sync_tool_result = String::new();
-    let mut bg_tool_result = String::new();
+    let mut sync_tool_content = String::new();
+    let mut bg_was_background = false;
 
     loop {
         let mut messages = vec![Message::System {
@@ -605,19 +609,20 @@ async fn test_mixed_sync_background_tool_calls() {
 
         if let Some(tool_calls) = choice.message.tool_calls() {
             for call in tool_calls {
-                let result =
-                    tool::execute_tool(&call.function.name, &call.function.arguments, None).await;
+                let outcome =
+                    tool::execute_tool(&call.function.name, &call.function.arguments).await;
 
                 if call.function.arguments.contains("run_in_background") {
-                    bg_tool_result = result.content.clone();
-                } else {
-                    sync_tool_result = result.content.clone();
+                    bg_was_background = matches!(&outcome, tool::ToolOutcome::Background { .. });
+                } else if let tool::ToolOutcome::Immediate { ref content, .. } = outcome {
+                    sync_tool_content = content.clone();
                 }
 
+                let content = tool::format_tool_outcome(&outcome);
                 history.push(Message::Tool {
                     tool_call_id: call.id.clone(),
                     name: None,
-                    content: result.content,
+                    content,
                 });
             }
         }
@@ -625,16 +630,15 @@ async fn test_mixed_sync_background_tool_calls() {
 
     // Sync tool should have actual output
     assert!(
-        sync_tool_result.contains("2026-03-28"),
+        sync_tool_content.contains("2026-03-28"),
         "Sync tool should return actual command output, got: {}",
-        sync_tool_result
+        sync_tool_content
     );
 
-    // Background tool should have task ID
+    // Background tool should have returned Background variant
     assert!(
-        bg_tool_result.contains("Command running in background"),
-        "Background tool should return task ID, got: {}",
-        bg_tool_result
+        bg_was_background,
+        "Background tool should return Background variant"
     );
 
     // Final response references both results
@@ -657,19 +661,13 @@ async fn test_background_task_output_readable() {
         "command": "echo lifecycle_test_output",
         "run_in_background": true
     });
-    let bg_result =
-        tool::execute_tool("bash", &serde_json::to_string(&bg_args).unwrap(), None).await;
+    let bg_outcome =
+        tool::execute_tool("bash", &serde_json::to_string(&bg_args).unwrap()).await;
 
-    assert!(!bg_result.is_error);
-
-    // Extract the output file path
-    let output_path = bg_result
-        .content
-        .split("Output is being written to: ")
-        .nth(1)
-        .unwrap()
-        .trim()
-        .to_owned();
+    let output_path = match bg_outcome {
+        tool::ToolOutcome::Background { output_path, .. } => output_path,
+        _ => panic!("Expected Background"),
+    };
 
     // Wait for background task to complete and verify output is readable
     let mut read_content = String::new();
@@ -677,14 +675,16 @@ async fn test_background_task_output_readable() {
     for _ in 0..100 {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let read_args = serde_json::json!({
-            "file_path": output_path
+            "file_path": output_path.to_str().unwrap()
         });
-        let read_result =
-            tool::execute_tool("read_file", &serde_json::to_string(&read_args).unwrap(), None).await;
-        if !read_result.is_error && read_result.content.contains("lifecycle_test_output") {
-            read_content = read_result.content;
-            read_ok = true;
-            break;
+        let read_outcome =
+            tool::execute_tool("read_file", &serde_json::to_string(&read_args).unwrap()).await;
+        if let tool::ToolOutcome::Immediate { content, is_error } = read_outcome {
+            if !is_error && content.contains("lifecycle_test_output") {
+                read_content = content;
+                read_ok = true;
+                break;
+            }
         }
     }
 
@@ -801,7 +801,7 @@ async fn test_multi_step_tool_chain() {
         "test-model".into(),
     );
 
-    let tools = tool::load_tool_definitions(std::path::Path::new("./tools"));
+    let tools = tool::default_tool_definitions();
 
     let mut history: Vec<Message> = vec![Message::User {
         content: UserContent::Text("Summarize files in /tmp".into()),
@@ -835,12 +835,13 @@ async fn test_multi_step_tool_chain() {
 
         if let Some(tool_calls) = choice.message.tool_calls() {
             for call in tool_calls {
-                let result =
-                    tool::execute_tool(&call.function.name, &call.function.arguments, None).await;
+                let outcome =
+                    tool::execute_tool(&call.function.name, &call.function.arguments).await;
+                let content = tool::format_tool_outcome(&outcome);
                 history.push(Message::Tool {
                     tool_call_id: call.id.clone(),
                     name: None,
-                    content: result.content,
+                    content,
                 });
             }
         }

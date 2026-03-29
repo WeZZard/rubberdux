@@ -1,18 +1,18 @@
 use std::path::PathBuf;
 
-use super::ToolResult;
+use super::ToolOutcome;
 
 const MAX_CONTENT_LENGTH: usize = 100_000;
 const PAGE_LOAD_TIMEOUT_SECS: u64 = 30;
 
-pub async fn execute(args: &serde_json::Value) -> ToolResult {
+pub async fn execute(args: &serde_json::Value) -> ToolOutcome {
     let url = match args["url"].as_str() {
         Some(u) => u,
         None => {
-            return ToolResult {
+            return ToolOutcome::Immediate {
                 content: "Missing required parameter: url".into(),
                 is_error: true,
-            }
+            };
         }
     };
 
@@ -21,7 +21,6 @@ pub async fn execute(args: &serde_json::Value) -> ToolResult {
     let _ = std::fs::create_dir_all(&output_dir);
 
     let output_path = output_dir.join(format!("{}.output", task_id));
-    let output_path_str = output_path.to_string_lossy().to_string();
 
     let url = url.to_owned();
     let path = output_path.clone();
@@ -39,13 +38,7 @@ pub async fn execute(args: &serde_json::Value) -> ToolResult {
         log::info!("Background fetch task {} completed", path.display());
     });
 
-    ToolResult {
-        content: format!(
-            "Fetching URL in background with ID: {}. Output is being written to: {}",
-            task_id, output_path_str
-        ),
-        is_error: false,
-    }
+    ToolOutcome::Background { task_id, output_path }
 }
 
 fn fetch_rendered(url: &str) -> Result<String, String> {

@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use super::MoonshotClient;
+use super::super::MoonshotClient;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FileInfo {
