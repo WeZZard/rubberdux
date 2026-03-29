@@ -22,17 +22,14 @@ async fn main() {
 
     let channel_partial = channel::adapter::telegram::channel_prompt();
     let system_prompt = prompt::compose_system_prompt(&prompt_parts, Some(channel_partial));
-    let web_search_prompt = prompt::load_web_search_prompt(&prompt_dir);
-
     log::info!("Composed system prompt ({} chars)", system_prompt.len());
-    log::info!("Loaded web search prompt ({} chars)", web_search_prompt.len());
 
     let client = Arc::new(provider::moonshot::MoonshotClient::from_env());
     log::info!("Moonshot client initialized (model: {})", client.model());
 
     let (tx, rx) = tokio::sync::mpsc::channel(32);
 
-    tokio::spawn(agent::runtime::chat::run(rx, client, system_prompt, web_search_prompt));
+    tokio::spawn(agent::runtime::chat::run(rx, client, system_prompt));
 
     let bot_token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_else(|_| {
         log::error!("TELEGRAM_BOT_TOKEN is not set");

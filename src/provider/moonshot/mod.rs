@@ -134,7 +134,6 @@ impl Message {
 
 /// Context for executing provider-owned tools.
 pub struct ToolExecutionContext {
-    pub web_search_prompt: String,
     pub last_user_query: String,
     pub assistant_message: Message,
     pub tool_call: ToolCall,
@@ -213,7 +212,6 @@ impl MoonshotClient {
                         self.api_key.clone(),
                         self.model.clone(),
                     )),
-                    web_search_prompt: ctx.web_search_prompt.clone(),
                     last_user_query: ctx.last_user_query.clone(),
                     assistant_message: ctx.assistant_message.clone(),
                     tool_call: ctx.tool_call.clone(),

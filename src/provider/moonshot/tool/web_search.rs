@@ -5,9 +5,10 @@ use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
 use crate::tool::ToolOutcome;
 use super::ToolCall;
 
+const WEB_SEARCH_PROMPT: &str = "You are a web search assistant. Summarize the search results concisely and accurately. Respond with plain text only.";
+
 pub struct WebSearchContext {
     pub client: Arc<MoonshotClient>,
-    pub web_search_prompt: String,
     pub last_user_query: String,
     pub assistant_message: Message,
     pub tool_call: ToolCall,
@@ -38,7 +39,7 @@ pub async fn execute(arguments: &str, context: Option<WebSearchContext>) -> Tool
 
         let messages = vec![
             Message::System {
-                content: ctx.web_search_prompt,
+                content: WEB_SEARCH_PROMPT.to_owned(),
             },
             Message::User {
                 content: UserContent::Text(ctx.last_user_query),
