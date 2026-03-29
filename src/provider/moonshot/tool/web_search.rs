@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use super::ToolCall;
 use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
 use crate::tool::ToolOutcome;
-use super::ToolCall;
 
-const WEB_SEARCH_PROMPT: &str = "You are a web search assistant. Summarize the search results concisely and accurately. Respond with plain text only.";
+const WEB_SEARCH_PROMPT: &str = include_str!("WEB_SEARCH.md");
 
 pub struct WebSearchContext {
     pub client: Arc<MoonshotClient>,
@@ -55,13 +55,11 @@ pub async fn execute(arguments: &str, context: Option<WebSearchContext>) -> Tool
         let result = ctx.client.chat(messages, None).await;
 
         let output = match result {
-            Ok(response) => {
-                response
-                    .choices
-                    .first()
-                    .map(|c| c.message.content_text().to_owned())
-                    .unwrap_or_else(|| "(empty search result)".into())
-            }
+            Ok(response) => response
+                .choices
+                .first()
+                .map(|c| c.message.content_text().to_owned())
+                .unwrap_or_else(|| "(empty search result)".into()),
             Err(e) => {
                 format!("Web search failed: {}", e)
             }
@@ -74,7 +72,10 @@ pub async fn execute(arguments: &str, context: Option<WebSearchContext>) -> Tool
         log::info!("Background web search task {} completed", task_id_clone);
     });
 
-    ToolOutcome::Background { task_id, output_path }
+    ToolOutcome::Background {
+        task_id,
+        output_path,
+    }
 }
 
 fn generate_task_id() -> String {

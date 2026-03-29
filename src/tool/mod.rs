@@ -6,6 +6,7 @@ pub mod read;
 pub mod web_fetch;
 pub mod write;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::provider::moonshot::tool::ToolDefinition;
@@ -35,28 +36,23 @@ pub fn format_tool_outcome(outcome: &ToolOutcome) -> String {
     }
 }
 
-/// Loads default tool definitions from embedded JSON files.
-pub fn default_tool_definitions() -> Vec<ToolDefinition> {
-    const BASH_JSON: &str = include_str!("bash.json");
-    const WEB_FETCH_JSON: &str = include_str!("web_fetch.json");
-    const READ_FILE_JSON: &str = include_str!("read_file.json");
-    const WRITE_FILE_JSON: &str = include_str!("write_file.json");
-    const EDIT_FILE_JSON: &str = include_str!("edit_file.json");
-    const GLOB_JSON: &str = include_str!("glob.json");
-    const GREP_JSON: &str = include_str!("grep.json");
+/// Loads default tool definitions from embedded JSON files, keyed by tool name.
+pub fn default_tool_definitions() -> BTreeMap<String, ToolDefinition> {
+    const JSONS: &[&str] = &[
+        include_str!("bash.json"),
+        include_str!("web_fetch.json"),
+        include_str!("read_file.json"),
+        include_str!("write_file.json"),
+        include_str!("edit_file.json"),
+        include_str!("glob.json"),
+        include_str!("grep.json"),
+    ];
 
-    [
-        BASH_JSON,
-        WEB_FETCH_JSON,
-        READ_FILE_JSON,
-        WRITE_FILE_JSON,
-        EDIT_FILE_JSON,
-        GLOB_JSON,
-        GREP_JSON,
-    ]
-    .iter()
-    .filter_map(|json| serde_json::from_str(json).ok())
-    .collect()
+    JSONS
+        .iter()
+        .filter_map(|json| serde_json::from_str::<ToolDefinition>(json).ok())
+        .map(|def| (def.function.name.clone(), def))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -163,9 +159,8 @@ mod tests {
     fn test_default_tool_definitions() {
         let defs = default_tool_definitions();
         assert_eq!(defs.len(), 7);
-        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
-        assert!(names.contains(&"bash"));
-        assert!(names.contains(&"web_fetch"));
-        assert!(names.contains(&"read_file"));
+        assert!(defs.contains_key("bash"));
+        assert!(defs.contains_key("web_fetch"));
+        assert!(defs.contains_key("read_file"));
     }
 }

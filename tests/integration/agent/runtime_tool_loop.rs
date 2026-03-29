@@ -139,7 +139,7 @@ async fn test_tool_call_loop() {
         "test-model".into(),
     );
 
-    let tools = tool::default_tool_definitions();
+    let tools: Vec<_> = tool::default_tool_definitions().into_values().collect();
 
     let mut history: Vec<Message> = vec![
         Message::User {
@@ -424,7 +424,7 @@ async fn test_background_tool_call_loop() {
         "test-model".into(),
     );
 
-    let tools = tool::default_tool_definitions();
+    let tools: Vec<_> = tool::default_tool_definitions().into_values().collect();
 
     let mut history: Vec<Message> = vec![Message::User {
         content: UserContent::Text("Build my project".into()),
@@ -577,7 +577,7 @@ async fn test_mixed_sync_background_tool_calls() {
         "test-model".into(),
     );
 
-    let tools = tool::default_tool_definitions();
+    let tools: Vec<_> = tool::default_tool_definitions().into_values().collect();
 
     let mut history: Vec<Message> = vec![Message::User {
         content: UserContent::Text("Show date and build project".into()),
@@ -801,7 +801,7 @@ async fn test_multi_step_tool_chain() {
         "test-model".into(),
     );
 
-    let tools = tool::default_tool_definitions();
+    let tools: Vec<_> = tool::default_tool_definitions().into_values().collect();
 
     let mut history: Vec<Message> = vec![Message::User {
         content: UserContent::Text("Summarize files in /tmp".into()),

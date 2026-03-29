@@ -21,6 +21,7 @@ TELEGRAM_BOT_TOKEN=<bot_token> cargo run
 - Use `log` macros (`log::info!`, `log::error!`) for logging. No `println!` outside of CLI output.
 - Derive `serde::Serialize` and `serde::Deserialize` on all data types that cross boundaries (config, API, storage).
 - Session data is stored as JSONL (one JSON object per line), not JSON arrays.
+
 ### Naming Convention
 
 Name identifiers after domain concepts, not implementation details.
@@ -74,6 +75,26 @@ Cross-cutting files that don't belong to a single domain sit at `src/` root.
 **You MUST NOT:**
 - Create directories that require reading file contents to understand their purpose.
 
+#### Addition Path Rules for Tests
+
+**Unit tests:** inline `#[cfg(test)] mod tests` at the bottom of the source file (Rust convention). Unit tests have direct access to private functions and run with `cargo test --lib`.
+
+**Integration tests:** replicate the path of the tested subject in `src` dir.
+<example>
+  src: `src/<domain>/<layer>`
+  tests: `tests/integration/<domain>/<layer>_{integration_test_purpose}.rs`
+</example>
+
+<example>
+  src: `src/<domain>`
+  tests: `tests/integration/<domain>_{integration_test_purpose}.rs`
+</example>
+
+**End-to-end tests:** clarify processor arch (required), vendor (required), os (required), runtime environment (required) and locale (optional).
+<example>
+  tests: `tests/e2e/{processor_arch}_{vendor}_{os}_{runtime_env}/{optional:locale}/{e2e_test_purpose}.rs`
+</example>
+
 ### Comment Scoping Rule
 
 Comments explain the purpose of the item they're attached to, not how other parts of the system work.
@@ -105,9 +126,12 @@ Comments explain the purpose of the item they're attached to, not how other part
 - Use comments to document how other parts of the system work — that belongs in those parts' own comments.
 - Write comments that create implicit coupling between unrelated modules.
 
-## Architecture Rules
+## User Experience Rules
 
 - The chat handler must never block. Any work that takes more than a trivial amount of time must be dispatched as a background task.
+
+## Architecture Rules
+
 - Keep the main binary thin — business logic goes in library modules (`src/lib.rs` or `src/` submodules).
 - No hardcoded paths, tokens, or secrets. Everything comes from environment variables or config files.
 

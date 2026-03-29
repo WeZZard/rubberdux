@@ -2,7 +2,7 @@ pub mod api;
 pub mod tool;
 
 use serde::{Deserialize, Serialize};
-use tool::{FunctionDefinition, ToolCall, ToolDefinition};
+use tool::{ToolCall, ToolDefinition};
 
 use crate::channel::interpreter::{Attachment, InterpretedMessage};
 
@@ -186,9 +186,13 @@ impl MoonshotClient {
         &self.model
     }
 
-    /// Assembles tool definitions with provider-first JSON resolution.
-    pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        tool::prompt::tool_definitions()
+    /// Applies provider-specific overrides to standard tool definitions
+    /// and inserts provider-owned custom tools.
+    pub fn override_tool_definitions(
+        &self,
+        defaults: std::collections::BTreeMap<String, ToolDefinition>,
+    ) -> std::collections::BTreeMap<String, ToolDefinition> {
+        tool::prompt::override_tool_definitions(defaults)
     }
 
     /// Returns true if this tool is owned by the provider.
@@ -230,35 +234,7 @@ impl MoonshotClient {
         tool::prompt::format_tool_outcome(name, outcome)
     }
 
-    pub fn build_messages(
-        &self,
-        system_prompt: &str,
-        history: &[Message],
-        interpreted: &InterpretedMessage,
-    ) -> Vec<Message> {
-        let mut msgs = Vec::with_capacity(history.len() + 2);
-        msgs.push(Message::System {
-            content: system_prompt.to_owned(),
-        });
-        msgs.extend_from_slice(history);
-        msgs.push(Message::from_interpreted(interpreted));
-        msgs
-    }
 
-    /// Builds messages from history only (no new user input). Used in the tool use loop
-    /// where user input is already in history.
-    pub fn build_messages_from_history(
-        &self,
-        system_prompt: &str,
-        history: &[Message],
-    ) -> Vec<Message> {
-        let mut msgs = Vec::with_capacity(history.len() + 1);
-        msgs.push(Message::System {
-            content: system_prompt.to_owned(),
-        });
-        msgs.extend_from_slice(history);
-        msgs
-    }
 
     pub(crate) fn http(&self) -> &reqwest::Client {
         &self.http
@@ -443,39 +419,6 @@ mod tests {
         assert!(json.get("tool_calls").is_some());
     }
 
-    #[test]
-    fn test_build_messages_ordering() {
-        let client = MoonshotClient {
-            http: reqwest::Client::new(),
-            base_url: "https://example.com/v1".into(),
-            api_key: "test".into(),
-            model: "test-model".into(),
-        };
-
-        let history = vec![
-            Message::User {
-                content: UserContent::Text("First".into()),
-            },
-            Message::Assistant {
-                content: Some("Reply".into()),
-                reasoning_content: None,
-                tool_calls: None,
-                partial: None,
-            },
-        ];
-
-        let interpreted = InterpretedMessage {
-            text: "Second".into(),
-            attachments: vec![],
-        };
-
-        let msgs = client.build_messages("System prompt", &history, &interpreted);
-
-        assert_eq!(msgs.len(), 4);
-        assert!(matches!(&msgs[0], Message::System { content } if content == "System prompt"));
-        assert!(matches!(&msgs[3], Message::User { content: UserContent::Text(t) } if t == "Second"));
-    }
-
     /// Shared harness: builds history with a given tool result message,
     /// calls real Moonshot API, and returns whether the model tried to poll.
     async fn run_background_tool_result_trial(
@@ -483,7 +426,10 @@ mod tests {
         tool_result_content: &str,
     ) -> bool {
         let client = MoonshotClient::from_env();
-        let tools = client.tool_definitions();
+        let tools: Vec<_> = client
+            .override_tool_definitions(crate::tool::default_tool_definitions())
+            .into_values()
+            .collect();
         let system_prompt = "You are a helpful assistant.";
 
         let mut history: Vec<Message> = vec![
@@ -519,7 +465,8 @@ mod tests {
         let mut polled = false;
         let max_iterations = 3;
         for iteration in 1..=max_iterations {
-            let messages = client.build_messages_from_history(system_prompt, &history);
+            let mut messages = vec![Message::System { content: system_prompt.to_owned() }];
+            messages.extend_from_slice(&history);
 
             let response = client.chat(messages, Some(tools.clone())).await.unwrap();
             let choice = &response.choices[0];

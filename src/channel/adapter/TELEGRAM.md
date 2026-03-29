@@ -26,7 +26,8 @@ Wrap text for the user:
 React to a user message:
 
 ```
-<telegram-reaction from="assistant" action="add" emoji="..." message-id="..." />
+<telegram-reaction from="assistant" action="add" emoji="..." message-id="..." date="..." />
+<telegram-reaction from="assistant" action="remove" emoji="..." message-id="..." date="..." />
 ```
 
 Text outside these tags is your internal reasoning and will not be sent to the user.

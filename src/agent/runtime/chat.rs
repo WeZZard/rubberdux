@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::channel::{AgentResponse, UserMessage};
+use crate::provider::moonshot::tool::ToolDefinition;
 use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
 
 const DEFAULT_BEST_PERFORMANCE_TOKENS: usize = 153_600;
@@ -13,8 +14,7 @@ const DEFAULT_SESSION_DIR: &str = "./sessions";
 const SESSION_FILENAME: &str = "session.jsonl";
 
 fn session_path() -> PathBuf {
-    let dir = std::env::var("RUBBERDUX_SESSION_DIR")
-        .unwrap_or_else(|_| DEFAULT_SESSION_DIR.into());
+    let dir = std::env::var("RUBBERDUX_SESSION_DIR").unwrap_or_else(|_| DEFAULT_SESSION_DIR.into());
     PathBuf::from(dir).join(SESSION_FILENAME)
 }
 
@@ -46,7 +46,11 @@ fn load_session(path: &Path) -> Vec<Message> {
         }
     }
 
-    log::info!("Restored {} messages from session {:?}", history.len(), path);
+    log::info!(
+        "Restored {} messages from session {:?}",
+        history.len(),
+        path
+    );
     history
 }
 
@@ -111,12 +115,19 @@ pub async fn run(
         if let Some(rest) = text_preview.strip_prefix("__update_assistant_id:") {
             let parts: Vec<&str> = rest.splitn(2, ':').collect();
             if let (Some(msg_id_str), Some(idx_str)) = (parts.first(), parts.get(1)) {
-                if let (Ok(msg_id), Ok(idx)) = (msg_id_str.parse::<i32>(), idx_str.parse::<usize>()) {
+                if let (Ok(msg_id), Ok(idx)) = (msg_id_str.parse::<i32>(), idx_str.parse::<usize>())
+                {
                     if let Some(Message::Assistant { content, .. }) = history.get_mut(idx) {
                         if let Some(text) = content {
-                            crate::channel::adapter::telegram::inject_assistant_message_id(text, msg_id);
+                            crate::channel::adapter::telegram::inject_assistant_message_id(
+                                text, msg_id,
+                            );
                             append_to_session(&session_file, &history[idx]);
-                            log::debug!("Updated assistant message at index {} with id={}", idx, msg_id);
+                            log::debug!(
+                                "Updated assistant message at index {} with id={}",
+                                idx,
+                                msg_id
+                            );
                         }
                     }
                 }
@@ -151,7 +162,11 @@ pub async fn run(
 
         // Store user message in history
         let history_text = if has_attachments {
-            format!("{} [with {} attachment(s)]", text_preview, interpreted.attachments.len())
+            format!(
+                "{} [with {} attachment(s)]",
+                text_preview,
+                interpreted.attachments.len()
+            )
         } else {
             text_preview.clone()
         };
@@ -163,11 +178,11 @@ pub async fn run(
         history.push(user_msg);
 
         // Tool use loop: call LLM, execute tools, repeat until finish_reason="stop"
-        let tools = client.tool_definitions();
+        let tools = assemble_tool_definitions(&client);
         let reply_tx = msg.reply_tx;
 
         loop {
-            let messages = client.build_messages_from_history(&system_prompt, &history);
+            let messages = build_messages(&system_prompt, &history);
 
             let result = client.chat(messages, Some(tools.clone())).await;
 
@@ -186,11 +201,13 @@ pub async fn run(
                         Some(c) => c,
                         None => {
                             if let Some(tx) = &reply_tx {
-                                let _ = tx.send(AgentResponse {
-                                    text: "(empty response)".into(),
-                                    history_index: history.len().saturating_sub(1),
-                                    is_final: true,
-                                }).await;
+                                let _ = tx
+                                    .send(AgentResponse {
+                                        text: "(empty response)".into(),
+                                        history_index: history.len().saturating_sub(1),
+                                        is_final: true,
+                                    })
+                                    .await;
                             }
                             break;
                         }
@@ -211,20 +228,24 @@ pub async fn run(
                     // Send text to channel immediately (intermediate or final)
                     if !text.is_empty() {
                         if let Some(tx) = &reply_tx {
-                            let _ = tx.send(AgentResponse {
-                                text: text.clone(),
-                                history_index: asst_index,
-                                is_final,
-                            }).await;
+                            let _ = tx
+                                .send(AgentResponse {
+                                    text: text.clone(),
+                                    history_index: asst_index,
+                                    is_final,
+                                })
+                                .await;
                         }
                     } else if is_final {
                         // Final response with no text — still signal completion
                         if let Some(tx) = &reply_tx {
-                            let _ = tx.send(AgentResponse {
-                                text: String::new(),
-                                history_index: asst_index,
-                                is_final: true,
-                            }).await;
+                            let _ = tx
+                                .send(AgentResponse {
+                                    text: String::new(),
+                                    history_index: asst_index,
+                                    is_final: true,
+                                })
+                                .await;
                         }
                     }
 
@@ -237,11 +258,17 @@ pub async fn run(
                     if let Some(tool_calls) = choice.message.tool_calls() {
                         log::info!("Executing {} tool call(s)", tool_calls.len());
                         for call in tool_calls {
-                            log::info!("Tool call: {}({})", call.function.name, call.function.arguments);
+                            log::info!(
+                                "Tool call: {}({})",
+                                call.function.name,
+                                call.function.arguments
+                            );
 
                             // Route: provider tools → provider, generic tools → tool module
                             let outcome = if MoonshotClient::is_provider_tool(&call.function.name) {
-                                let last_user_query = history.iter().rev()
+                                let last_user_query = history
+                                    .iter()
+                                    .rev()
                                     .find_map(|m| match m {
                                         Message::User { content } => Some(match content {
                                             UserContent::Text(t) => t.clone(),
@@ -257,27 +284,36 @@ pub async fn run(
                                     tool_call: call.clone(),
                                 };
 
-                                client.execute_provider_tool(
-                                    &call.function.name,
-                                    &call.function.arguments,
-                                    &ctx,
-                                ).await
+                                client
+                                    .execute_provider_tool(
+                                        &call.function.name,
+                                        &call.function.arguments,
+                                        &ctx,
+                                    )
+                                    .await
                             } else {
                                 crate::tool::execute_tool(
                                     &call.function.name,
                                     &call.function.arguments,
-                                ).await
+                                )
+                                .await
                             };
 
-                            if let crate::tool::ToolOutcome::Immediate { ref content, is_error: true } = outcome {
+                            if let crate::tool::ToolOutcome::Immediate {
+                                ref content,
+                                is_error: true,
+                            } = outcome
+                            {
                                 log::warn!("Tool error: {}", content);
                             }
 
                             // Format: provider override first, then default
-                            let content = MoonshotClient::format_tool_outcome(&call.function.name, &outcome)
-                                .unwrap_or_else(|| crate::tool::format_tool_outcome(&outcome));
+                            let content =
+                                MoonshotClient::format_tool_outcome(&call.function.name, &outcome)
+                                    .unwrap_or_else(|| crate::tool::format_tool_outcome(&outcome));
 
-                            let tool_name = if MoonshotClient::is_provider_tool(&call.function.name) {
+                            let tool_name = if MoonshotClient::is_provider_tool(&call.function.name)
+                            {
                                 Some(call.function.name.clone())
                             } else {
                                 None
@@ -296,11 +332,13 @@ pub async fn run(
                 Err(e) => {
                     log::error!("LLM call failed: {}", e);
                     if let Some(tx) = &reply_tx {
-                        let _ = tx.send(AgentResponse {
-                            text: format!("Sorry, I encountered an error: {}", e),
-                            history_index: history.len().saturating_sub(1),
-                            is_final: true,
-                        }).await;
+                        let _ = tx
+                            .send(AgentResponse {
+                                text: format!("Sorry, I encountered an error: {}", e),
+                                history_index: history.len().saturating_sub(1),
+                                is_final: true,
+                            })
+                            .await;
                     }
                     break;
                 }
@@ -309,6 +347,22 @@ pub async fn run(
     }
 
     log::info!("Agent loop shutting down");
+}
+
+fn build_messages(system_prompt: &str, history: &[Message]) -> Vec<Message> {
+    let mut msgs = Vec::with_capacity(history.len() + 1);
+    msgs.push(Message::System {
+        content: system_prompt.to_owned(),
+    });
+    msgs.extend_from_slice(history);
+    msgs
+}
+
+/// Assembles the tool definitions for a chat turn: standard defaults
+/// with provider-specific overrides applied.
+fn assemble_tool_definitions(client: &MoonshotClient) -> Vec<ToolDefinition> {
+    let defaults = crate::tool::default_tool_definitions();
+    client.override_tool_definitions(defaults).into_values().collect()
 }
 
 fn evict_oldest_pair(history: &mut Vec<Message>) -> bool {
@@ -328,26 +382,58 @@ mod tests {
     #[test]
     fn test_eviction_removes_oldest_pairs() {
         let mut history = vec![
-            Message::User { content: UserContent::Text("old1".into()) },
-            Message::Assistant { content: Some("reply1".into()), reasoning_content: None, tool_calls: None, partial: None },
-            Message::User { content: UserContent::Text("old2".into()) },
-            Message::Assistant { content: Some("reply2".into()), reasoning_content: None, tool_calls: None, partial: None },
-            Message::User { content: UserContent::Text("recent".into()) },
-            Message::Assistant { content: Some("reply3".into()), reasoning_content: None, tool_calls: None, partial: None },
+            Message::User {
+                content: UserContent::Text("old1".into()),
+            },
+            Message::Assistant {
+                content: Some("reply1".into()),
+                reasoning_content: None,
+                tool_calls: None,
+                partial: None,
+            },
+            Message::User {
+                content: UserContent::Text("old2".into()),
+            },
+            Message::Assistant {
+                content: Some("reply2".into()),
+                reasoning_content: None,
+                tool_calls: None,
+                partial: None,
+            },
+            Message::User {
+                content: UserContent::Text("recent".into()),
+            },
+            Message::Assistant {
+                content: Some("reply3".into()),
+                reasoning_content: None,
+                tool_calls: None,
+                partial: None,
+            },
         ];
 
         assert!(evict_oldest_pair(&mut history));
         assert_eq!(history.len(), 4);
 
-        assert!(matches!(&history[2], Message::User { content: UserContent::Text(t) } if t == "recent"));
-        assert!(matches!(&history[3], Message::Assistant { content: Some(c), .. } if c == "reply3"));
+        assert!(
+            matches!(&history[2], Message::User { content: UserContent::Text(t) } if t == "recent")
+        );
+        assert!(
+            matches!(&history[3], Message::Assistant { content: Some(c), .. } if c == "reply3")
+        );
     }
 
     #[test]
     fn test_no_eviction_under_threshold() {
         let history = vec![
-            Message::User { content: UserContent::Text("hello".into()) },
-            Message::Assistant { content: Some("hi".into()), reasoning_content: None, tool_calls: None, partial: None },
+            Message::User {
+                content: UserContent::Text("hello".into()),
+            },
+            Message::Assistant {
+                content: Some("hi".into()),
+                reasoning_content: None,
+                tool_calls: None,
+                partial: None,
+            },
         ];
 
         let last_prompt_tokens: usize = 100;
@@ -357,5 +443,4 @@ mod tests {
         assert!(last_prompt_tokens + estimated_new <= best_perf_tokens);
         assert_eq!(history.len(), 2);
     }
-
 }
