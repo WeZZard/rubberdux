@@ -9,6 +9,7 @@ pub enum ChannelEvent {
     UserInput {
         interpreted: InterpretedMessage,
         reply_tx: Option<tokio::sync::mpsc::Sender<AgentResponse>>,
+        telegram_message_id: Option<i32>,
     },
     /// Channel-internal event that mutates history without calling the LLM.
     InternalEvent(InternalEvent),
@@ -27,4 +28,5 @@ pub struct AgentResponse {
     pub text: String,
     pub entry_id: usize,
     pub is_final: bool,
+    pub reply_to_message_id: Option<i32>,
 }

@@ -35,6 +35,7 @@ async fn handle_message(
     let event = ChannelEvent::UserInput {
         interpreted,
         reply_tx: Some(reply_tx),
+        telegram_message_id: Some(msg.id.0),
     };
 
     if tx.send(event).await.is_err() {
@@ -81,10 +82,13 @@ async fn handle_message(
                         log::debug!("Raw model reply:\n{}", content);
                         log::debug!("Formatted for Telegram:\n{}", formatted);
 
-                        let sent_msg = bot
+                        let mut req = bot
                             .send_message(chat_id, &formatted)
-                            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-                            .await;
+                            .parse_mode(teloxide::types::ParseMode::MarkdownV2);
+                        if let Some(reply_id) = response.reply_to_message_id {
+                            req = req.reply_parameters(teloxide::types::ReplyParameters::new(teloxide::types::MessageId(reply_id)));
+                        }
+                        let sent_msg = req.await;
 
                         let sent_msg = match sent_msg {
                             Ok(m) => Some(m),
@@ -93,7 +97,11 @@ async fn handle_message(
                                     "MarkdownV2 send failed ({}), retrying without parse_mode",
                                     e
                                 );
-                                bot.send_message(chat_id, content).await.ok()
+                                let mut fallback_req = bot.send_message(chat_id, content);
+                                if let Some(reply_id) = response.reply_to_message_id {
+                                    fallback_req = fallback_req.reply_parameters(teloxide::types::ReplyParameters::new(teloxide::types::MessageId(reply_id)));
+                                }
+                                fallback_req.await.ok()
                             }
                         };
 
@@ -121,10 +129,13 @@ async fn handle_message(
                     let formatted = super::markdown::format(&response.text);
                     log::debug!("Raw LLM response (no tags):\n{}", response.text);
 
-                    let sent_msg = bot
+                    let mut req = bot
                         .send_message(chat_id, &formatted)
-                        .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-                        .await;
+                        .parse_mode(teloxide::types::ParseMode::MarkdownV2);
+                    if let Some(reply_id) = response.reply_to_message_id {
+                        req = req.reply_parameters(teloxide::types::ReplyParameters::new(teloxide::types::MessageId(reply_id)));
+                    }
+                    let sent_msg = req.await;
 
                     match sent_msg {
                         Ok(_) => {}
@@ -133,7 +144,11 @@ async fn handle_message(
                                 "MarkdownV2 send failed ({}), retrying without parse_mode",
                                 e
                             );
-                            let _ = bot.send_message(chat_id, &response.text).await;
+                            let mut fallback_req = bot.send_message(chat_id, &response.text);
+                            if let Some(reply_id) = response.reply_to_message_id {
+                                fallback_req = fallback_req.reply_parameters(teloxide::types::ReplyParameters::new(teloxide::types::MessageId(reply_id)));
+                            }
+                            let _ = fallback_req.await;
                         }
                     }
                 }
@@ -164,6 +179,7 @@ async fn handle_reaction(
         let event = ChannelEvent::UserInput {
             interpreted,
             reply_tx: None,
+            telegram_message_id: None,
         };
 
         if tx.send(event).await.is_err() {

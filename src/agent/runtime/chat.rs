@@ -28,6 +28,7 @@ struct TaskGroup {
     asst_entry_id: usize,
     remaining: usize,
     completed_results: Vec<BackgroundTaskResult>,
+    telegram_message_id: Option<i32>,
 }
 
 /// A conversation that needs the next LLM step. Persists across select! iterations.
@@ -38,6 +39,10 @@ struct ActiveConversation {
     pending_task_ids: Vec<String>,
     /// The assistant entry that first dispatched background tasks (for TaskGroup).
     first_bg_asst_entry_id: Option<usize>,
+    /// Original Telegram message ID for reply-to on background completions.
+    telegram_message_id: Option<i32>,
+    /// Whether this conversation was triggered by a background task completion.
+    is_background_completion: bool,
 }
 
 const DEFAULT_BEST_PERFORMANCE_TOKENS: usize = 153_600;
@@ -347,7 +352,7 @@ pub async fn run(
                     ChannelEvent::InternalEvent(internal) => {
                         handle_internal_event(internal, &mut history, &session_file);
                     }
-                    ChannelEvent::UserInput { interpreted, reply_tx } => {
+                    ChannelEvent::UserInput { interpreted, reply_tx, telegram_message_id } => {
                         let text_preview = interpreted.text.clone();
                         let has_attachments = !interpreted.attachments.is_empty();
                         let is_silent = reply_tx.is_none();
@@ -396,15 +401,20 @@ pub async fn run(
                                     asst_entry_id,
                                     remaining: prev.pending_task_ids.len(),
                                     completed_results: Vec::new(),
+                                    telegram_message_id: prev.telegram_message_id,
                                 });
                             }
                         }
 
                         // Start a new conversation — next select! iteration will drive it
+                        // telegram_message_id is stored for TaskGroup use (reply-to on bg completion)
+                        // but NOT used for the initial response (regular messages don't reply-to)
                         active_conversation = Some(ActiveConversation {
                             reply_tx,
                             pending_task_ids: Vec::new(),
                             first_bg_asst_entry_id: None,
+                            telegram_message_id,
+                            is_background_completion: false,
                         });
                         let _ = conv_notify_tx.send(()).await;
                     }
@@ -463,6 +473,8 @@ pub async fn run(
                     reply_tx: group.reply_tx,
                     pending_task_ids: Vec::new(),
                     first_bg_asst_entry_id: None,
+                    telegram_message_id: group.telegram_message_id,
+                    is_background_completion: true,
                 });
                 let _ = conv_notify_tx.send(()).await;
             }
@@ -482,7 +494,12 @@ pub async fn run(
                         if conv.pending_task_ids.is_empty() {
                             // No background tasks — truly final
                             let is_final = active_groups.is_empty();
-                            send_response(&conv.reply_tx, text, entry_id, is_final).await;
+                            let reply_to = if conv.is_background_completion {
+                                conv.telegram_message_id
+                            } else {
+                                None
+                            };
+                            send_response(&conv.reply_tx, text, entry_id, is_final, reply_to).await;
                         } else {
                             // Background tasks accumulated — create ONE group, send non-final response
                             let asst_entry_id = conv.first_bg_asst_entry_id.unwrap_or(entry_id);
@@ -494,8 +511,9 @@ pub async fn run(
                                 asst_entry_id,
                                 remaining: conv.pending_task_ids.len(),
                                 completed_results: Vec::new(),
+                                telegram_message_id: conv.telegram_message_id,
                             });
-                            send_response(&conv.reply_tx, text, entry_id, false).await;
+                            send_response(&conv.reply_tx, text, entry_id, false, None).await;
                         }
                         log::info!("LLM conversation completed");
                     }
@@ -521,6 +539,7 @@ pub async fn run(
                             format!("Sorry, I encountered an error: {}", e),
                             history.last_id().unwrap_or(0),
                             true,
+                            None,
                         ).await;
                     }
                 }
@@ -538,6 +557,7 @@ async fn send_response(
     text: String,
     entry_id: usize,
     is_final: bool,
+    reply_to_message_id: Option<i32>,
 ) {
     if !text.is_empty() || is_final {
         let _ = tx
@@ -545,6 +565,7 @@ async fn send_response(
                 text,
                 entry_id,
                 is_final,
+                reply_to_message_id,
             })
             .await;
     }
