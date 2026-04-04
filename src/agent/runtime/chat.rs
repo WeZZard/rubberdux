@@ -641,7 +641,9 @@ fn evict_if_needed(
 /// with provider-specific overrides applied.
 fn assemble_tool_definitions(client: &MoonshotClient) -> Vec<ToolDefinition> {
     let defaults = crate::tool::default_tool_definitions();
-    client.override_tool_definitions(defaults).into_values().collect()
+    let tools: Vec<_> = client.override_tool_definitions(defaults).into_values().collect();
+    log::info!("Assembled {} tools: {:?}", tools.len(), tools.iter().map(|t| &t.function.name).collect::<Vec<_>>());
+    tools
 }
 
 #[cfg(test)]

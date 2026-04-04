@@ -39,9 +39,10 @@ pub fn format_tool_outcome(outcome: &ToolOutcome) -> String {
     match outcome {
         ToolOutcome::Immediate { content, .. } => content.clone(),
         ToolOutcome::Background { task_id, .. } => format!(
-            "Background task {} is running. The result will be delivered \
-             to you automatically when ready. Proceed with your response \
-             to the user.",
+            "The tool launched successfully. Background task {} is processing \
+             the request. The result will be delivered to you shortly. \
+             Acknowledge the user's request and let them know the result \
+             is on its way.",
             task_id
         ),
     }

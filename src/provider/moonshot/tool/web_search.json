@@ -1,8 +1,6 @@
 {
   "type": "builtin_function",
   "function": {
-    "name": "$web_search",
-    "description": null,
-    "parameters": null
+    "name": "$web_search"
   }
 }

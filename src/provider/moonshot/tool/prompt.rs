@@ -18,18 +18,11 @@ pub fn override_tool_definitions(
         }
     }
 
-    // Add custom provider tools
-    defaults.insert(
-        "$web_search".to_owned(),
-        ToolDefinition {
-            r#type: "builtin_function".to_owned(),
-            function: FunctionDefinition {
-                name: "$web_search".to_owned(),
-                description: None,
-                parameters: None,
-            },
-        },
-    );
+    // Add custom provider tools from JSON
+    const WEB_SEARCH_JSON: &str = include_str!("web_search.json");
+    if let Ok(def) = serde_json::from_str::<ToolDefinition>(WEB_SEARCH_JSON) {
+        defaults.insert(def.function.name.clone(), def);
+    }
 
     defaults
 }
@@ -71,5 +64,14 @@ mod tests {
         assert!(is_provider_tool("$web_search"));
         assert!(!is_provider_tool("bash"));
         assert!(!is_provider_tool("web_fetch"));
+    }
+
+    #[test]
+    fn test_dump_assembled_tools_json() {
+        let defaults = crate::tool::default_tool_definitions();
+        let defs = override_tool_definitions(defaults);
+        let tools: Vec<_> = defs.into_values().collect();
+        let json = serde_json::to_string_pretty(&tools).unwrap();
+        eprintln!("\n=== ASSEMBLED TOOLS JSON ===\n{}\n===========================\n", json);
     }
 }

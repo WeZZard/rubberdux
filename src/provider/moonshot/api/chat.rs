@@ -61,6 +61,20 @@ impl MoonshotClient {
         // The caller passes the complete tool list — no internal merging needed.
         let tools = tools.filter(|t| !t.is_empty());
 
+        // $web_search requires thinking to be explicitly disabled
+        let has_web_search = tools
+            .as_ref()
+            .map(|t| t.iter().any(|td| td.function.name == "$web_search"))
+            .unwrap_or(false);
+
+        let thinking = if has_web_search {
+            Some(ThinkingConfig {
+                r#type: "disabled".to_owned(),
+            })
+        } else {
+            None
+        };
+
         let request = ChatRequest {
             model: self.model().to_owned(),
             messages,
@@ -68,8 +82,15 @@ impl MoonshotClient {
             max_completion_tokens: None,
             tools,
             response_format: None,
-            thinking: None,
+            thinking,
         };
+
+        if let Ok(json) = serde_json::to_string(&request) {
+            log::debug!("Chat API request tools: {}",
+                serde_json::to_string(&request.tools).unwrap_or_default());
+            log::debug!("Chat API request thinking: {}",
+                serde_json::to_string(&request.thinking).unwrap_or_default());
+        }
 
         let response = self
             .http()
