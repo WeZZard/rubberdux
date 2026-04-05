@@ -29,7 +29,7 @@ pub fn override_tool_definitions(
 
 /// Returns true if this tool is owned by the Moonshot provider.
 pub fn is_provider_tool(name: &str) -> bool {
-    name == "$web_search"
+    name == "web_search"
 }
 
 /// Optional format override. Returns None to use default format_tool_outcome.
@@ -56,12 +56,12 @@ mod tests {
     fn test_override_tool_definitions_includes_provider_tools() {
         let defaults = crate::tool::default_tool_definitions();
         let defs = override_tool_definitions(defaults);
-        assert!(defs.contains_key("$web_search"), "should include $web_search");
+        assert!(defs.contains_key("web_search"), "should include web_search");
     }
 
     #[test]
     fn test_is_provider_tool() {
-        assert!(is_provider_tool("$web_search"));
+        assert!(is_provider_tool("web_search"));
         assert!(!is_provider_tool("bash"));
         assert!(!is_provider_tool("web_fetch"));
     }

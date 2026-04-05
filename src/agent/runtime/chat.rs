@@ -246,8 +246,6 @@ async fn run_tool_turn(
 
             let ctx = crate::provider::moonshot::ToolExecutionContext {
                 last_user_query,
-                assistant_message: choice.message.clone(),
-                tool_call: call.clone(),
             };
 
             client

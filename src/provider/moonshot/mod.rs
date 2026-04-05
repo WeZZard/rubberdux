@@ -135,8 +135,6 @@ impl Message {
 /// Context for executing provider-owned tools.
 pub struct ToolExecutionContext {
     pub last_user_query: String,
-    pub assistant_message: Message,
-    pub tool_call: ToolCall,
 }
 
 pub struct MoonshotClient {
@@ -208,7 +206,7 @@ impl MoonshotClient {
         ctx: &ToolExecutionContext,
     ) -> crate::tool::ToolOutcome {
         match name {
-            "$web_search" => {
+            "web_search" => {
                 let ws_ctx = tool::web_search::WebSearchContext {
                     client: std::sync::Arc::new(MoonshotClient::new(
                         self.http.clone(),
@@ -217,8 +215,6 @@ impl MoonshotClient {
                         self.model.clone(),
                     )),
                     last_user_query: ctx.last_user_query.clone(),
-                    assistant_message: ctx.assistant_message.clone(),
-                    tool_call: ctx.tool_call.clone(),
                 };
                 tool::web_search::execute(arguments, Some(ws_ctx)).await
             }

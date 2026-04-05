@@ -21,7 +21,7 @@ async fn main() {
     let prompt_parts = prompt::load_prompt_parts(&prompt_dir);
 
     let channel_partial = channel::adapter::telegram::channel_prompt();
-    let system_prompt = prompt::compose_system_prompt(&prompt_parts, Some(channel_partial));
+    let system_prompt = prompt::compose_system_prompt(&prompt_parts, Some(&channel_partial));
     log::info!("Composed system prompt ({} chars)", system_prompt.len());
 
     let client = Arc::new(provider::moonshot::MoonshotClient::from_env());

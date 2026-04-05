@@ -9,9 +9,33 @@ use crate::channel::{AgentResponse, ChannelEvent, InternalEvent};
 
 const TELEGRAM_PROMPT: &str = include_str!("TELEGRAM.md");
 
-/// Returns the Telegram channel prompt partial for system prompt composition.
-pub fn channel_prompt() -> &'static str {
-    TELEGRAM_PROMPT
+/// Available reaction emojis supported by the Telegram Bot API.
+/// Source: teloxide-core ReactionType::Emoji documentation.
+const AVAILABLE_REACTIONS: &[&str] = &[
+    "👍", "👎", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "🤬", "😢",
+    "🎉", "🤩", "🤮", "💩", "🙏", "👌", "🕊", "🤡", "🥱", "🥴", "😍", "🐳",
+    "❤\u{200d}🔥", "🌚", "🌭", "💯", "🤣", "⚡", "🍌", "🏆", "💔", "🤨",
+    "😐", "🍓", "🍾", "💋", "🖕", "😈", "😴", "😭", "🤓", "👻", "👨\u{200d}💻",
+    "👀", "🎃", "🙈", "😇", "😨", "🤝", "✍", "🤗", "🫡", "🎅", "🎄", "☃",
+    "💅", "🤪", "🗿", "🆒", "💘", "🙉", "🦄", "😘", "💊", "🙊", "😎", "👾",
+    "🤷\u{200d}♂", "🤷", "🤷\u{200d}♀", "😡",
+];
+
+/// Returns the Telegram channel prompt with available reactions injected.
+pub fn channel_prompt() -> String {
+    let reaction_list = AVAILABLE_REACTIONS.join(" ");
+    format!(
+        "{}\n\n## Reactions\n\n\
+         Available reaction emojis: {}\n\n\
+         Guidelines:\n\
+         - Use reactions sparingly to acknowledge messages or express genuine sentiment.\n\
+         - Do not react to every message. Reserve reactions for moments where they add warmth or clarity.\n\
+         - Prefer simple, universally understood emojis (👍 ❤ 🔥 🎉 😁) over niche ones.\n\
+         - Never use reactions as a substitute for a text response when the user expects information.\n\
+         - Avoid 🖕 and other potentially offensive emojis unless the user explicitly sets a casual tone.\n\
+         - Do not use emojis outside this list — they will be rejected by Telegram.",
+        TELEGRAM_PROMPT, reaction_list
+    )
 }
 
 async fn handle_message(

@@ -1,6 +1,17 @@
 {
-  "type": "builtin_function",
+  "type": "function",
   "function": {
-    "name": "$web_search"
+    "name": "web_search",
+    "description": "Search the web for current information. Use this when the user asks about recent news, events, or any information that requires up-to-date knowledge beyond your training data.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "The search query"
+        }
+      },
+      "required": ["query"]
+    }
   }
 }
