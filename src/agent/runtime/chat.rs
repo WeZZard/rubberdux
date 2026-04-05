@@ -348,7 +348,7 @@ pub async fn run(
             Some(event) = rx.recv() => {
                 match event {
                     ChannelEvent::InternalEvent(internal) => {
-                        handle_internal_event(internal, &mut history, &session_file);
+                        handle_internal_event(internal, &mut history, &session_file, &system_prompt);
                     }
                     ChannelEvent::UserInput { interpreted, reply_tx, telegram_message_id } => {
                         let text_preview = interpreted.text.clone();
@@ -573,6 +573,7 @@ fn handle_internal_event(
     event: InternalEvent,
     history: &mut EntryHistory,
     session_file: &Path,
+    system_prompt: &str,
 ) {
     match event {
         InternalEvent::UpdateAssistantMessageId {
@@ -605,6 +606,13 @@ fn handle_internal_event(
                     append_entry_to_session(session_file, entry);
                 }
             }
+        }
+        InternalEvent::UpdateAvailableReactions { reaction_section } => {
+            // Rebuild system prompt: base prompt + reaction section
+            let base = system_prompt;
+            let full = format!("{}\n\n{}", base, reaction_section);
+            history.update_system(full);
+            log::info!("Updated system prompt with dynamic reactions");
         }
     }
 }

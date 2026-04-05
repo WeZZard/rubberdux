@@ -101,6 +101,16 @@ impl EntryHistory {
         self.entries.iter_mut().find(|e| e.id == id)
     }
 
+    /// Updates the system message (Entry[0]). Used for dynamic prompt updates
+    /// like injecting available reactions from the channel.
+    pub fn update_system(&mut self, content: String) {
+        if let Some(entry) = self.entries.first_mut() {
+            if matches!(&entry.message, Message::System { .. }) {
+                entry.message = Message::System { content };
+            }
+        }
+    }
+
     /// ID of the last entry.
     pub fn last_id(&self) -> Option<usize> {
         self.entries.last().map(|e| e.id)
@@ -259,6 +269,20 @@ mod tests {
         assert_eq!(h.root_entry_id(tool), Some(user));
         // Root of system is itself
         assert_eq!(h.root_entry_id(sys), Some(sys));
+    }
+
+    #[test]
+    fn test_update_system_replaces_entry_zero() {
+        let mut h = EntryHistory::new();
+        h.push_system(Message::System { content: "original".into() });
+        h.push_user(Message::User { content: UserContent::Text("hi".into()) });
+
+        h.update_system("updated system prompt".into());
+
+        assert_eq!(h.entries()[0].message.content_text(), "updated system prompt");
+        assert_eq!(h.messages()[0].content_text(), "updated system prompt");
+        // User message unchanged
+        assert_eq!(h.entries()[1].message.content_text(), "hi");
     }
 
     #[test]

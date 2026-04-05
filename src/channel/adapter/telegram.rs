@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use teloxide::prelude::*;
 use teloxide::types::{MessageReactionUpdated, ReactionType, Recipient};
 use tokio::sync::mpsc;
@@ -9,9 +12,9 @@ use crate::channel::{AgentResponse, ChannelEvent, InternalEvent};
 
 const TELEGRAM_PROMPT: &str = include_str!("TELEGRAM.md");
 
-/// Available reaction emojis supported by the Telegram Bot API.
-/// Source: teloxide-core ReactionType::Emoji documentation.
-const AVAILABLE_REACTIONS: &[&str] = &[
+/// Default reaction emojis from teloxide's ReactionType::Emoji documentation.
+/// Used as fallback when get_chat returns None for available_reactions.
+pub const DEFAULT_REACTIONS: &[&str] = &[
     "👍", "👎", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "🤬", "😢",
     "🎉", "🤩", "🤮", "💩", "🙏", "👌", "🕊", "🤡", "🥱", "🥴", "😍", "🐳",
     "❤\u{200d}🔥", "🌚", "🌭", "💯", "🤣", "⚡", "🍌", "🏆", "💔", "🤨",
@@ -21,11 +24,17 @@ const AVAILABLE_REACTIONS: &[&str] = &[
     "🤷\u{200d}♂", "🤷", "🤷\u{200d}♀", "😡",
 ];
 
-/// Returns the Telegram channel prompt with available reactions injected.
-pub fn channel_prompt() -> String {
-    let reaction_list = AVAILABLE_REACTIONS.join(" ");
+/// Returns the Telegram channel prompt WITHOUT reactions section.
+/// Reactions are injected dynamically via UpdateAvailableReactions events.
+pub fn channel_prompt() -> &'static str {
+    TELEGRAM_PROMPT
+}
+
+/// Formats the reaction section for the system prompt.
+pub fn format_reaction_section(emojis: &[String]) -> String {
+    let emoji_list = emojis.join(" ");
     format!(
-        "{}\n\n## Reactions\n\n\
+        "## Reactions\n\n\
          Available reaction emojis: {}\n\n\
          Guidelines:\n\
          - Use reactions sparingly to acknowledge messages or express genuine sentiment.\n\
@@ -34,15 +43,64 @@ pub fn channel_prompt() -> String {
          - Never use reactions as a substitute for a text response when the user expects information.\n\
          - Avoid 🖕 and other potentially offensive emojis unless the user explicitly sets a casual tone.\n\
          - Do not use emojis outside this list — they will be rejected by Telegram.",
-        TELEGRAM_PROMPT, reaction_list
+        emoji_list
     )
+}
+
+/// Fetches available reactions for a chat and sends an UpdateAvailableReactions event.
+async fn fetch_and_send_reactions(bot: &Bot, chat_id: ChatId, tx: &mpsc::Sender<ChannelEvent>) {
+    match bot.get_chat(chat_id).await {
+        Ok(chat) => {
+            let emojis: Vec<String> = match chat.available_reactions {
+                Some(reactions) => reactions
+                    .into_iter()
+                    .filter_map(|r| match r {
+                        ReactionType::Emoji { emoji } => Some(emoji),
+                        _ => None,
+                    })
+                    .collect(),
+                None => {
+                    // None means all emoji reactions are allowed — use defaults
+                    DEFAULT_REACTIONS.iter().map(|s| s.to_string()).collect()
+                }
+            };
+            let section = format_reaction_section(&emojis);
+            log::info!("Fetched {} available reactions for chat {}", emojis.len(), chat_id);
+            let _ = tx
+                .send(ChannelEvent::InternalEvent(
+                    InternalEvent::UpdateAvailableReactions {
+                        reaction_section: section,
+                    },
+                ))
+                .await;
+        }
+        Err(e) => {
+            log::warn!("Failed to fetch chat info for reactions: {}", e);
+            // Fall back to defaults
+            let emojis: Vec<String> = DEFAULT_REACTIONS.iter().map(|s| s.to_string()).collect();
+            let section = format_reaction_section(&emojis);
+            let _ = tx
+                .send(ChannelEvent::InternalEvent(
+                    InternalEvent::UpdateAvailableReactions {
+                        reaction_section: section,
+                    },
+                ))
+                .await;
+        }
+    }
 }
 
 async fn handle_message(
     bot: Bot,
     msg: Message,
     tx: mpsc::Sender<ChannelEvent>,
+    reactions_fetched: Arc<AtomicBool>,
 ) -> Result<(), teloxide::RequestError> {
+    // Fetch available reactions on first message
+    if !reactions_fetched.swap(true, Ordering::Relaxed) {
+        fetch_and_send_reactions(&bot, msg.chat.id, &tx).await;
+    }
+
     let interpreted = match interpreter::interpret(&bot, &msg).await {
         Some(m) => m,
         None => return Ok(()),
@@ -215,12 +273,14 @@ async fn handle_reaction(
 }
 
 pub async fn run(bot: Bot, tx: mpsc::Sender<ChannelEvent>) {
+    let reactions_fetched = Arc::new(AtomicBool::new(false));
+
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(handle_message))
         .branch(Update::filter_message_reaction_updated().endpoint(handle_reaction));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![tx])
+        .dependencies(dptree::deps![tx, reactions_fetched])
         .enable_ctrlc_handler()
         .build()
         .dispatch()

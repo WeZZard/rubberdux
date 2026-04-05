@@ -22,6 +22,10 @@ pub enum InternalEvent {
         entry_id: usize,
         message_id: i32,
     },
+    /// Provides an updated reaction section for the system prompt.
+    UpdateAvailableReactions {
+        reaction_section: String,
+    },
 }
 
 pub struct AgentResponse {
