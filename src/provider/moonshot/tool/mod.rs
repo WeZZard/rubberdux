@@ -1,4 +1,5 @@
-pub mod prompt;
+pub mod bash;
+pub mod web_fetch;
 pub mod web_search;
 
 use serde::{Deserialize, Serialize};

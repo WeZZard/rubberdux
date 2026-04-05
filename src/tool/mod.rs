@@ -6,10 +6,68 @@ pub mod read;
 pub mod web_fetch;
 pub mod write;
 
-use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 use crate::provider::moonshot::tool::ToolDefinition;
+
+// ---------------------------------------------------------------------------
+// Tool trait — unified abstraction for tool definition + execution
+// ---------------------------------------------------------------------------
+
+/// System-declared tool abstraction. Each tool encapsulates its
+/// definition (what the model sees) and execution (how it runs).
+pub trait Tool: Send + Sync {
+    fn name(&self) -> &str;
+    fn definition(&self) -> ToolDefinition;
+    fn execute<'a>(
+        &'a self,
+        arguments: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ToolOutcome> + Send + 'a>>;
+}
+
+/// Dynamic tool registry. Holds tool instances, provides unified dispatch.
+pub struct ToolRegistry {
+    tools: Vec<Box<dyn Tool>>,
+}
+
+impl ToolRegistry {
+    pub fn new() -> Self {
+        Self { tools: Vec::new() }
+    }
+
+    pub fn register(&mut self, tool: Box<dyn Tool>) {
+        self.tools.push(tool);
+    }
+
+    pub fn unregister(&mut self, name: &str) -> bool {
+        let before = self.tools.len();
+        self.tools.retain(|t| t.name() != name);
+        self.tools.len() < before
+    }
+
+    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
+        self.tools
+            .iter()
+            .find(|t| t.name() == name)
+            .map(|t| t.as_ref())
+    }
+
+    pub fn definitions(&self) -> Vec<ToolDefinition> {
+        self.tools.iter().map(|t| t.definition()).collect()
+    }
+
+    pub async fn execute(&self, name: &str, arguments: &str) -> ToolOutcome {
+        match self.get(name) {
+            Some(tool) => tool.execute(arguments).await,
+            None => ToolOutcome::Immediate {
+                content: format!("Unknown tool: {}", name),
+                is_error: true,
+            },
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ToolOutcome — raw domain result from tool execution
@@ -48,79 +106,6 @@ pub fn format_tool_outcome(outcome: &ToolOutcome) -> String {
     }
 }
 
-/// Loads default tool definitions from embedded JSON files, keyed by tool name.
-pub fn default_tool_definitions() -> BTreeMap<String, ToolDefinition> {
-    const JSONS: &[&str] = &[
-        include_str!("bash.json"),
-        include_str!("web_fetch.json"),
-        include_str!("read_file.json"),
-        include_str!("write_file.json"),
-        include_str!("edit_file.json"),
-        include_str!("glob.json"),
-        include_str!("grep.json"),
-    ];
-
-    JSONS
-        .iter()
-        .filter_map(|json| serde_json::from_str::<ToolDefinition>(json).ok())
-        .map(|def| (def.function.name.clone(), def))
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Legacy ToolResult — used by tools that haven't migrated to ToolOutcome yet
-// ---------------------------------------------------------------------------
-
-pub struct ToolResult {
-    pub content: String,
-    pub is_error: bool,
-}
-
-// ---------------------------------------------------------------------------
-// Generic tool execution
-// ---------------------------------------------------------------------------
-
-pub async fn execute_tool(name: &str, arguments: &str) -> ToolOutcome {
-    let args: serde_json::Value = match serde_json::from_str(arguments) {
-        Ok(v) => v,
-        Err(e) => {
-            return ToolOutcome::Immediate {
-                content: format!("Failed to parse tool arguments: {}", e),
-                is_error: true,
-            }
-        }
-    };
-
-    match name {
-        "bash" => bash::execute(&args).await,
-        "web_fetch" => web_fetch::execute(&args).await,
-        "read_file" => {
-            let r = read::execute(&args).await;
-            ToolOutcome::Immediate { content: r.content, is_error: r.is_error }
-        }
-        "write_file" => {
-            let r = write::execute(&args).await;
-            ToolOutcome::Immediate { content: r.content, is_error: r.is_error }
-        }
-        "edit_file" => {
-            let r = edit::execute(&args).await;
-            ToolOutcome::Immediate { content: r.content, is_error: r.is_error }
-        }
-        "glob" => {
-            let r = glob::execute(&args).await;
-            ToolOutcome::Immediate { content: r.content, is_error: r.is_error }
-        }
-        "grep" => {
-            let r = grep::execute(&args).await;
-            ToolOutcome::Immediate { content: r.content, is_error: r.is_error }
-        }
-        _ => ToolOutcome::Immediate {
-            content: format!("Unknown tool: {}", name),
-            is_error: true,
-        },
-    }
-}
-
 pub(crate) fn generate_task_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let ts = SystemTime::now()
@@ -133,15 +118,80 @@ pub(crate) fn generate_task_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    struct DummyTool;
+
+    impl Tool for DummyTool {
+        fn name(&self) -> &str {
+            "dummy"
+        }
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition::new("dummy", "A dummy tool", serde_json::json!({}))
+        }
+        fn execute<'a>(
+            &'a self,
+            _arguments: &'a str,
+        ) -> Pin<Box<dyn Future<Output = ToolOutcome> + Send + 'a>> {
+            Box::pin(async {
+                ToolOutcome::Immediate {
+                    content: "dummy result".into(),
+                    is_error: false,
+                }
+            })
+        }
+    }
 
     #[tokio::test]
-    async fn test_unknown_tool_returns_error() {
-        let outcome = execute_tool("nonexistent", "{}").await;
+    async fn test_registry_execute_known_tool() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DummyTool));
+        let outcome = registry.execute("dummy", "{}").await;
+        match outcome {
+            ToolOutcome::Immediate { content, is_error } => {
+                assert!(!is_error);
+                assert_eq!(content, "dummy result");
+            }
+            _ => panic!("Expected Immediate outcome"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_registry_execute_unknown_tool() {
+        let registry = ToolRegistry::new();
+        let outcome = registry.execute("nonexistent", "{}").await;
         match outcome {
             ToolOutcome::Immediate { content, is_error } => {
                 assert!(is_error);
                 assert!(content.contains("Unknown tool"));
             }
+            _ => panic!("Expected Immediate outcome"),
+        }
+    }
+
+    #[test]
+    fn test_registry_definitions() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DummyTool));
+        let defs = registry.definitions();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].function.name, "dummy");
+    }
+
+    #[test]
+    fn test_registry_unregister() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DummyTool));
+        assert!(registry.unregister("dummy"));
+        assert!(registry.definitions().is_empty());
+        // Execute after unregister returns error
+        let outcome =
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(registry.execute("dummy", "{}"));
+        match outcome {
+            ToolOutcome::Immediate { is_error, .. } => assert!(is_error),
             _ => panic!("Expected Immediate outcome"),
         }
     }
@@ -167,14 +217,5 @@ mod tests {
         assert!(formatted.contains("bg_abc123"), "should contain task_id");
         assert!(!formatted.contains("sessions/tasks"), "should NOT contain file path");
         assert!(formatted.contains("delivered"), "should tell model result will be delivered");
-    }
-
-    #[test]
-    fn test_default_tool_definitions() {
-        let defs = default_tool_definitions();
-        assert_eq!(defs.len(), 7);
-        assert!(defs.contains_key("bash"));
-        assert!(defs.contains_key("web_fetch"));
-        assert!(defs.contains_key("read_file"));
     }
 }

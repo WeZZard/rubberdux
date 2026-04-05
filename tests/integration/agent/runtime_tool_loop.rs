@@ -139,7 +139,17 @@ async fn test_tool_call_loop() {
         "test-model".into(),
     );
 
-    let tools: Vec<_> = tool::default_tool_definitions().into_values().collect();
+    let registry = {
+        let mut r = rubberdux::tool::ToolRegistry::new();
+        r.register(Box::new(rubberdux::tool::bash::BashTool));
+        r.register(Box::new(rubberdux::tool::read::ReadFileTool));
+        r.register(Box::new(rubberdux::tool::write::WriteFileTool));
+        r.register(Box::new(rubberdux::tool::edit::EditFileTool));
+        r.register(Box::new(rubberdux::tool::glob::GlobTool));
+        r.register(Box::new(rubberdux::tool::grep::GrepTool));
+        r
+    };
+    let tools = registry.definitions();
 
     let mut history: Vec<Message> = vec![
         Message::User {
@@ -174,7 +184,7 @@ async fn test_tool_call_loop() {
         if let Some(tool_calls) = choice.message.tool_calls() {
             for call in tool_calls {
                 let outcome =
-                    tool::execute_tool(&call.function.name, &call.function.arguments).await;
+                    registry.execute(&call.function.name, &call.function.arguments).await;
                 let content = tool::format_tool_outcome(&outcome);
 
                 history.push(Message::Tool {
@@ -206,7 +216,13 @@ async fn test_read_file_tool_execution() {
         "file_path": tmp.path().to_str().unwrap()
     });
 
-    let outcome = tool::execute_tool("read_file", &serde_json::to_string(&args).unwrap()).await;
+    let registry = {
+        let mut r = rubberdux::tool::ToolRegistry::new();
+        r.register(Box::new(rubberdux::tool::read::ReadFileTool));
+        r
+    };
+
+    let outcome = registry.execute("read_file", &serde_json::to_string(&args).unwrap()).await;
 
     match outcome {
         tool::ToolOutcome::Immediate { content, is_error } => {
@@ -226,7 +242,13 @@ async fn test_bash_tool_sync() {
         "command": "echo hello_test_output"
     });
 
-    let outcome = tool::execute_tool("bash", &serde_json::to_string(&args).unwrap()).await;
+    let registry = {
+        let mut r = rubberdux::tool::ToolRegistry::new();
+        r.register(Box::new(rubberdux::tool::bash::BashTool));
+        r
+    };
+
+    let outcome = registry.execute("bash", &serde_json::to_string(&args).unwrap()).await;
 
     match outcome {
         tool::ToolOutcome::Immediate { content, is_error } => {
@@ -246,7 +268,13 @@ async fn test_bash_tool_background() {
         "run_in_background": true
     });
 
-    let outcome = tool::execute_tool("bash", &serde_json::to_string(&args).unwrap()).await;
+    let registry = {
+        let mut r = rubberdux::tool::ToolRegistry::new();
+        r.register(Box::new(rubberdux::tool::bash::BashTool));
+        r
+    };
+
+    let outcome = registry.execute("bash", &serde_json::to_string(&args).unwrap()).await;
 
     match outcome {
         tool::ToolOutcome::Background { task_id, output_path, receiver } => {
@@ -288,7 +316,13 @@ async fn test_edit_file_tool() {
         "new_string": "baz qux"
     });
 
-    let outcome = tool::execute_tool("edit_file", &serde_json::to_string(&args).unwrap()).await;
+    let registry = {
+        let mut r = rubberdux::tool::ToolRegistry::new();
+        r.register(Box::new(rubberdux::tool::edit::EditFileTool));
+        r
+    };
+
+    let outcome = registry.execute("edit_file", &serde_json::to_string(&args).unwrap()).await;
 
     match &outcome {
         tool::ToolOutcome::Immediate { is_error, .. } => assert!(!is_error),
@@ -427,7 +461,17 @@ async fn test_background_tool_call_loop() {
         "test-model".into(),
     );
 
-    let tools: Vec<_> = tool::default_tool_definitions().into_values().collect();
+    let registry = {
+        let mut r = rubberdux::tool::ToolRegistry::new();
+        r.register(Box::new(rubberdux::tool::bash::BashTool));
+        r.register(Box::new(rubberdux::tool::read::ReadFileTool));
+        r.register(Box::new(rubberdux::tool::write::WriteFileTool));
+        r.register(Box::new(rubberdux::tool::edit::EditFileTool));
+        r.register(Box::new(rubberdux::tool::glob::GlobTool));
+        r.register(Box::new(rubberdux::tool::grep::GrepTool));
+        r
+    };
+    let tools = registry.definitions();
 
     let mut history: Vec<Message> = vec![Message::User {
         content: UserContent::Text("Build my project".into()),
@@ -458,7 +502,7 @@ async fn test_background_tool_call_loop() {
         if let Some(tool_calls) = choice.message.tool_calls() {
             for call in tool_calls {
                 let outcome =
-                    tool::execute_tool(&call.function.name, &call.function.arguments).await;
+                    registry.execute(&call.function.name, &call.function.arguments).await;
 
                 // Background tool should return Background variant
                 if call.function.arguments.contains("run_in_background") {
@@ -580,7 +624,17 @@ async fn test_mixed_sync_background_tool_calls() {
         "test-model".into(),
     );
 
-    let tools: Vec<_> = tool::default_tool_definitions().into_values().collect();
+    let registry = {
+        let mut r = rubberdux::tool::ToolRegistry::new();
+        r.register(Box::new(rubberdux::tool::bash::BashTool));
+        r.register(Box::new(rubberdux::tool::read::ReadFileTool));
+        r.register(Box::new(rubberdux::tool::write::WriteFileTool));
+        r.register(Box::new(rubberdux::tool::edit::EditFileTool));
+        r.register(Box::new(rubberdux::tool::glob::GlobTool));
+        r.register(Box::new(rubberdux::tool::grep::GrepTool));
+        r
+    };
+    let tools = registry.definitions();
 
     let mut history: Vec<Message> = vec![Message::User {
         content: UserContent::Text("Show date and build project".into()),
@@ -613,7 +667,7 @@ async fn test_mixed_sync_background_tool_calls() {
         if let Some(tool_calls) = choice.message.tool_calls() {
             for call in tool_calls {
                 let outcome =
-                    tool::execute_tool(&call.function.name, &call.function.arguments).await;
+                    registry.execute(&call.function.name, &call.function.arguments).await;
 
                 if call.function.arguments.contains("run_in_background") {
                     bg_was_background = matches!(&outcome, tool::ToolOutcome::Background { .. });
@@ -664,8 +718,15 @@ async fn test_background_task_output_readable() {
         "command": "echo lifecycle_test_output",
         "run_in_background": true
     });
+    let registry = {
+        let mut r = rubberdux::tool::ToolRegistry::new();
+        r.register(Box::new(rubberdux::tool::bash::BashTool));
+        r.register(Box::new(rubberdux::tool::read::ReadFileTool));
+        r
+    };
+
     let bg_outcome =
-        tool::execute_tool("bash", &serde_json::to_string(&bg_args).unwrap()).await;
+        registry.execute("bash", &serde_json::to_string(&bg_args).unwrap()).await;
 
     let output_path = match bg_outcome {
         tool::ToolOutcome::Background { output_path, .. } => output_path,
@@ -681,7 +742,7 @@ async fn test_background_task_output_readable() {
             "file_path": output_path.to_str().unwrap()
         });
         let read_outcome =
-            tool::execute_tool("read_file", &serde_json::to_string(&read_args).unwrap()).await;
+            registry.execute("read_file", &serde_json::to_string(&read_args).unwrap()).await;
         if let tool::ToolOutcome::Immediate { content, is_error } = read_outcome {
             if !is_error && content.contains("lifecycle_test_output") {
                 read_content = content;
@@ -804,7 +865,17 @@ async fn test_multi_step_tool_chain() {
         "test-model".into(),
     );
 
-    let tools: Vec<_> = tool::default_tool_definitions().into_values().collect();
+    let registry = {
+        let mut r = rubberdux::tool::ToolRegistry::new();
+        r.register(Box::new(rubberdux::tool::bash::BashTool));
+        r.register(Box::new(rubberdux::tool::read::ReadFileTool));
+        r.register(Box::new(rubberdux::tool::write::WriteFileTool));
+        r.register(Box::new(rubberdux::tool::edit::EditFileTool));
+        r.register(Box::new(rubberdux::tool::glob::GlobTool));
+        r.register(Box::new(rubberdux::tool::grep::GrepTool));
+        r
+    };
+    let tools = registry.definitions();
 
     let mut history: Vec<Message> = vec![Message::User {
         content: UserContent::Text("Summarize files in /tmp".into()),
@@ -839,7 +910,7 @@ async fn test_multi_step_tool_chain() {
         if let Some(tool_calls) = choice.message.tool_calls() {
             for call in tool_calls {
                 let outcome =
-                    tool::execute_tool(&call.function.name, &call.function.arguments).await;
+                    registry.execute(&call.function.name, &call.function.arguments).await;
                 let content = tool::format_tool_outcome(&outcome);
                 history.push(Message::Tool {
                     tool_call_id: call.id.clone(),
@@ -896,4 +967,125 @@ fn test_extract_reactions_from_model_output() {
     let mid_end = output[mid_start..].find('"').unwrap();
     let mid: i32 = output[mid_start..mid_start + mid_end].parse().unwrap();
     assert_eq!(mid, 42);
+}
+
+/// Test: web_search tool through ToolRegistry with mocked Moonshot API.
+/// Verifies the full flow: registry dispatch → background task → two-call
+/// $web_search pattern → result delivered via oneshot channel.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_web_search_tool_via_registry() {
+    use std::sync::{Arc, RwLock};
+
+    let mock_server = MockServer::start().await;
+
+    // First API call: model triggers $web_search builtin
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-ws-1",
+                "object": "chat.completion",
+                "created": 1234567890,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "tool_ws_001",
+                            "type": "builtin_function",
+                            "function": {
+                                "name": "$web_search",
+                                "arguments": "{\"search_result\":{\"id\":\"mock_search\"}}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": { "prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60 }
+            })),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Second API call: after echoing tool result, model returns final answer
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-ws-2",
+                "object": "chat.completion",
+                "created": 1234567891,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Here are the latest search results for your query."
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 100, "completion_tokens": 15, "total_tokens": 115 }
+            })),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let client = Arc::new(MoonshotClient::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "test-key".into(),
+        "test-model".into(),
+    ));
+
+    let last_user_query = Arc::new(RwLock::new("latest AI news".to_owned()));
+
+    let registry = {
+        use rubberdux::provider::moonshot::tool::web_search::WebSearchTool;
+
+        let mut r = rubberdux::tool::ToolRegistry::new();
+        r.register(Box::new(WebSearchTool::new(client.clone(), last_user_query)));
+        r
+    };
+
+    // Verify web_search is in the registry
+    let defs = registry.definitions();
+    assert!(
+        defs.iter().any(|d| d.function.name == "web_search"),
+        "web_search should be registered"
+    );
+
+    // Execute web_search through the registry
+    let outcome = registry
+        .execute("web_search", r#"{"query": "latest AI news"}"#)
+        .await;
+
+    // Should return Background variant (spawns async task)
+    let receiver = match outcome {
+        tool::ToolOutcome::Background { task_id, receiver, .. } => {
+            assert!(task_id.starts_with("search_"), "task_id should start with search_");
+            receiver
+        }
+        tool::ToolOutcome::Immediate { content, is_error } => {
+            panic!(
+                "Expected Background, got Immediate(is_error={}, content={})",
+                is_error, content
+            );
+        }
+    };
+
+    // Wait for background task to complete
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), receiver)
+        .await
+        .expect("background task should complete within 10s")
+        .expect("oneshot channel should not be dropped");
+
+    assert!(
+        result.content.contains("latest search results"),
+        "Expected search result content, got: {}",
+        result.content
+    );
 }

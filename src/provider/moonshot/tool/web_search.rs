@@ -1,15 +1,55 @@
+use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, RwLock};
 
-use super::{FunctionDefinition, ToolCall, ToolDefinition};
+use super::{FunctionDefinition, ToolDefinition};
 use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
-use crate::tool::ToolOutcome;
+use crate::tool::{Tool, ToolOutcome};
 
 const WEB_SEARCH_PROMPT: &str = include_str!("WEB_SEARCH.md");
 
 pub struct WebSearchContext {
     pub client: Arc<MoonshotClient>,
     pub last_user_query: String,
+}
+
+pub struct WebSearchTool {
+    client: Arc<MoonshotClient>,
+    last_user_query: Arc<RwLock<String>>,
+}
+
+impl WebSearchTool {
+    pub fn new(client: Arc<MoonshotClient>, last_user_query: Arc<RwLock<String>>) -> Self {
+        Self {
+            client,
+            last_user_query,
+        }
+    }
+}
+
+impl Tool for WebSearchTool {
+    fn name(&self) -> &str {
+        "web_search"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        serde_json::from_str(include_str!("web_search.json")).unwrap()
+    }
+
+    fn execute<'a>(
+        &'a self,
+        arguments: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ToolOutcome> + Send + 'a>> {
+        let query = self.last_user_query.read().unwrap().clone();
+        Box::pin(async move {
+            let ctx = WebSearchContext {
+                client: self.client.clone(),
+                last_user_query: query,
+            };
+            execute(arguments, Some(ctx)).await
+        })
+    }
 }
 
 pub async fn execute(arguments: &str, context: Option<WebSearchContext>) -> ToolOutcome {

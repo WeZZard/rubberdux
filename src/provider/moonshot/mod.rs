@@ -2,7 +2,7 @@ pub mod api;
 pub mod tool;
 
 use serde::{Deserialize, Serialize};
-use tool::{ToolCall, ToolDefinition};
+use tool::ToolCall;
 
 use crate::channel::interpreter::{Attachment, InterpretedMessage};
 
@@ -132,11 +132,6 @@ impl Message {
     }
 }
 
-/// Context for executing provider-owned tools.
-pub struct ToolExecutionContext {
-    pub last_user_query: String,
-}
-
 pub struct MoonshotClient {
     http: reqwest::Client,
     base_url: String,
@@ -183,54 +178,6 @@ impl MoonshotClient {
     pub fn model(&self) -> &str {
         &self.model
     }
-
-    /// Applies provider-specific overrides to standard tool definitions
-    /// and inserts provider-owned custom tools.
-    pub fn override_tool_definitions(
-        &self,
-        defaults: std::collections::BTreeMap<String, ToolDefinition>,
-    ) -> std::collections::BTreeMap<String, ToolDefinition> {
-        tool::prompt::override_tool_definitions(defaults)
-    }
-
-    /// Returns true if this tool is owned by the provider.
-    pub fn is_provider_tool(name: &str) -> bool {
-        tool::prompt::is_provider_tool(name)
-    }
-
-    /// Executes a provider-owned tool.
-    pub async fn execute_provider_tool(
-        &self,
-        name: &str,
-        arguments: &str,
-        ctx: &ToolExecutionContext,
-    ) -> crate::tool::ToolOutcome {
-        match name {
-            "web_search" => {
-                let ws_ctx = tool::web_search::WebSearchContext {
-                    client: std::sync::Arc::new(MoonshotClient::new(
-                        self.http.clone(),
-                        self.base_url.clone(),
-                        self.api_key.clone(),
-                        self.model.clone(),
-                    )),
-                    last_user_query: ctx.last_user_query.clone(),
-                };
-                tool::web_search::execute(arguments, Some(ws_ctx)).await
-            }
-            _ => crate::tool::ToolOutcome::Immediate {
-                content: format!("Unknown provider tool: {}", name),
-                is_error: true,
-            },
-        }
-    }
-
-    /// Optional format override. Returns None to use default.
-    pub fn format_tool_outcome(name: &str, outcome: &crate::tool::ToolOutcome) -> Option<String> {
-        tool::prompt::format_tool_outcome(name, outcome)
-    }
-
-
 
     pub(crate) fn http(&self) -> &reqwest::Client {
         &self.http
@@ -422,10 +369,15 @@ mod tests {
         tool_result_content: &str,
     ) -> bool {
         let client = MoonshotClient::from_env();
-        let tools: Vec<_> = client
-            .override_tool_definitions(crate::tool::default_tool_definitions())
-            .into_values()
-            .collect();
+        let mut registry = crate::tool::ToolRegistry::new();
+        registry.register(Box::new(crate::tool::bash::BashTool));
+        registry.register(Box::new(crate::tool::web_fetch::WebFetchTool));
+        registry.register(Box::new(crate::tool::read::ReadFileTool));
+        registry.register(Box::new(crate::tool::write::WriteFileTool));
+        registry.register(Box::new(crate::tool::edit::EditFileTool));
+        registry.register(Box::new(crate::tool::glob::GlobTool));
+        registry.register(Box::new(crate::tool::grep::GrepTool));
+        let tools = registry.definitions();
         let system_prompt = "You are a helpful assistant.";
 
         let mut history: Vec<Message> = vec![
@@ -558,10 +510,15 @@ mod tests {
     async fn test_tool_call_recursion_shape() {
         dotenvy::dotenv().ok();
         let client = MoonshotClient::from_env();
-        let tools: Vec<_> = client
-            .override_tool_definitions(crate::tool::default_tool_definitions())
-            .into_values()
-            .collect();
+        let mut registry = crate::tool::ToolRegistry::new();
+        registry.register(Box::new(crate::tool::bash::BashTool));
+        registry.register(Box::new(crate::tool::web_fetch::WebFetchTool));
+        registry.register(Box::new(crate::tool::read::ReadFileTool));
+        registry.register(Box::new(crate::tool::write::WriteFileTool));
+        registry.register(Box::new(crate::tool::edit::EditFileTool));
+        registry.register(Box::new(crate::tool::glob::GlobTool));
+        registry.register(Box::new(crate::tool::grep::GrepTool));
+        let tools = registry.definitions();
 
         let system_prompt = "You are a helpful assistant.";
 
@@ -664,10 +621,15 @@ mod tests {
     async fn test_batch_tool_results() {
         dotenvy::dotenv().ok();
         let client = MoonshotClient::from_env();
-        let tools: Vec<_> = client
-            .override_tool_definitions(crate::tool::default_tool_definitions())
-            .into_values()
-            .collect();
+        let mut registry = crate::tool::ToolRegistry::new();
+        registry.register(Box::new(crate::tool::bash::BashTool));
+        registry.register(Box::new(crate::tool::web_fetch::WebFetchTool));
+        registry.register(Box::new(crate::tool::read::ReadFileTool));
+        registry.register(Box::new(crate::tool::write::WriteFileTool));
+        registry.register(Box::new(crate::tool::edit::EditFileTool));
+        registry.register(Box::new(crate::tool::glob::GlobTool));
+        registry.register(Box::new(crate::tool::grep::GrepTool));
+        let tools = registry.definitions();
 
         // Step 1: Get the model to call multiple tools
         let mut history: Vec<Message> = vec![Message::User {

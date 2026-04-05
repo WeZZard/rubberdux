@@ -2,15 +2,14 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use tokio::sync::mpsc;
 
 use crate::agent::entry::{Entry, EntryHistory};
 use crate::channel::{AgentResponse, ChannelEvent, InternalEvent};
-use crate::provider::moonshot::tool::ToolDefinition;
 use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
-use crate::tool::BackgroundTaskResult;
+use crate::tool::{BackgroundTaskResult, ToolRegistry};
 
 /// Result of a single LLM tool turn.
 enum TurnResult {
@@ -180,11 +179,12 @@ async fn run_tool_turn(
     client: &MoonshotClient,
     history: &mut EntryHistory,
     session_file: &Path,
-    tools: &[ToolDefinition],
+    registry: &ToolRegistry,
     bg_tx: &tokio::sync::mpsc::Sender<BackgroundTaskResult>,
 ) -> Result<TurnResult, crate::error::Error> {
     let messages = history.messages();
-    let chat_response = client.chat(messages, Some(tools.to_vec())).await?;
+    let tools = registry.definitions();
+    let chat_response = client.chat(messages, Some(tools)).await?;
 
     log::debug!(
         "Token usage: prompt={}, completion={}, total={}, cached={}",
@@ -217,7 +217,6 @@ async fn run_tool_turn(
         return Ok(TurnResult::Done { text, entry_id: asst_entry_id });
     }
 
-    // Execute tool calls -- separate sync from background
     let tool_calls = match choice.message.tool_calls() {
         Some(tc) => tc.clone(),
         None => return Ok(TurnResult::Continue),
@@ -230,41 +229,16 @@ async fn run_tool_turn(
     for call in &tool_calls {
         log::info!("Tool call: {}({})", call.function.name, call.function.arguments);
 
-        let outcome = if MoonshotClient::is_provider_tool(&call.function.name) {
-            let last_user_query = history
-                .entries()
-                .iter()
-                .rev()
-                .find_map(|e| match &e.message {
-                    Message::User { content } => Some(match content {
-                        UserContent::Text(t) => t.clone(),
-                        UserContent::Parts(_) => "(multimodal)".into(),
-                    }),
-                    _ => None,
-                })
-                .unwrap_or_default();
+        let outcome = registry
+            .execute(&call.function.name, &call.function.arguments)
+            .await;
 
-            let ctx = crate::provider::moonshot::ToolExecutionContext {
-                last_user_query,
-            };
+        let formatted = crate::tool::format_tool_outcome(&outcome);
 
-            client
-                .execute_provider_tool(&call.function.name, &call.function.arguments, &ctx)
-                .await
-        } else {
-            crate::tool::execute_tool(&call.function.name, &call.function.arguments).await
-        };
-
-        // Format first (borrows outcome)
-        let formatted = MoonshotClient::format_tool_outcome(&call.function.name, &outcome)
-            .unwrap_or_else(|| crate::tool::format_tool_outcome(&outcome));
-
-        // Check for errors
         if let crate::tool::ToolOutcome::Immediate { ref content, is_error: true } = outcome {
             log::warn!("Tool error: {}", content);
         }
 
-        // Extract background receiver if applicable
         if let crate::tool::ToolOutcome::Background { task_id, receiver, .. } = outcome {
             let bg_tx_clone = bg_tx.clone();
             tokio::spawn(async move {
@@ -275,15 +249,9 @@ async fn run_tool_turn(
             bg_task_ids.push(task_id);
         }
 
-        // Create and persist Tool entry
-        let tool_name = if MoonshotClient::is_provider_tool(&call.function.name) {
-            Some(call.function.name.clone())
-        } else {
-            None
-        };
         let tool_msg = Message::Tool {
             tool_call_id: call.id.clone(),
-            name: tool_name,
+            name: None,
             content: formatted,
         };
         let tool_entry_id = history.push_tool(asst_entry_id, tool_msg);
@@ -301,11 +269,11 @@ async fn run_until_done_or_pending(
     client: &MoonshotClient,
     history: &mut EntryHistory,
     session_file: &Path,
-    tools: &[ToolDefinition],
+    registry: &ToolRegistry,
     bg_tx: &tokio::sync::mpsc::Sender<BackgroundTaskResult>,
 ) -> Result<TurnResult, crate::error::Error> {
     loop {
-        let result = run_tool_turn(client, history, session_file, tools, bg_tx).await?;
+        let result = run_tool_turn(client, history, session_file, registry, bg_tx).await?;
         match result {
             TurnResult::Continue => continue,
             other => return Ok(other),
@@ -335,6 +303,35 @@ pub async fn run(
     );
 
     let (bg_tx, mut bg_rx) = tokio::sync::mpsc::channel::<BackgroundTaskResult>(32);
+
+    // Build tool registry
+    let last_user_query = Arc::new(RwLock::new(String::new()));
+    let registry = {
+        use crate::provider::moonshot::tool::bash::MoonshotBashTool;
+        use crate::provider::moonshot::tool::web_fetch::MoonshotWebFetchTool;
+        use crate::provider::moonshot::tool::web_search::WebSearchTool;
+        use crate::tool::edit::EditFileTool;
+        use crate::tool::glob::GlobTool;
+        use crate::tool::grep::GrepTool;
+        use crate::tool::read::ReadFileTool;
+        use crate::tool::write::WriteFileTool;
+
+        let mut r = ToolRegistry::new();
+        r.register(Box::new(MoonshotBashTool::new()));
+        r.register(Box::new(MoonshotWebFetchTool::new()));
+        r.register(Box::new(ReadFileTool));
+        r.register(Box::new(WriteFileTool));
+        r.register(Box::new(EditFileTool));
+        r.register(Box::new(GlobTool));
+        r.register(Box::new(GrepTool));
+        r.register(Box::new(WebSearchTool::new(client.clone(), last_user_query.clone())));
+        log::info!(
+            "Tool registry: {:?}",
+            r.definitions().iter().map(|d| &d.function.name).collect::<Vec<_>>()
+        );
+        r
+    };
+
     let mut active_groups: HashMap<usize, TaskGroup> = HashMap::new();
     let mut task_to_group: HashMap<String, usize> = HashMap::new();
     let mut active_conversation: Option<ActiveConversation> = None;
@@ -479,10 +476,23 @@ pub async fn run(
 
             // Branch 3: Drive active conversation one step at a time
             Some(()) = conv_notify_rx.recv(), if active_conversation.is_some() => {
-                let tools = assemble_tool_definitions(&client);
+                // Update shared last_user_query for WebSearchTool
+                let query = history
+                    .entries()
+                    .iter()
+                    .rev()
+                    .find_map(|e| match &e.message {
+                        Message::User { content } => Some(match content {
+                            UserContent::Text(t) => t.clone(),
+                            UserContent::Parts(_) => "(multimodal)".into(),
+                        }),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                *last_user_query.write().unwrap() = query;
 
                 let turn_result = run_tool_turn(
-                    &client, &mut history, &session_file, &tools, &bg_tx,
+                    &client, &mut history, &session_file, &registry, &bg_tx,
                 ).await;
 
                 match turn_result {
@@ -641,15 +651,6 @@ fn evict_if_needed(
         );
         *last_prompt_tokens = last_prompt_tokens.saturating_sub(*last_prompt_tokens / 10);
     }
-}
-
-/// Assembles the tool definitions for a chat turn: standard defaults
-/// with provider-specific overrides applied.
-fn assemble_tool_definitions(client: &MoonshotClient) -> Vec<ToolDefinition> {
-    let defaults = crate::tool::default_tool_definitions();
-    let tools: Vec<_> = client.override_tool_definitions(defaults).into_values().collect();
-    log::info!("Assembled {} tools: {:?}", tools.len(), tools.iter().map(|t| &t.function.name).collect::<Vec<_>>());
-    tools
 }
 
 #[cfg(test)]

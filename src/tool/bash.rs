@@ -1,4 +1,40 @@
+use std::future::Future;
+use std::pin::Pin;
+
+use crate::provider::moonshot::tool::ToolDefinition;
+
 use super::ToolOutcome;
+
+pub struct BashTool;
+
+impl super::Tool for BashTool {
+    fn name(&self) -> &str {
+        "bash"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        serde_json::from_str(include_str!("bash.json"))
+            .expect("bash.json must be valid ToolDefinition")
+    }
+
+    fn execute<'a>(
+        &'a self,
+        arguments: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ToolOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            let args: serde_json::Value = match serde_json::from_str(arguments) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ToolOutcome::Immediate {
+                        content: format!("Failed to parse tool arguments: {}", e),
+                        is_error: true,
+                    };
+                }
+            };
+            execute(&args).await
+        })
+    }
+}
 
 pub async fn execute(args: &serde_json::Value) -> ToolOutcome {
     let command = match args["command"].as_str() {

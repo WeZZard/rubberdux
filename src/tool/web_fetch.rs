@@ -1,6 +1,41 @@
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
+
+use crate::provider::moonshot::tool::ToolDefinition;
 
 use super::ToolOutcome;
+
+pub struct WebFetchTool;
+
+impl super::Tool for WebFetchTool {
+    fn name(&self) -> &str {
+        "web_fetch"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        serde_json::from_str(include_str!("web_fetch.json"))
+            .expect("web_fetch.json must be valid ToolDefinition")
+    }
+
+    fn execute<'a>(
+        &'a self,
+        arguments: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ToolOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            let args: serde_json::Value = match serde_json::from_str(arguments) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ToolOutcome::Immediate {
+                        content: format!("Failed to parse tool arguments: {}", e),
+                        is_error: true,
+                    };
+                }
+            };
+            execute(&args).await
+        })
+    }
+}
 
 const MAX_CONTENT_LENGTH: usize = 100_000;
 const PAGE_LOAD_TIMEOUT_SECS: u64 = 30;
