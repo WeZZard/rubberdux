@@ -135,6 +135,11 @@ impl EntryHistory {
             false
         }
     }
+
+    /// Remove entries by their IDs. Used by compaction strategies.
+    pub fn remove_entries(&mut self, ids: &[usize]) {
+        self.entries.retain(|e| !ids.contains(&e.id));
+    }
 }
 
 #[cfg(test)]

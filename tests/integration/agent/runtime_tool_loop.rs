@@ -1075,6 +1075,9 @@ async fn test_web_search_tool_via_registry() {
                 is_error, content
             );
         }
+        tool::ToolOutcome::Subagent { .. } => {
+            panic!("Expected Background, got Subagent");
+        }
     };
 
     // Wait for background task to complete

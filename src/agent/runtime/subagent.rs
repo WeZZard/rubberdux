@@ -1,7 +1,14 @@
-use tokio::sync::{broadcast, oneshot};
+use std::sync::Arc;
+
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::provider::moonshot::Message;
+use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
+use crate::tool::ToolRegistry;
+
+use super::agent_loop::{AgentLoop, AgentLoopConfig};
+use super::compaction::EvictOldestTurns;
+use super::port::InputPort;
 
 /// A context event broadcast to all active subagents.
 #[derive(Debug, Clone)]
@@ -29,17 +36,17 @@ pub struct SubagentResult {
 
 /// Spawn a subagent as a tokio task. Returns a handle for tracking.
 ///
-/// The subagent runs its own isolated LLM loop with a private
-/// `EntryHistory`. It subscribes to `context_rx` for live environment
-/// updates and respects the `CancellationToken` for early termination.
+/// The subagent runs its own `AgentLoop` with an isolated history and
+/// no session persistence. It subscribes to `context_rx` for live
+/// environment updates and respects the `CancellationToken` for early
+/// termination.
 pub fn spawn_subagent(
     task_id: String,
-    client: std::sync::Arc<crate::provider::moonshot::MoonshotClient>,
+    client: Arc<MoonshotClient>,
     system_prompt: String,
     initial_prompt: String,
-    registry: std::sync::Arc<crate::tool::ToolRegistry>,
+    registry: Arc<ToolRegistry>,
     context_rx: broadcast::Receiver<ContextEvent>,
-    bg_tx: tokio::sync::mpsc::Sender<crate::tool::BackgroundTaskResult>,
 ) -> SubagentHandle {
     let cancel = CancellationToken::new();
     let (result_tx, result_rx) = oneshot::channel();
@@ -48,17 +55,53 @@ pub fn spawn_subagent(
     let task_id_clone = task_id.clone();
 
     tokio::spawn(async move {
-        let result = run_subagent(
-            &client,
+        let config = AgentLoopConfig {
+            client,
+            registry,
             system_prompt,
-            initial_prompt,
-            &registry,
+            session_path: None,
+            token_budget: 128_000,
+            cancel: cancel_clone.clone(),
+            compaction: Box::new(EvictOldestTurns),
+        };
+
+        let (agent_loop, input_port) = AgentLoop::new(config);
+
+        // Send the initial prompt as a UserMessage with a reply channel
+        // so the AgentLoop starts a conversation (reply: None would be
+        // treated as a silent injection).
+        let (reply_tx, _reply_rx) = mpsc::channel(8);
+        let initial_msg = Message::User {
+            content: UserContent::Text(initial_prompt),
+        };
+        if input_port
+            .send_user_message(initial_msg, Some(reply_tx))
+            .await
+            .is_err()
+        {
+            let _ = result_tx.send(SubagentResult {
+                task_id: task_id_clone,
+                summary: "(failed to send initial prompt)".into(),
+            });
+            return;
+        }
+
+        // Adapter: forward ContextEvent stream into the AgentLoop's InputPort.
+        let adapter_cancel = cancel_clone.clone();
+        tokio::spawn(adapt_context_events(
             context_rx,
-            cancel_clone,
-            bg_tx,
-            &task_id_clone,
-        ).await;
-        let _ = result_tx.send(result);
+            input_port,
+            adapter_cancel,
+        ));
+
+        // Drive the loop to completion.
+        let summary = agent_loop.run_to_completion().await;
+
+        log::info!("Subagent {} completed", task_id_clone);
+        let _ = result_tx.send(SubagentResult {
+            task_id: task_id_clone,
+            summary,
+        });
     });
 
     SubagentHandle {
@@ -68,110 +111,29 @@ pub fn spawn_subagent(
     }
 }
 
-async fn run_subagent(
-    client: &crate::provider::moonshot::MoonshotClient,
-    system_prompt: String,
-    initial_prompt: String,
-    registry: &crate::tool::ToolRegistry,
+/// Adapter that converts `ContextEvent`s from a broadcast receiver into
+/// `LoopEvent::ContextUpdate`s sent via the `InputPort`.
+async fn adapt_context_events(
     mut context_rx: broadcast::Receiver<ContextEvent>,
+    input_port: InputPort,
     cancel: CancellationToken,
-    _bg_tx: tokio::sync::mpsc::Sender<crate::tool::BackgroundTaskResult>,
-    task_id: &str,
-) -> SubagentResult {
-    use crate::agent::entry::EntryHistory;
-    use crate::provider::moonshot::UserContent;
-
-    let mut history = EntryHistory::new();
-    history.push_system(Message::System {
-        content: system_prompt,
-    });
-    history.push_user(Message::User {
-        content: UserContent::Text(initial_prompt),
-    });
-
-    let tools = registry.definitions();
-
+) {
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => {
-                log::info!("Subagent {} cancelled", task_id);
-                return SubagentResult {
-                    task_id: task_id.to_owned(),
-                    summary: "(cancelled)".into(),
-                };
-            }
-
+            biased;
+            _ = cancel.cancelled() => break,
             event = context_rx.recv() => {
                 match event {
                     Ok(ContextEvent::EnvironmentChange(msg)) | Ok(ContextEvent::UserMessage(msg)) => {
-                        history.push_user(msg);
+                        if input_port.send_context_update(msg).await.is_err() {
+                            break; // Loop closed
+                        }
                     }
-                    Ok(ContextEvent::Cancel) => {
-                        log::info!("Subagent {} received cancel event", task_id);
-                        return SubagentResult {
-                            task_id: task_id.to_owned(),
-                            summary: "(cancelled)".into(),
-                        };
-                    }
+                    Ok(ContextEvent::Cancel) => break,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        log::warn!("Subagent {} lagged by {} context events", task_id, n);
+                        log::warn!("Subagent context adapter lagged by {} events", n);
                     }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        // Context stream closed, continue without updates
-                    }
-                }
-            }
-
-            result = async {
-                let messages = history.messages();
-                client.chat(messages, Some(tools.clone())).await
-            } => {
-                match result {
-                    Ok(response) => {
-                        let choice = match response.choices.first() {
-                            Some(c) => c,
-                            None => {
-                                return SubagentResult {
-                                    task_id: task_id.to_owned(),
-                                    summary: "(empty response)".into(),
-                                };
-                            }
-                        };
-
-                        let text = choice.message.content_text().to_owned();
-                        let parent_id = history.last_id().unwrap_or(0);
-                        let asst_entry_id = history.push_assistant(parent_id, choice.message.clone());
-
-                        if choice.finish_reason == "stop" {
-                            log::info!("Subagent {} completed", task_id);
-                            return SubagentResult {
-                                task_id: task_id.to_owned(),
-                                summary: text,
-                            };
-                        }
-
-                        // Execute tool calls
-                        if let Some(tool_calls) = choice.message.tool_calls() {
-                            let tool_results = super::chat::execute_tool_calls(tool_calls, registry).await;
-                            for (call, outcome) in tool_results {
-                                let formatted = crate::tool::format_tool_outcome(&outcome);
-                                let tool_msg = Message::Tool {
-                                    tool_call_id: call.id.clone(),
-                                    name: None,
-                                    content: formatted,
-                                };
-                                history.push_tool(asst_entry_id, tool_msg);
-                            }
-                        }
-                        // Loop back for next LLM call
-                    }
-                    Err(e) => {
-                        log::error!("Subagent {} LLM error: {}", task_id, e);
-                        return SubagentResult {
-                            task_id: task_id.to_owned(),
-                            summary: format!("Subagent failed: {}", e),
-                        };
-                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         }

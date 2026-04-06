@@ -1,0 +1,729 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use tokio::sync::{broadcast, mpsc};
+use tokio_util::sync::CancellationToken;
+
+use crate::agent::entry::EntryHistory;
+use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
+use crate::tool::{BackgroundTaskResult, ToolRegistry};
+
+use super::compaction::CompactionStrategy;
+use super::port::{EntryNotification, InputPort, InternalMutation, LoopEvent, LoopOutput, OutputPort};
+use super::session::{append_entry_to_session, load_session};
+use super::subagent::{ContextEvent, SubagentResult};
+
+// ---------------------------------------------------------------------------
+// Private types
+// ---------------------------------------------------------------------------
+
+/// Result of a single LLM tool turn.
+enum TurnResult {
+    /// Model stopped (finish_reason="stop"). Send response to user.
+    Done { text: String, entry_id: usize },
+    /// Sync tools executed, need another LLM call immediately.
+    Continue,
+    /// Background tasks dispatched. Wait for all to complete.
+    Pending {
+        asst_entry_id: usize,
+        task_ids: Vec<String>,
+    },
+}
+
+/// Runtime state for a group of background/subagent tasks.
+struct TaskGroup {
+    reply: Option<mpsc::Sender<LoopOutput>>,
+    asst_entry_id: usize,
+    remaining: usize,
+    completed_results: Vec<BackgroundTaskResult>,
+    metadata: Option<Box<dyn std::any::Any + Send>>,
+}
+
+/// Active conversation state. Persists across select! iterations.
+struct ActiveConversation {
+    reply: Option<mpsc::Sender<LoopOutput>>,
+    /// Background task IDs accumulated across multiple tool turns.
+    pending_task_ids: Vec<String>,
+    /// The assistant entry that first dispatched background tasks (for TaskGroup).
+    first_bg_asst_entry_id: Option<usize>,
+    /// Opaque metadata from the input source (e.g. telegram_message_id).
+    metadata: Option<Box<dyn std::any::Any + Send>>,
+    /// Whether this conversation was triggered by a task completion.
+    is_child_completion: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/// Configuration for constructing an AgentLoop.
+pub struct AgentLoopConfig {
+    pub client: Arc<MoonshotClient>,
+    pub registry: Arc<ToolRegistry>,
+    pub system_prompt: String,
+    pub session_path: Option<PathBuf>,
+    pub token_budget: usize,
+    pub cancel: CancellationToken,
+    pub compaction: Box<dyn CompactionStrategy>,
+}
+
+/// The unified agent loop that drives LLM conversations, tool execution,
+/// background task tracking, and subagent coordination.
+pub struct AgentLoop {
+    // From config
+    client: Arc<MoonshotClient>,
+    registry: Arc<ToolRegistry>,
+    system_prompt: String,
+    session_path: Option<PathBuf>,
+    token_budget: usize,
+    cancel: CancellationToken,
+    compaction: Box<dyn CompactionStrategy>,
+
+    // History
+    history: EntryHistory,
+    current_tokens: usize,
+
+    // Channels
+    input_rx: mpsc::Receiver<LoopEvent>,
+    trampoline_tx: mpsc::Sender<()>,
+    trampoline_rx: mpsc::Receiver<()>,
+    bg_tx: mpsc::Sender<BackgroundTaskResult>,
+    bg_rx: mpsc::Receiver<BackgroundTaskResult>,
+    child_agent_tx: mpsc::Sender<SubagentResult>,
+    child_agent_rx: mpsc::Receiver<SubagentResult>,
+    context_tx: broadcast::Sender<ContextEvent>,
+    entry_notify_tx: broadcast::Sender<EntryNotification>,
+
+    // State
+    active_groups: HashMap<usize, TaskGroup>,
+    task_to_group: HashMap<String, usize>,
+    active_conversation: Option<ActiveConversation>,
+    active_child_cancels: Vec<CancellationToken>,
+}
+
+impl AgentLoop {
+    /// Create a new AgentLoop and its InputPort for injecting events.
+    pub fn new(config: AgentLoopConfig) -> (Self, InputPort) {
+        let (input_tx, input_rx) = mpsc::channel(32);
+
+        let history = match &config.session_path {
+            Some(path) => load_session(path, &config.system_prompt),
+            None => {
+                let mut h = EntryHistory::new();
+                h.push_system(Message::System {
+                    content: config.system_prompt.clone(),
+                });
+                h
+            }
+        };
+
+        let (trampoline_tx, trampoline_rx) = mpsc::channel(16);
+        let (bg_tx, bg_rx) = mpsc::channel(32);
+        let (child_agent_tx, child_agent_rx) = mpsc::channel(32);
+        let (context_tx, _) = broadcast::channel(64);
+        let (entry_notify_tx, _) = broadcast::channel(256);
+
+        let agent_loop = Self {
+            client: config.client,
+            registry: config.registry,
+            system_prompt: config.system_prompt,
+            session_path: config.session_path,
+            token_budget: config.token_budget,
+            cancel: config.cancel,
+            compaction: config.compaction,
+            history,
+            current_tokens: 0,
+            input_rx,
+            trampoline_tx,
+            trampoline_rx,
+            bg_tx,
+            bg_rx,
+            child_agent_tx,
+            child_agent_rx,
+            context_tx,
+            entry_notify_tx,
+            active_groups: HashMap::new(),
+            task_to_group: HashMap::new(),
+            active_conversation: None,
+            active_child_cancels: Vec::new(),
+        };
+
+        let input_port = InputPort::new(input_tx);
+        (agent_loop, input_port)
+    }
+
+    /// Subscribe to entry notifications broadcast by this loop.
+    pub fn subscribe_output(&self) -> OutputPort {
+        OutputPort::new(self.entry_notify_tx.subscribe())
+    }
+
+    /// Get the context broadcast sender (for spawning child agents that need context updates).
+    pub fn context_sender(&self) -> broadcast::Sender<ContextEvent> {
+        self.context_tx.clone()
+    }
+
+    // -----------------------------------------------------------------------
+    // Core event loop
+    // -----------------------------------------------------------------------
+
+    /// Run the agent loop until cancellation or all channels close.
+    pub async fn run(mut self) {
+        log::info!(
+            "AgentLoop started (history: {} messages, session: {:?})",
+            self.history.len(),
+            self.session_path,
+        );
+
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = self.cancel.cancelled() => {
+                    log::info!("AgentLoop cancelled");
+                    break;
+                }
+
+                Some(event) = self.input_rx.recv() => {
+                    self.handle_event(event).await;
+                }
+
+                Some(bg_result) = self.bg_rx.recv() => {
+                    self.handle_task_result(bg_result).await;
+                }
+
+                Some(agent_result) = self.child_agent_rx.recv() => {
+                    let bg_result = BackgroundTaskResult {
+                        task_id: agent_result.task_id,
+                        content: agent_result.summary,
+                    };
+                    self.handle_task_result(bg_result).await;
+                }
+
+                Some(()) = self.trampoline_rx.recv(), if self.active_conversation.is_some() => {
+                    self.drain_pending_events().await;
+                    self.drive_conversation().await;
+                }
+
+                else => break,
+            }
+        }
+
+        log::info!("AgentLoop shutting down");
+    }
+
+    /// Run the loop until the model stops with no pending tasks.
+    /// Returns the final assistant text. Convenience for subagent use.
+    pub async fn run_to_completion(mut self) -> String {
+        let mut final_text = String::new();
+
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = self.cancel.cancelled() => {
+                    return "(cancelled)".into();
+                }
+
+                Some(event) = self.input_rx.recv() => {
+                    self.handle_event(event).await;
+                }
+
+                Some(bg_result) = self.bg_rx.recv() => {
+                    self.handle_task_result(bg_result).await;
+                }
+
+                Some(agent_result) = self.child_agent_rx.recv() => {
+                    let bg_result = BackgroundTaskResult {
+                        task_id: agent_result.task_id,
+                        content: agent_result.summary,
+                    };
+                    self.handle_task_result(bg_result).await;
+                }
+
+                Some(()) = self.trampoline_rx.recv(), if self.active_conversation.is_some() => {
+                    self.drain_pending_events().await;
+                    self.drive_conversation().await;
+
+                    if self.active_conversation.is_none() && self.active_groups.is_empty() {
+                        final_text = self
+                            .history
+                            .entries()
+                            .iter()
+                            .rev()
+                            .find_map(|e| match &e.message {
+                                Message::Assistant {
+                                    content: Some(text), ..
+                                } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        break;
+                    }
+                }
+
+                else => break,
+            }
+        }
+
+        final_text
+    }
+
+    // -----------------------------------------------------------------------
+    // Event handling
+    // -----------------------------------------------------------------------
+
+    async fn handle_event(&mut self, event: LoopEvent) {
+        match event {
+            LoopEvent::UserMessage {
+                message,
+                reply,
+                metadata,
+            } => {
+                let text_estimate = message.content_text().len();
+                if self.current_tokens > 0 {
+                    self.compaction.compact(
+                        &mut self.history,
+                        self.token_budget,
+                        self.current_tokens + text_estimate / 4,
+                    );
+                }
+
+                let entry_id = self.history.push_user(message.clone());
+                self.persist_entry(entry_id);
+
+                let _ = self.context_tx.send(ContextEvent::UserMessage(message));
+
+                self.notify_entry(entry_id, false);
+
+                if reply.is_none() {
+                    return;
+                }
+
+                if let Some(prev) = self.active_conversation.take() {
+                    self.finalize_conversation(prev);
+                }
+
+                self.active_conversation = Some(ActiveConversation {
+                    reply,
+                    pending_task_ids: Vec::new(),
+                    first_bg_asst_entry_id: None,
+                    metadata,
+                    is_child_completion: false,
+                });
+                let _ = self.trampoline_tx.send(()).await;
+            }
+            LoopEvent::ContextUpdate(message) => {
+                let entry_id = self.history.push_user(message.clone());
+                self.persist_entry(entry_id);
+                let _ = self
+                    .context_tx
+                    .send(ContextEvent::EnvironmentChange(message));
+                self.notify_entry(entry_id, false);
+            }
+            LoopEvent::Internal(mutation) => {
+                self.handle_internal_mutation(mutation);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task result handling
+    // -----------------------------------------------------------------------
+
+    async fn handle_task_result(&mut self, result: BackgroundTaskResult) {
+        let group_key = match self.task_to_group.remove(&result.task_id) {
+            Some(k) => k,
+            None => {
+                log::warn!("Received result for unknown task: {}", result.task_id);
+                let msg = Message::User {
+                    content: UserContent::Text(format!(
+                        "[Task {} completed]\n{}",
+                        result.task_id, result.content
+                    )),
+                };
+                let entry_id = self.history.push_user(msg);
+                self.persist_entry(entry_id);
+                self.notify_entry(entry_id, false);
+                return;
+            }
+        };
+
+        let group = match self.active_groups.get_mut(&group_key) {
+            Some(g) => g,
+            None => {
+                log::warn!("No active group for key {}", group_key);
+                return;
+            }
+        };
+
+        log::info!(
+            "Task {} completed ({} bytes), {}/{} in group",
+            result.task_id,
+            result.content.len(),
+            group.completed_results.len() + 1,
+            group.remaining + group.completed_results.len(),
+        );
+
+        group.completed_results.push(result);
+        group.remaining -= 1;
+
+        if group.remaining > 0 {
+            return;
+        }
+
+        // Group complete
+        let group = self.active_groups.remove(&group_key);
+        let group = match group {
+            Some(g) => g,
+            None => return,
+        };
+
+        for result in &group.completed_results {
+            let msg = Message::User {
+                content: UserContent::Text(format!(
+                    "[Task {} completed]\n{}",
+                    result.task_id, result.content
+                )),
+            };
+            let entry_id = self.history.push_user(msg);
+            self.persist_entry(entry_id);
+            self.notify_entry(entry_id, false);
+        }
+
+        self.active_conversation = Some(ActiveConversation {
+            reply: group.reply,
+            pending_task_ids: Vec::new(),
+            first_bg_asst_entry_id: None,
+            metadata: group.metadata,
+            is_child_completion: true,
+        });
+        let _ = self.trampoline_tx.send(()).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Conversation driving
+    // -----------------------------------------------------------------------
+
+    async fn drive_conversation(&mut self) {
+        let turn_result = self.run_tool_turn().await;
+
+        match turn_result {
+            Ok(TurnResult::Done { text, entry_id }) => {
+                let conv = match self.active_conversation.take() {
+                    Some(c) => c,
+                    None => return,
+                };
+
+                if conv.pending_task_ids.is_empty() {
+                    let is_final = self.active_groups.is_empty();
+                    Self::send_output(&conv.reply, text, entry_id, is_final, conv.metadata)
+                        .await;
+                } else {
+                    let asst_entry_id = conv.first_bg_asst_entry_id.unwrap_or(entry_id);
+                    for tid in &conv.pending_task_ids {
+                        self.task_to_group.insert(tid.clone(), asst_entry_id);
+                    }
+                    self.active_groups.insert(
+                        asst_entry_id,
+                        TaskGroup {
+                            reply: conv.reply.clone(),
+                            asst_entry_id,
+                            remaining: conv.pending_task_ids.len(),
+                            completed_results: Vec::new(),
+                            metadata: conv.metadata,
+                        },
+                    );
+                    Self::send_output(&conv.reply, text, entry_id, false, None)
+                        .await;
+                }
+                log::info!("LLM conversation completed");
+            }
+            Ok(TurnResult::Continue) => {
+                let _ = self.trampoline_tx.send(()).await;
+            }
+            Ok(TurnResult::Pending {
+                asst_entry_id,
+                task_ids,
+            }) => {
+                if let Some(conv) = self.active_conversation.as_mut() {
+                    if conv.first_bg_asst_entry_id.is_none() {
+                        conv.first_bg_asst_entry_id = Some(asst_entry_id);
+                    }
+                    conv.pending_task_ids.extend(task_ids);
+                }
+                let _ = self.trampoline_tx.send(()).await;
+            }
+            Err(e) => {
+                let conv = match self.active_conversation.take() {
+                    Some(c) => c,
+                    None => return,
+                };
+                log::error!("LLM call failed: {}", e);
+                Self::send_output(
+                    &conv.reply,
+                    format!("Sorry, I encountered an error: {}", e),
+                    self.history.last_id().unwrap_or(0),
+                    true,
+                    None,
+                )
+                .await;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // LLM tool turn
+    // -----------------------------------------------------------------------
+
+    async fn run_tool_turn(&mut self) -> Result<TurnResult, crate::error::Error> {
+        let messages = self.history.messages();
+        let tools = self.registry.definitions();
+        let chat_response = self.client.chat(messages, Some(tools)).await?;
+
+        self.current_tokens = chat_response.usage.prompt_tokens;
+
+        log::debug!(
+            "Token usage: prompt={}, completion={}, total={}, cached={}",
+            chat_response.usage.prompt_tokens,
+            chat_response.usage.completion_tokens,
+            chat_response.usage.total_tokens,
+            chat_response.usage.cached_tokens,
+        );
+
+        let choice = match chat_response.choices.first() {
+            Some(c) => c,
+            None => {
+                return Ok(TurnResult::Done {
+                    text: "(empty response)".into(),
+                    entry_id: self.history.last_id().unwrap_or(0),
+                });
+            }
+        };
+
+        let model_done = choice.finish_reason == "stop";
+        let text = choice.message.content_text().to_owned();
+
+        let parent_id = self.history.last_id().unwrap_or(0);
+        let asst_entry_id = self.history.push_assistant(parent_id, choice.message.clone());
+        if !model_done {
+            self.persist_entry(asst_entry_id);
+        }
+        self.notify_entry(asst_entry_id, model_done);
+
+        if model_done {
+            self.persist_entry(asst_entry_id);
+            return Ok(TurnResult::Done {
+                text,
+                entry_id: asst_entry_id,
+            });
+        }
+
+        let tool_calls = match choice.message.tool_calls() {
+            Some(tc) => tc.clone(),
+            None => return Ok(TurnResult::Continue),
+        };
+
+        log::info!("Executing {} tool call(s)", tool_calls.len());
+
+        let tool_results = execute_tool_calls(&tool_calls, &self.registry).await;
+
+        let mut bg_task_ids = Vec::new();
+        for (call, outcome) in tool_results {
+            let formatted = crate::tool::format_tool_outcome(&outcome);
+
+            if let crate::tool::ToolOutcome::Immediate {
+                ref content,
+                is_error: true,
+            } = outcome
+            {
+                log::warn!("Tool error: {}", content);
+            }
+
+            match outcome {
+                crate::tool::ToolOutcome::Background {
+                    task_id, receiver, ..
+                } => {
+                    let bg_tx_clone = self.bg_tx.clone();
+                    tokio::spawn(async move {
+                        if let Ok(result) = receiver.await {
+                            let _ = bg_tx_clone.send(result).await;
+                        }
+                    });
+                    bg_task_ids.push(task_id);
+                }
+                crate::tool::ToolOutcome::Subagent { handle } => {
+                    let agent_tx = self.child_agent_tx.clone();
+                    let cancel = handle.cancel.clone();
+                    self.active_child_cancels.push(cancel);
+                    let task_id = handle.task_id.clone();
+                    tokio::spawn(async move {
+                        if let Ok(result) = handle.result_rx.await {
+                            let _ = agent_tx.send(result).await;
+                        }
+                    });
+                    bg_task_ids.push(task_id);
+                }
+                _ => {}
+            }
+
+            let tool_msg = Message::Tool {
+                tool_call_id: call.id.clone(),
+                name: None,
+                content: formatted,
+            };
+            let tool_entry_id = self.history.push_tool(asst_entry_id, tool_msg);
+            self.persist_entry(tool_entry_id);
+            self.notify_entry(tool_entry_id, false);
+        }
+
+        if bg_task_ids.is_empty() {
+            Ok(TurnResult::Continue)
+        } else {
+            Ok(TurnResult::Pending {
+                asst_entry_id,
+                task_ids: bg_task_ids,
+            })
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Small helpers
+    // -----------------------------------------------------------------------
+
+    fn persist_entry(&self, entry_id: usize) {
+        if let (Some(path), Some(entry)) = (&self.session_path, self.history.get(entry_id)) {
+            append_entry_to_session(path, entry);
+        }
+    }
+
+    fn notify_entry(&self, entry_id: usize, is_final: bool) {
+        if let Some(entry) = self.history.get(entry_id) {
+            let _ = self.entry_notify_tx.send(EntryNotification {
+                entry: entry.clone(),
+                is_final,
+            });
+        }
+    }
+
+    async fn send_output(
+        reply: &Option<mpsc::Sender<LoopOutput>>,
+        text: String,
+        entry_id: usize,
+        is_final: bool,
+        metadata: Option<Box<dyn std::any::Any + Send>>,
+    ) {
+        if let Some(tx) = reply {
+            if !text.is_empty() || is_final {
+                let _ = tx
+                    .send(LoopOutput {
+                        text,
+                        entry_id,
+                        is_final,
+                        metadata,
+                    })
+                    .await;
+            }
+        }
+    }
+
+    fn handle_internal_mutation(&mut self, mutation: InternalMutation) {
+        match mutation {
+            InternalMutation::UpdateEntryContent { entry_id, mutator } => {
+                if let Some(entry) = self.history.get_mut(entry_id) {
+                    mutator(entry);
+                }
+                self.persist_entry(entry_id);
+            }
+            InternalMutation::UpdateSystemPrompt { content } => {
+                let full = format!("{}\n\n{}", self.system_prompt, content);
+                self.history.update_system(full);
+                log::info!("Updated system prompt");
+            }
+        }
+    }
+
+    fn finalize_conversation(&mut self, conv: ActiveConversation) {
+        if !conv.pending_task_ids.is_empty() {
+            let asst_entry_id = conv.first_bg_asst_entry_id.unwrap_or(0);
+            for tid in &conv.pending_task_ids {
+                self.task_to_group.insert(tid.clone(), asst_entry_id);
+            }
+            self.active_groups.insert(
+                asst_entry_id,
+                TaskGroup {
+                    reply: conv.reply,
+                    asst_entry_id,
+                    remaining: conv.pending_task_ids.len(),
+                    completed_results: Vec::new(),
+                    metadata: conv.metadata,
+                },
+            );
+        }
+    }
+
+    async fn drain_pending_events(&mut self) {
+        while let Ok(event) = self.input_rx.try_recv() {
+            self.handle_event(event).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Module-level helpers
+// ---------------------------------------------------------------------------
+
+use crate::provider::moonshot::tool::ToolCall;
+use crate::tool::ToolOutcome;
+
+/// Execute tool calls with wave-based concurrency.
+/// Tools with no `depends_on` run concurrently in wave 0.
+/// Tools depending on wave-0 tools run sequentially in wave 1.
+pub(super) async fn execute_tool_calls<'a>(
+    tool_calls: &'a [ToolCall],
+    registry: &'a ToolRegistry,
+) -> Vec<(&'a ToolCall, ToolOutcome)> {
+    let (independent, dependent): (Vec<_>, Vec<_>) =
+        tool_calls.iter().partition(|tc| tc.depends_on.is_none());
+
+    let mut results = Vec::with_capacity(tool_calls.len());
+
+    // Wave 0: all independent tools concurrently
+    if !independent.is_empty() {
+        let futures: Vec<_> = independent
+            .into_iter()
+            .map(|call| {
+                let name = call.function.name.clone();
+                let args = call.function.arguments.clone();
+                async move {
+                    log::info!("Tool call: {}({})", name, args);
+                    (call, registry.execute(&name, &args).await)
+                }
+            })
+            .collect();
+        results.extend(futures::future::join_all(futures).await);
+    }
+
+    // Wave 1+: dependent tools sequentially
+    for call in &dependent {
+        let dep_id = call.depends_on.as_deref().unwrap_or("");
+        if !tool_calls.iter().any(|tc| tc.id == dep_id) {
+            log::warn!(
+                "Tool call {} depends on unknown ID '{}', running anyway",
+                call.function.name,
+                dep_id
+            );
+        }
+        log::info!(
+            "Tool call (dependent): {}({})",
+            call.function.name,
+            call.function.arguments
+        );
+        let outcome = registry
+            .execute(&call.function.name, &call.function.arguments)
+            .await;
+        results.push((call, outcome));
+    }
+
+    results
+}
