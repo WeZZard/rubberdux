@@ -89,6 +89,10 @@ pub enum ToolOutcome {
         output_path: PathBuf,
         receiver: tokio::sync::oneshot::Receiver<BackgroundTaskResult>,
     },
+    /// Subagent dispatched with its own LLM loop.
+    Subagent {
+        handle: crate::agent::runtime::subagent::SubagentHandle,
+    },
 }
 
 /// Default formatting for ToolOutcome → Message::Tool content.
@@ -102,6 +106,11 @@ pub fn format_tool_outcome(outcome: &ToolOutcome) -> String {
              Acknowledge the user's request and let them know the result \
              is on its way.",
             task_id
+        ),
+        ToolOutcome::Subagent { handle } => format!(
+            "Subagent {} has been dispatched and is processing the request. \
+             The result will be delivered when complete.",
+            handle.task_id
         ),
     }
 }

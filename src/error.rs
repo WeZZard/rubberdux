@@ -15,6 +15,9 @@ pub enum Error {
     #[error("prompt load error: {0}")]
     PromptLoad(#[from] std::io::Error),
 
+    #[error("subagent error: {0}")]
+    Subagent(String),
+
     #[error("agent channel closed")]
     ChannelClosed,
 }

@@ -24,6 +24,8 @@ headless_chrome = "1"
 whisper-rs = "0.13"
 hound = "3"
 tempfile = "3"
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]
 wiremock = "0.6"

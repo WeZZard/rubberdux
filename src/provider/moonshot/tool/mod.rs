@@ -26,6 +26,8 @@ pub struct ToolCall {
     pub id: String,
     pub r#type: String,
     pub function: FunctionCall,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub depends_on: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,5 +50,46 @@ impl ToolDefinition {
 
     pub fn is_builtin(&self) -> bool {
         self.r#type == "builtin_function"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_call_depends_on_serde() {
+        // Without depends_on
+        let tc = ToolCall {
+            index: None,
+            id: "call_1".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "bash".into(),
+                arguments: "{}".into(),
+            },
+            depends_on: None,
+        };
+        let json = serde_json::to_value(&tc).unwrap();
+        assert!(json.get("depends_on").is_none(), "depends_on: None should be omitted");
+
+        // With depends_on
+        let tc2 = ToolCall {
+            index: None,
+            id: "call_2".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "read".into(),
+                arguments: "{}".into(),
+            },
+            depends_on: Some("call_1".into()),
+        };
+        let json2 = serde_json::to_value(&tc2).unwrap();
+        assert_eq!(json2["depends_on"], "call_1");
+
+        // Roundtrip without depends_on field in JSON
+        let raw = r#"{"id":"call_3","type":"function","function":{"name":"x","arguments":"{}"}}"#;
+        let parsed: ToolCall = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.depends_on, None);
     }
 }

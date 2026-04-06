@@ -1911,6 +1911,7 @@ dependencies = [
  "base64 0.22.1",
  "dotenvy",
  "env_logger",
+ "futures",
  "headless_chrome",
  "hound",
  "htmd",
@@ -1925,6 +1926,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "whisper-rs",
  "wiremock",
 ]
@@ -2652,6 +2654,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

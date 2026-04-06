@@ -175,12 +175,59 @@ fn append_entry_to_session(path: &Path, entry: &Entry) {
     }
 }
 
+use crate::provider::moonshot::tool::ToolCall;
+use crate::tool::ToolOutcome;
+
+/// Execute tool calls with wave-based concurrency.
+/// Tools with no `depends_on` run concurrently in wave 0.
+/// Tools depending on wave-0 tools run sequentially in wave 1.
+pub(super) async fn execute_tool_calls<'a>(
+    tool_calls: &'a [ToolCall],
+    registry: &'a ToolRegistry,
+) -> Vec<(&'a ToolCall, ToolOutcome)> {
+    let (independent, dependent): (Vec<_>, Vec<_>) =
+        tool_calls.iter().partition(|tc| tc.depends_on.is_none());
+
+    let mut results = Vec::with_capacity(tool_calls.len());
+
+    // Wave 0: all independent tools concurrently
+    if !independent.is_empty() {
+        let futures: Vec<_> = independent.into_iter().map(|call| {
+            let name = call.function.name.clone();
+            let args = call.function.arguments.clone();
+            async move {
+                log::info!("Tool call: {}({})", name, args);
+                (call, registry.execute(&name, &args).await)
+            }
+        }).collect();
+        results.extend(futures::future::join_all(futures).await);
+    }
+
+    // Wave 1+: dependent tools sequentially
+    for call in &dependent {
+        let dep_id = call.depends_on.as_deref().unwrap_or("");
+        if !tool_calls.iter().any(|tc| tc.id == dep_id) {
+            log::warn!(
+                "Tool call {} depends on unknown ID '{}', running anyway",
+                call.function.name, dep_id
+            );
+        }
+        log::info!("Tool call (dependent): {}({})", call.function.name, call.function.arguments);
+        let outcome = registry.execute(&call.function.name, &call.function.arguments).await;
+        results.push((call, outcome));
+    }
+
+    results
+}
+
 async fn run_tool_turn(
     client: &MoonshotClient,
     history: &mut EntryHistory,
     session_file: &Path,
     registry: &ToolRegistry,
     bg_tx: &tokio::sync::mpsc::Sender<BackgroundTaskResult>,
+    agent_result_tx: &tokio::sync::mpsc::Sender<super::subagent::SubagentResult>,
+    active_subagent_cancels: &mut Vec<tokio_util::sync::CancellationToken>,
 ) -> Result<TurnResult, crate::error::Error> {
     let messages = history.messages();
     let tools = registry.definitions();
@@ -224,29 +271,40 @@ async fn run_tool_turn(
 
     log::info!("Executing {} tool call(s)", tool_calls.len());
 
+    let tool_results = execute_tool_calls(&tool_calls, registry).await;
+
+    // Process results
     let mut bg_task_ids = Vec::new();
-
-    for call in &tool_calls {
-        log::info!("Tool call: {}({})", call.function.name, call.function.arguments);
-
-        let outcome = registry
-            .execute(&call.function.name, &call.function.arguments)
-            .await;
-
+    for (call, outcome) in tool_results {
         let formatted = crate::tool::format_tool_outcome(&outcome);
 
         if let crate::tool::ToolOutcome::Immediate { ref content, is_error: true } = outcome {
             log::warn!("Tool error: {}", content);
         }
 
-        if let crate::tool::ToolOutcome::Background { task_id, receiver, .. } = outcome {
-            let bg_tx_clone = bg_tx.clone();
-            tokio::spawn(async move {
-                if let Ok(result) = receiver.await {
-                    let _ = bg_tx_clone.send(result).await;
-                }
-            });
-            bg_task_ids.push(task_id);
+        match outcome {
+            crate::tool::ToolOutcome::Background { task_id, receiver, .. } => {
+                let bg_tx_clone = bg_tx.clone();
+                tokio::spawn(async move {
+                    if let Ok(result) = receiver.await {
+                        let _ = bg_tx_clone.send(result).await;
+                    }
+                });
+                bg_task_ids.push(task_id);
+            }
+            crate::tool::ToolOutcome::Subagent { handle } => {
+                let agent_tx = agent_result_tx.clone();
+                let cancel = handle.cancel.clone();
+                active_subagent_cancels.push(cancel);
+                let task_id = handle.task_id.clone();
+                tokio::spawn(async move {
+                    if let Ok(result) = handle.result_rx.await {
+                        let _ = agent_tx.send(result).await;
+                    }
+                });
+                bg_task_ids.push(task_id);
+            }
+            _ => {}
         }
 
         let tool_msg = Message::Tool {
@@ -271,9 +329,11 @@ async fn run_until_done_or_pending(
     session_file: &Path,
     registry: &ToolRegistry,
     bg_tx: &tokio::sync::mpsc::Sender<BackgroundTaskResult>,
+    agent_result_tx: &tokio::sync::mpsc::Sender<super::subagent::SubagentResult>,
+    active_subagent_cancels: &mut Vec<tokio_util::sync::CancellationToken>,
 ) -> Result<TurnResult, crate::error::Error> {
     loop {
-        let result = run_tool_turn(client, history, session_file, registry, bg_tx).await?;
+        let result = run_tool_turn(client, history, session_file, registry, bg_tx, agent_result_tx, active_subagent_cancels).await?;
         match result {
             TurnResult::Continue => continue,
             other => return Ok(other),
@@ -339,6 +399,16 @@ pub async fn run(
     // Send a signal to trigger branch 3. Buffered so sends never block.
     let (conv_notify_tx, mut conv_notify_rx) = tokio::sync::mpsc::channel::<()>(16);
 
+    // Context broadcast for subagents
+    let (context_tx, _) = tokio::sync::broadcast::channel::<super::subagent::ContextEvent>(64);
+
+    // Subagent result channel
+    let (agent_result_tx, mut agent_result_rx) =
+        tokio::sync::mpsc::channel::<super::subagent::SubagentResult>(32);
+
+    // Track active subagent cancel tokens
+    let mut active_subagent_cancels: Vec<tokio_util::sync::CancellationToken> = Vec::new();
+
     loop {
         tokio::select! {
             // Branch 1: Channel events (user messages, internal events)
@@ -381,7 +451,14 @@ pub async fn run(
                         } else {
                             text_preview.clone()
                         };
-                        append_user_message(history_text, &mut history, &session_file);
+                        append_user_message(history_text.clone(), &mut history, &session_file);
+
+                        // Broadcast to active subagents
+                        let _ = context_tx.send(super::subagent::ContextEvent::UserMessage(
+                            Message::User {
+                                content: UserContent::Text(history_text),
+                            },
+                        ));
 
                         // If there's an active conversation with pending bg tasks,
                         // finalize its TaskGroup before starting a new conversation.
@@ -474,6 +551,69 @@ pub async fn run(
                 let _ = conv_notify_tx.send(()).await;
             }
 
+            // Branch 2b: Subagent completions
+            Some(agent_result) = agent_result_rx.recv() => {
+                log::info!(
+                    "Subagent {} completed ({} bytes summary)",
+                    agent_result.task_id,
+                    agent_result.summary.len(),
+                );
+
+                // Remove the cancel token for this subagent
+                active_subagent_cancels.retain(|_| true); // cleanup handled by drop
+
+                // Check if this belongs to a task group
+                let group_key = task_to_group.remove(&agent_result.task_id);
+
+                if let Some(group_key) = group_key {
+                    // Convert to BackgroundTaskResult for unified group handling
+                    let bg_result = BackgroundTaskResult {
+                        task_id: agent_result.task_id,
+                        content: agent_result.summary,
+                    };
+
+                    if let Some(group) = active_groups.get_mut(&group_key) {
+                        group.completed_results.push(bg_result);
+                        group.remaining -= 1;
+
+                        if group.remaining > 0 {
+                            continue;
+                        }
+
+                        let group = active_groups.remove(&group_key).unwrap();
+                        for result in &group.completed_results {
+                            let msg = Message::User {
+                                content: UserContent::Text(format!(
+                                    "[Task {} completed]\n{}",
+                                    result.task_id, result.content
+                                )),
+                            };
+                            let entry_id = history.push_user(msg);
+                            append_entry_to_session(&session_file, history.get(entry_id).unwrap());
+                        }
+
+                        active_conversation = Some(ActiveConversation {
+                            reply_tx: group.reply_tx,
+                            pending_task_ids: Vec::new(),
+                            first_bg_asst_entry_id: None,
+                            telegram_message_id: group.telegram_message_id,
+                            is_background_completion: true,
+                        });
+                        let _ = conv_notify_tx.send(()).await;
+                    }
+                } else {
+                    // Standalone subagent result (not in a group)
+                    let msg = Message::User {
+                        content: UserContent::Text(format!(
+                            "[Subagent {} completed]\n{}",
+                            agent_result.task_id, agent_result.summary
+                        )),
+                    };
+                    let entry_id = history.push_user(msg);
+                    append_entry_to_session(&session_file, history.get(entry_id).unwrap());
+                }
+            }
+
             // Branch 3: Drive active conversation one step at a time
             Some(()) = conv_notify_rx.recv(), if active_conversation.is_some() => {
                 // Update shared last_user_query for WebSearchTool
@@ -493,6 +633,7 @@ pub async fn run(
 
                 let turn_result = run_tool_turn(
                     &client, &mut history, &session_file, &registry, &bg_tx,
+                    &agent_result_tx, &mut active_subagent_cancels,
                 ).await;
 
                 match turn_result {
@@ -656,6 +797,7 @@ fn evict_if_needed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
 
     #[test]
     fn test_eviction_removes_oldest_pairs() {
@@ -721,5 +863,233 @@ mod tests {
 
         assert!(last_prompt_tokens + estimated_new <= best_perf_tokens);
         assert_eq!(history.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_tool_execution() {
+        use std::time::{Duration, Instant};
+        use crate::tool::{Tool, ToolOutcome, ToolRegistry};
+        use crate::provider::moonshot::tool::ToolDefinition;
+
+        struct SlowTool { name: &'static str }
+
+        impl Tool for SlowTool {
+            fn name(&self) -> &str { self.name }
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition::new(self.name, "slow", serde_json::json!({}))
+            }
+            fn execute<'a>(
+                &'a self,
+                _arguments: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ToolOutcome> + Send + 'a>> {
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    ToolOutcome::Immediate {
+                        content: "done".into(),
+                        is_error: false,
+                    }
+                })
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SlowTool { name: "slow_a" }));
+        registry.register(Box::new(SlowTool { name: "slow_b" }));
+
+        let start = Instant::now();
+
+        let reg = &registry;
+        let tool_futures: Vec<_> = ["slow_a", "slow_b"].iter().map(|name| {
+            let name = name.to_string();
+            async move {
+                reg.execute(&name, "{}").await
+            }
+        }).collect();
+        let results = futures::future::join_all(tool_futures).await;
+
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 2);
+        for outcome in &results {
+            match outcome {
+                ToolOutcome::Immediate { content, is_error } => {
+                    assert!(!is_error);
+                    assert_eq!(content, "done");
+                }
+                _ => panic!("Expected Immediate outcome"),
+            }
+        }
+
+        // Concurrent: should take ~100ms, not ~200ms
+        assert!(
+            elapsed < Duration::from_millis(180),
+            "Expected concurrent execution under 180ms, took {:?}",
+            elapsed
+        );
+    }
+
+    fn make_tool_call(id: &str, name: &str, depends_on: Option<&str>) -> ToolCall {
+        ToolCall {
+            index: None,
+            id: id.into(),
+            r#type: "function".into(),
+            function: crate::provider::moonshot::tool::FunctionCall {
+                name: name.into(),
+                arguments: "{}".into(),
+            },
+            depends_on: depends_on.map(String::from),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_wave_partitioning_independent() {
+        use std::time::{Duration, Instant};
+        use crate::tool::{Tool, ToolOutcome, ToolRegistry};
+        use crate::provider::moonshot::tool::ToolDefinition;
+
+        struct TimedTool { name: &'static str }
+
+        impl Tool for TimedTool {
+            fn name(&self) -> &str { self.name }
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition::new(self.name, "timed", serde_json::json!({}))
+            }
+            fn execute<'a>(
+                &'a self,
+                _arguments: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ToolOutcome> + Send + 'a>> {
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    ToolOutcome::Immediate {
+                        content: "ok".into(),
+                        is_error: false,
+                    }
+                })
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TimedTool { name: "a" }));
+        registry.register(Box::new(TimedTool { name: "b" }));
+        registry.register(Box::new(TimedTool { name: "c" }));
+
+        let calls = vec![
+            make_tool_call("1", "a", None),
+            make_tool_call("2", "b", None),
+            make_tool_call("3", "c", None),
+        ];
+
+        let start = Instant::now();
+        let results = execute_tool_calls(&calls, &registry).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 3);
+        // All 3 independent tools should run concurrently (~80ms, not ~240ms)
+        assert!(
+            elapsed < Duration::from_millis(160),
+            "Expected concurrent execution under 160ms, took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wave_partitioning_dependent() {
+        use std::time::{Duration, Instant};
+        use crate::tool::{Tool, ToolOutcome, ToolRegistry};
+        use crate::provider::moonshot::tool::ToolDefinition;
+
+        struct TimedTool { name: &'static str }
+
+        impl Tool for TimedTool {
+            fn name(&self) -> &str { self.name }
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition::new(self.name, "timed", serde_json::json!({}))
+            }
+            fn execute<'a>(
+                &'a self,
+                _arguments: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ToolOutcome> + Send + 'a>> {
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    ToolOutcome::Immediate {
+                        content: "ok".into(),
+                        is_error: false,
+                    }
+                })
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TimedTool { name: "a" }));
+        registry.register(Box::new(TimedTool { name: "b" }));
+        registry.register(Box::new(TimedTool { name: "c" }));
+
+        // A and B independent, C depends on A
+        let calls = vec![
+            make_tool_call("1", "a", None),
+            make_tool_call("2", "b", None),
+            make_tool_call("3", "c", Some("1")),
+        ];
+
+        let start = Instant::now();
+        let results = execute_tool_calls(&calls, &registry).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 3);
+        // Wave 0: A+B concurrent (~80ms), Wave 1: C (~80ms) = ~160ms total
+        assert!(
+            elapsed >= Duration::from_millis(140),
+            "Expected sequential waves to take at least 140ms, took {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_millis(260),
+            "Should not take 3x sequential (~240ms+), took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_malformed_depends_on() {
+        use crate::tool::{Tool, ToolOutcome, ToolRegistry};
+        use crate::provider::moonshot::tool::ToolDefinition;
+
+        struct DummyTool;
+
+        impl Tool for DummyTool {
+            fn name(&self) -> &str { "d" }
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition::new("d", "dummy", serde_json::json!({}))
+            }
+            fn execute<'a>(
+                &'a self,
+                _arguments: &'a str,
+            ) -> Pin<Box<dyn Future<Output = ToolOutcome> + Send + 'a>> {
+                Box::pin(async {
+                    ToolOutcome::Immediate {
+                        content: "ok".into(),
+                        is_error: false,
+                    }
+                })
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DummyTool));
+
+        // depends_on references a nonexistent ID
+        let calls = vec![
+            make_tool_call("1", "d", Some("nonexistent")),
+        ];
+
+        let results = execute_tool_calls(&calls, &registry).await;
+        assert_eq!(results.len(), 1);
+        match &results[0].1 {
+            ToolOutcome::Immediate { content, is_error } => {
+                assert!(!is_error);
+                assert_eq!(content, "ok");
+            }
+            _ => panic!("Expected Immediate outcome"),
+        }
     }
 }

@@ -395,6 +395,7 @@ mod tests {
                         name: "web_fetch".into(),
                         arguments: "{\"url\": \"https://example.com\"}".into(),
                     },
+                    depends_on: None,
                 }]),
                 partial: None,
             },
