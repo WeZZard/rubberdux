@@ -2,7 +2,7 @@
   "type": "function",
   "function": {
     "name": "agent",
-    "description": "Launch a subagent to handle a complex, multi-step task autonomously. The subagent runs its own LLM loop with tool access, processes the task independently, and returns a summary when done. Use this for tasks that require multiple tool calls or extended reasoning.",
+    "description": "Launch a subagent to handle a complex, multi-step task autonomously. The subagent runs its own LLM loop with tool access, processes the task independently, and returns a summary when done. Use this for tasks that require multiple tool calls or extended reasoning. Do not call this tool more than once for the same task — one agent per task is sufficient.",
     "parameters": {
       "type": "object",
       "properties": {
