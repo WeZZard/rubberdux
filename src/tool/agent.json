@@ -1,0 +1,17 @@
+{
+  "type": "function",
+  "function": {
+    "name": "agent",
+    "description": "Launch a subagent to handle a complex, multi-step task autonomously. The subagent runs its own LLM loop with tool access, processes the task independently, and returns a summary when done. Use this for tasks that require multiple tool calls or extended reasoning.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "prompt": {
+          "type": "string",
+          "description": "A detailed description of the task for the subagent to perform. Include all necessary context — the subagent does not see the current conversation history."
+        }
+      },
+      "required": ["prompt"]
+    }
+  }
+}

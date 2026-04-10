@@ -63,6 +63,7 @@ pub fn spawn_subagent(
             token_budget: 128_000,
             cancel: cancel_clone.clone(),
             compaction: Box::new(EvictOldestTurns),
+            context_tx: None,
         };
 
         let (agent_loop, input_port) = AgentLoop::new(config);

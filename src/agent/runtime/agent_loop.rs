@@ -66,6 +66,9 @@ pub struct AgentLoopConfig {
     pub token_budget: usize,
     pub cancel: CancellationToken,
     pub compaction: Box<dyn CompactionStrategy>,
+    /// Optional pre-created context broadcast sender. If None, a new one is created.
+    /// Use this when a tool (e.g. AgentTool) needs the sender before the loop is constructed.
+    pub context_tx: Option<broadcast::Sender<ContextEvent>>,
 }
 
 /// The unified agent loop that drives LLM conversations, tool execution,
@@ -121,7 +124,7 @@ impl AgentLoop {
         let (trampoline_tx, trampoline_rx) = mpsc::channel(16);
         let (bg_tx, bg_rx) = mpsc::channel(32);
         let (child_agent_tx, child_agent_rx) = mpsc::channel(32);
-        let (context_tx, _) = broadcast::channel(64);
+        let context_tx = config.context_tx.unwrap_or_else(|| broadcast::channel(64).0);
         let (entry_notify_tx, _) = broadcast::channel(256);
 
         let agent_loop = Self {
@@ -215,8 +218,6 @@ impl AgentLoop {
     /// Run the loop until the model stops with no pending tasks.
     /// Returns the final assistant text. Convenience for subagent use.
     pub async fn run_to_completion(mut self) -> String {
-        let mut final_text = String::new();
-
         loop {
             tokio::select! {
                 biased;
@@ -244,29 +245,34 @@ impl AgentLoop {
                 Some(()) = self.trampoline_rx.recv(), if self.active_conversation.is_some() => {
                     self.drain_pending_events().await;
                     self.drive_conversation().await;
-
-                    if self.active_conversation.is_none() && self.active_groups.is_empty() {
-                        final_text = self
-                            .history
-                            .entries()
-                            .iter()
-                            .rev()
-                            .find_map(|e| match &e.message {
-                                Message::Assistant {
-                                    content: Some(text), ..
-                                } => Some(text.clone()),
-                                _ => None,
-                            })
-                            .unwrap_or_default();
-                        break;
-                    }
                 }
 
                 else => break,
             }
+
+            // Check exit condition after every branch, not just trampoline.
+            // Done when: no active conversation AND no pending task groups.
+            if self.active_conversation.is_none() && self.active_groups.is_empty() {
+                // Only exit if we've actually had at least one conversation
+                // (history has more than just the system message).
+                if self.history.len() > 2 {
+                    break;
+                }
+            }
         }
 
-        final_text
+        // Extract final assistant text from history
+        self.history
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|e| match &e.message {
+                Message::Assistant {
+                    content: Some(text), ..
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     // -----------------------------------------------------------------------
@@ -338,7 +344,7 @@ impl AgentLoop {
                 log::warn!("Received result for unknown task: {}", result.task_id);
                 let msg = Message::User {
                     content: UserContent::Text(format!(
-                        "[Task {} completed]\n{}",
+                        "[Subagent {} completed. This is a subagent result — the user has not seen this content. Decide whether and how to present it based on the original request.]\n{}",
                         result.task_id, result.content
                     )),
                 };
@@ -382,7 +388,7 @@ impl AgentLoop {
         for result in &group.completed_results {
             let msg = Message::User {
                 content: UserContent::Text(format!(
-                    "[Task {} completed]\n{}",
+                    "[Subagent {} completed. This is a subagent result — the user has not seen this content. Decide whether and how to present it based on the original request.]\n{}",
                     result.task_id, result.content
                 )),
             };
@@ -391,14 +397,19 @@ impl AgentLoop {
             self.notify_entry(entry_id, false);
         }
 
-        self.active_conversation = Some(ActiveConversation {
-            reply: group.reply,
-            pending_task_ids: Vec::new(),
-            first_bg_asst_entry_id: None,
-            metadata: group.metadata,
-            is_child_completion: true,
-        });
-        let _ = self.trampoline_tx.send(()).await;
+        // If there's already an active conversation driving the LLM,
+        // don't overwrite it — the results are in history and the next
+        // LLM turn will see them. Only create a new conversation if idle.
+        if self.active_conversation.is_none() {
+            self.active_conversation = Some(ActiveConversation {
+                reply: group.reply,
+                pending_task_ids: Vec::new(),
+                first_bg_asst_entry_id: None,
+                metadata: group.metadata,
+                is_child_completion: true,
+            });
+            let _ = self.trampoline_tx.send(()).await;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -420,22 +431,23 @@ impl AgentLoop {
                     Self::send_output(&conv.reply, text, entry_id, is_final, conv.metadata)
                         .await;
                 } else {
+                    // Tasks were already registered in task_to_group during
+                    // Pending handling. Finalize: set the reply channel on
+                    // the group so completions can respond to the user.
                     let asst_entry_id = conv.first_bg_asst_entry_id.unwrap_or(entry_id);
-                    for tid in &conv.pending_task_ids {
-                        self.task_to_group.insert(tid.clone(), asst_entry_id);
+                    if let Some(group) = self.active_groups.get_mut(&asst_entry_id) {
+                        group.reply = conv.reply.clone();
+                        group.metadata = conv.metadata;
+                        // Send non-final response (results still pending)
+                        Self::send_output(&conv.reply, text, entry_id, false, None)
+                            .await;
+                    } else {
+                        // Group already completed before Done — results are
+                        // in history. Send as final since nothing is pending.
+                        let is_final = self.active_groups.is_empty();
+                        Self::send_output(&conv.reply, text, entry_id, is_final, conv.metadata)
+                            .await;
                     }
-                    self.active_groups.insert(
-                        asst_entry_id,
-                        TaskGroup {
-                            reply: conv.reply.clone(),
-                            asst_entry_id,
-                            remaining: conv.pending_task_ids.len(),
-                            completed_results: Vec::new(),
-                            metadata: conv.metadata,
-                        },
-                    );
-                    Self::send_output(&conv.reply, text, entry_id, false, None)
-                        .await;
                 }
                 log::info!("LLM conversation completed");
             }
@@ -450,7 +462,27 @@ impl AgentLoop {
                     if conv.first_bg_asst_entry_id.is_none() {
                         conv.first_bg_asst_entry_id = Some(asst_entry_id);
                     }
-                    conv.pending_task_ids.extend(task_ids);
+                    conv.pending_task_ids.extend(task_ids.clone());
+                }
+
+                // Register tasks immediately so results arriving before
+                // Done can find their group (prevents orphaned results).
+                for tid in &task_ids {
+                    self.task_to_group.insert(tid.clone(), asst_entry_id);
+                }
+                if !self.active_groups.contains_key(&asst_entry_id) {
+                    self.active_groups.insert(
+                        asst_entry_id,
+                        TaskGroup {
+                            reply: None, // Set when Done is received
+                            asst_entry_id,
+                            remaining: task_ids.len(),
+                            completed_results: Vec::new(),
+                            metadata: None,
+                        },
+                    );
+                } else if let Some(group) = self.active_groups.get_mut(&asst_entry_id) {
+                    group.remaining += task_ids.len();
                 }
                 let _ = self.trampoline_tx.send(()).await;
             }
@@ -545,10 +577,19 @@ impl AgentLoop {
                     task_id, receiver, ..
                 } => {
                     let bg_tx_clone = self.bg_tx.clone();
+                    let tid = task_id.clone();
                     tokio::spawn(async move {
-                        if let Ok(result) = receiver.await {
-                            let _ = bg_tx_clone.send(result).await;
-                        }
+                        let result = match receiver.await {
+                            Ok(result) => result,
+                            Err(_) => {
+                                log::warn!("Background task {} sender dropped", tid);
+                                BackgroundTaskResult {
+                                    task_id: tid,
+                                    content: "(task failed: sender dropped)".into(),
+                                }
+                            }
+                        };
+                        let _ = bg_tx_clone.send(result).await;
                     });
                     bg_task_ids.push(task_id);
                 }
@@ -557,10 +598,19 @@ impl AgentLoop {
                     let cancel = handle.cancel.clone();
                     self.active_child_cancels.push(cancel);
                     let task_id = handle.task_id.clone();
+                    let tid = task_id.clone();
                     tokio::spawn(async move {
-                        if let Ok(result) = handle.result_rx.await {
-                            let _ = agent_tx.send(result).await;
-                        }
+                        let result = match handle.result_rx.await {
+                            Ok(result) => result,
+                            Err(_) => {
+                                log::warn!("Subagent {} sender dropped", tid);
+                                SubagentResult {
+                                    task_id: tid,
+                                    summary: "(subagent failed: sender dropped)".into(),
+                                }
+                            }
+                        };
+                        let _ = agent_tx.send(result).await;
                     });
                     bg_task_ids.push(task_id);
                 }

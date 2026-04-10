@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod bash;
 pub mod edit;
 pub mod glob;
@@ -108,8 +109,10 @@ pub fn format_tool_outcome(outcome: &ToolOutcome) -> String {
             task_id
         ),
         ToolOutcome::Subagent { handle } => format!(
-            "Subagent {} has been dispatched and is processing the request. \
-             The result will be delivered when complete.",
+            "Subagent {} has been dispatched. This is foreground work — \
+             the user is waiting for the result. When it arrives, you will \
+             receive it as a message in this conversation. The user will \
+             not see it directly; it is up to you to present it.",
             handle.task_id
         ),
     }

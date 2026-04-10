@@ -48,12 +48,21 @@ pub async fn run(
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_BEST_PERFORMANCE_TOKENS);
 
+    // Create context broadcast early so AgentTool can subscribe
+    let (context_tx, _) = tokio::sync::broadcast::channel::<
+        super::subagent::ContextEvent,
+    >(64);
+
     // Build tool registry
+    // Step 1: base tools (shared by both outer loop and subagents)
+    // Step 2: wrap in Arc for subagent use
+    // Step 3: build outer registry that adds AgentTool (which holds the base Arc)
     let last_user_query = Arc::new(RwLock::new(String::new()));
     let registry = {
         use crate::provider::moonshot::tool::bash::MoonshotBashTool;
         use crate::provider::moonshot::tool::web_fetch::MoonshotWebFetchTool;
         use crate::provider::moonshot::tool::web_search::WebSearchTool;
+        use crate::tool::agent::AgentTool;
         use crate::tool::edit::EditFileTool;
         use crate::tool::glob::GlobTool;
         use crate::tool::grep::GrepTool;
@@ -72,14 +81,38 @@ pub async fn run(
             client.clone(),
             last_user_query.clone(),
         )));
+
+        // Wrap base tools in Arc for subagent use, then add AgentTool
+        let base_registry = Arc::new(r);
+        let mut outer = ToolRegistry::new();
+        // Re-register base tool definitions (AgentTool delegates to base_registry for subagents)
+        // The outer registry holds AgentTool + all base tools by re-registering
+        outer.register(Box::new(MoonshotBashTool::new()));
+        outer.register(Box::new(MoonshotWebFetchTool::new()));
+        outer.register(Box::new(ReadFileTool));
+        outer.register(Box::new(WriteFileTool));
+        outer.register(Box::new(EditFileTool));
+        outer.register(Box::new(GlobTool));
+        outer.register(Box::new(GrepTool));
+        outer.register(Box::new(WebSearchTool::new(
+            client.clone(),
+            last_user_query.clone(),
+        )));
+        outer.register(Box::new(AgentTool::new(
+            client.clone(),
+            base_registry,
+            system_prompt.clone(),
+            context_tx.clone(),
+        )));
         log::info!(
             "Tool registry: {:?}",
-            r.definitions()
+            outer
+                .definitions()
                 .iter()
                 .map(|d| &d.function.name)
                 .collect::<Vec<_>>()
         );
-        r
+        outer
     };
 
     let config = AgentLoopConfig {
@@ -90,6 +123,7 @@ pub async fn run(
         token_budget: best_perf_tokens,
         cancel: CancellationToken::new(),
         compaction: Box::new(EvictOldestTurns),
+        context_tx: Some(context_tx),
     };
 
     let (agent_loop, input_port) = AgentLoop::new(config);
