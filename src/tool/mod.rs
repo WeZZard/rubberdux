@@ -13,6 +13,19 @@ use std::pin::Pin;
 
 use crate::provider::moonshot::tool::ToolDefinition;
 
+/// Subagent execution strategy. Determines the tool registry and
+/// execution environment for a spawned subagent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentType {
+    /// Read-only. Code search, finding definitions, tracing call chains.
+    Explore,
+    /// Read-only. Design implementation plans, analyze tradeoffs.
+    Plan,
+    /// Full access. Write code, run builds, execute tests.
+    GeneralPurpose,
+}
+
 // ---------------------------------------------------------------------------
 // Tool trait — unified abstraction for tool definition + execution
 // ---------------------------------------------------------------------------
@@ -215,6 +228,54 @@ mod tests {
             is_error: false,
         };
         assert_eq!(format_tool_outcome(&outcome), "file contents here");
+    }
+
+    #[test]
+    fn test_subagent_type_deserialize_explore() {
+        let t: SubagentType = serde_json::from_str(r#""explore""#).unwrap();
+        assert_eq!(t, SubagentType::Explore);
+    }
+
+    #[test]
+    fn test_subagent_type_deserialize_plan() {
+        let t: SubagentType = serde_json::from_str(r#""plan""#).unwrap();
+        assert_eq!(t, SubagentType::Plan);
+    }
+
+    #[test]
+    fn test_subagent_type_deserialize_general_purpose() {
+        let t: SubagentType = serde_json::from_str(r#""general_purpose""#).unwrap();
+        assert_eq!(t, SubagentType::GeneralPurpose);
+    }
+
+    #[test]
+    fn test_subagent_type_rejects_invalid() {
+        let result = serde_json::from_str::<SubagentType>(r#""invalid""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_subagent_type_rejects_wrong_case() {
+        let result = serde_json::from_str::<SubagentType>(r#""EXPLORE""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_subagent_type_rejects_empty_string() {
+        let result = serde_json::from_str::<SubagentType>(r#""""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_subagent_type_rejects_null() {
+        let result = serde_json::from_str::<SubagentType>("null");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_subagent_type_rejects_number() {
+        let result = serde_json::from_str::<SubagentType>("0");
+        assert!(result.is_err());
     }
 
     #[test]

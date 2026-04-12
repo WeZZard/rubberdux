@@ -26,6 +26,41 @@ pub fn load_prompt_parts(prompt_dir: &Path) -> Vec<String> {
     parts
 }
 
+/// Subagent preamble selected by type. Prepended to the system prompt
+/// for subagent loops to scope their capabilities.
+pub fn subagent_preamble(subagent_type: crate::tool::SubagentType) -> &'static str {
+    use crate::tool::SubagentType;
+    match subagent_type {
+        SubagentType::Explore => include_str!("EXPLORE_PREAMBLE.md"),
+        SubagentType::Plan => include_str!("PLAN_PREAMBLE.md"),
+        SubagentType::GeneralPurpose => include_str!("GP_PREAMBLE.md"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool::SubagentType;
+
+    #[test]
+    fn test_preambles_non_empty() {
+        for ty in [SubagentType::Explore, SubagentType::Plan, SubagentType::GeneralPurpose] {
+            let preamble = subagent_preamble(ty);
+            assert!(!preamble.trim().is_empty(), "{:?} preamble should be non-empty", ty);
+        }
+    }
+
+    #[test]
+    fn test_preambles_distinct() {
+        let explore = subagent_preamble(SubagentType::Explore);
+        let plan = subagent_preamble(SubagentType::Plan);
+        let gp = subagent_preamble(SubagentType::GeneralPurpose);
+        assert_ne!(explore, plan, "Explore and Plan preambles must differ");
+        assert_ne!(explore, gp, "Explore and GeneralPurpose preambles must differ");
+        assert_ne!(plan, gp, "Plan and GeneralPurpose preambles must differ");
+    }
+}
+
 /// Built-in system reasoning principles. Cannot be modified by end users.
 const SYSTEM: &str = include_str!("SYSTEM.md");
 
