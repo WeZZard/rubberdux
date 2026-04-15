@@ -36,10 +36,9 @@ pub struct SubagentResult {
 
 /// Spawn a subagent as a tokio task. Returns a handle for tracking.
 ///
-/// The subagent runs its own `AgentLoop` with an isolated history and
-/// no session persistence. It subscribes to `context_rx` for live
-/// environment updates and respects the `CancellationToken` for early
-/// termination.
+/// The subagent runs its own `AgentLoop` with an isolated history.
+/// It subscribes to `context_rx` for live environment updates and
+/// respects the `CancellationToken` for early termination.
 pub fn spawn_subagent(
     task_id: String,
     client: Arc<MoonshotClient>,
@@ -47,6 +46,8 @@ pub fn spawn_subagent(
     initial_prompt: String,
     registry: Arc<ToolRegistry>,
     context_rx: broadcast::Receiver<ContextEvent>,
+    session_path: Option<std::path::PathBuf>,
+    tool_results_dir: Option<std::path::PathBuf>,
 ) -> SubagentHandle {
     let cancel = CancellationToken::new();
     let (result_tx, result_rx) = oneshot::channel();
@@ -59,7 +60,8 @@ pub fn spawn_subagent(
             client,
             registry,
             system_prompt,
-            session_path: None,
+            session_path,
+            tool_results_dir,
             token_budget: 128_000,
             cancel: cancel_clone.clone(),
             compaction: Box::new(EvictOldestTurns),

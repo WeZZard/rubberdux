@@ -5,6 +5,20 @@ use crate::provider::moonshot::tool::ToolDefinition;
 
 use super::ToolOutcome;
 
+const MAX_OUTPUT_LENGTH: usize = 100_000;
+
+fn truncate_output(content: String) -> String {
+    if content.len() <= MAX_OUTPUT_LENGTH {
+        return content;
+    }
+    let end = content.floor_char_boundary(MAX_OUTPUT_LENGTH);
+    format!(
+        "{}\n\n[Output truncated at {} characters]",
+        &content[..end],
+        end
+    )
+}
+
 pub struct BashTool;
 
 impl super::Tool for BashTool {
@@ -90,7 +104,7 @@ async fn execute_sync(command: &str, timeout_ms: u64) -> ToolOutcome {
             }
 
             ToolOutcome::Immediate {
-                content,
+                content: truncate_output(content),
                 is_error: !output.status.success(),
             }
         }
@@ -141,6 +155,8 @@ async fn execute_background(command: &str) -> ToolOutcome {
             Err(e) => format!("Failed to execute command: {}", e),
         };
 
+        let content = truncate_output(content);
+
         if let Err(e) = std::fs::write(&path, &content) {
             log::error!("Failed to write background task output: {}", e);
         }
@@ -163,4 +179,29 @@ fn generate_task_id() -> String {
         .unwrap_or_default()
         .as_millis();
     format!("{:x}", ts & 0xFFFF_FFFF)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_output_under_limit() {
+        let short = "hello world".to_owned();
+        assert_eq!(truncate_output(short.clone()), short);
+    }
+
+    #[test]
+    fn test_truncate_output_over_limit() {
+        let long = "x".repeat(MAX_OUTPUT_LENGTH + 1000);
+        let result = truncate_output(long);
+        assert!(result.len() < MAX_OUTPUT_LENGTH + 100);
+        assert!(result.ends_with("[Output truncated at 100000 characters]"));
+    }
+
+    #[test]
+    fn test_truncate_output_exact_limit() {
+        let exact = "a".repeat(MAX_OUTPUT_LENGTH);
+        assert_eq!(truncate_output(exact.clone()), exact);
+    }
 }

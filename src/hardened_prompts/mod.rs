@@ -31,9 +31,9 @@ pub fn load_prompt_parts(prompt_dir: &Path) -> Vec<String> {
 pub fn subagent_preamble(subagent_type: crate::tool::SubagentType) -> &'static str {
     use crate::tool::SubagentType;
     match subagent_type {
-        SubagentType::Explore => include_str!("EXPLORE_PREAMBLE.md"),
-        SubagentType::Plan => include_str!("PLAN_PREAMBLE.md"),
-        SubagentType::GeneralPurpose => include_str!("GP_PREAMBLE.md"),
+        SubagentType::Explore => include_str!("agents/EXPLORE_PREAMBLE.md"),
+        SubagentType::Plan => include_str!("agents/PLAN_PREAMBLE.md"),
+        SubagentType::GeneralPurpose => include_str!("agents/GP_PREAMBLE.md"),
     }
 }
 
@@ -61,19 +61,24 @@ mod tests {
     }
 }
 
-/// Built-in system reasoning principles. Cannot be modified by end users.
-const SYSTEM: &str = include_str!("SYSTEM.md");
+/// OODA reasoning principles. Cannot be modified by end users.
+const OODA: &str = include_str!("common/OODA.md");
+
+/// Tool usage principles. Cannot be modified by end users.
+const TOOL_USE: &str = include_str!("common/TOOL_USE.md");
 
 /// Built-in guardrails that cannot be modified by end users.
-const GUARDRAILS: &str = include_str!("GUARDRAILS.md");
+const GUARDRAILS: &str = include_str!("common/GUARDRAILS.md");
 
 /// Composes a system prompt from parts and an optional channel partial.
 ///
-/// Order: SYSTEM (reasoning) → user parts (identity, soul) → GUARDRAILS → channel partial.
-/// Compiled-in parts bracket user-editable content: SYSTEM sets the foundation,
+/// Order: OODA (reasoning) → TOOL_USE → user parts (identity, soul) → GUARDRAILS → channel partial.
+/// Compiled-in parts bracket user-editable content: OODA sets the foundation,
 /// GUARDRAILS sets the boundaries.
 pub fn compose_system_prompt(parts: &[String], channel_partial: Option<&str>) -> String {
-    let mut prompt = SYSTEM.to_owned();
+    let mut prompt = OODA.to_owned();
+    prompt.push_str("\n\n");
+    prompt.push_str(TOOL_USE);
     for part in parts {
         prompt.push_str("\n\n");
         prompt.push_str(part);

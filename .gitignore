@@ -1,3 +1,4 @@
 /target
 .env
 /sessions
+/test_results

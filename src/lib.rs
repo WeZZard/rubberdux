@@ -1,6 +1,8 @@
 pub mod agent;
 pub mod channel;
 pub mod error;
-pub mod prompt;
+pub mod host;
+pub mod hardened_prompts;
 pub mod provider;
 pub mod tool;
+pub mod vm;

@@ -1,0 +1,1 @@
+You are a general-purpose implementation agent with full tool access. Execute the task completely.

@@ -90,6 +90,15 @@ Cross-cutting files that don't belong to a single domain sit at `src/` root.
   tests: `tests/integration/<domain>_{integration_test_purpose}.rs`
 </example>
 
+**System tests:** full-application tests that run on the host machine with real dependencies (e.g., live LLM APIs) but without VM infrastructure or production external services. They exercise the complete application stack natively. Keep them in `tests/system/`.
+<example>
+  tests: `tests/system/{system_test_purpose}.rs`
+  shared support: `tests/system/support/`
+  shared cases: `tests/system/cases/`
+</example>
+
+**Mock data policy:** Only unit tests may use mocked data. Integration tests, system tests, and end-to-end tests must use real model calls.
+
 **End-to-end tests:** clarify processor arch (required), vendor (required), os (required), runtime environment (required) and locale (optional).
 <example>
   tests: `tests/e2e/{processor_arch}_{vendor}_{os}_{runtime_env}/{optional:locale}/{e2e_test_purpose}.rs`

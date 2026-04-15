@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -7,7 +8,7 @@ use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::agent::runtime::subagent::{spawn_subagent, ContextEvent};
-use crate::prompt::subagent_preamble;
+use crate::hardened_prompts::subagent_preamble;
 use crate::provider::moonshot::MoonshotClient;
 use crate::provider::moonshot::tool::ToolDefinition;
 use crate::tool::{SubagentType, ToolRegistry};
@@ -77,6 +78,8 @@ pub struct AgentTool {
     base_system_prompt: String,
     context_tx: broadcast::Sender<ContextEvent>,
     rpc_writer: Option<Arc<Mutex<OwnedWriteHalf>>>,
+    /// Session directory for persisting subagent sessions and metadata.
+    session_dir: Option<PathBuf>,
 }
 
 impl AgentTool {
@@ -86,6 +89,7 @@ impl AgentTool {
         base_system_prompt: String,
         context_tx: broadcast::Sender<ContextEvent>,
         rpc_writer: Option<Arc<Mutex<OwnedWriteHalf>>>,
+        session_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             client,
@@ -93,6 +97,7 @@ impl AgentTool {
             base_system_prompt,
             context_tx,
             rpc_writer,
+            session_dir,
         }
     }
 }
@@ -201,6 +206,30 @@ impl super::Tool for AgentTool {
                 &prompt[..prompt.len().min(100)]
             );
 
+            // Persist subagent session and metadata alongside the main session
+            let (subagent_session, subagent_tool_results) =
+                if let Some(ref dir) = self.session_dir {
+                    let subagents_dir = dir.join("subagents");
+                    let _ = std::fs::create_dir_all(&subagents_dir);
+
+                    let meta = serde_json::json!({
+                        "agent_id": task_id,
+                        "subagent_type": format!("{:?}", subagent_type),
+                    });
+                    let meta_path = subagents_dir.join(format!("{}.meta.json", task_id));
+                    if let Ok(json) = serde_json::to_string_pretty(&meta) {
+                        let _ = std::fs::write(&meta_path, json);
+                    }
+
+                    let tool_results_dir = dir.join("tool-results");
+                    (
+                        Some(subagents_dir.join(format!("{}.jsonl", task_id))),
+                        Some(tool_results_dir),
+                    )
+                } else {
+                    (None, None)
+                };
+
             let context_rx = self.context_tx.subscribe();
             let handle = spawn_subagent(
                 task_id,
@@ -209,6 +238,8 @@ impl super::Tool for AgentTool {
                 prompt,
                 registry,
                 context_rx,
+                subagent_session,
+                subagent_tool_results,
             );
 
             ToolOutcome::Subagent { handle }
@@ -245,6 +276,7 @@ mod tests {
             registries,
             "test system prompt".into(),
             context_tx,
+            None,
             None,
         )
     }
@@ -393,6 +425,7 @@ mod tests {
             HashMap::new(), // empty registries
             "test system prompt".into(),
             context_tx,
+            None,
             None,
         );
         let outcome = <AgentTool as Tool>::execute(

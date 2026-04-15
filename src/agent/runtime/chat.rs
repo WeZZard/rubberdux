@@ -39,9 +39,18 @@ fn bridge_reply(
 }
 
 pub async fn run(
+    rx: mpsc::Receiver<ChannelEvent>,
+    client: Arc<MoonshotClient>,
+    system_prompt: String,
+) {
+    run_with_session(rx, client, system_prompt, session_path()).await;
+}
+
+pub async fn run_with_session(
     mut rx: mpsc::Receiver<ChannelEvent>,
     client: Arc<MoonshotClient>,
     system_prompt: String,
+    session_path: std::path::PathBuf,
 ) {
     let best_perf_tokens: usize = std::env::var("RUBBERDUX_LLM_BEST_PERFORMANCE_TOKENS")
         .ok()
@@ -53,16 +62,17 @@ pub async fn run(
         super::subagent::ContextEvent,
     >(64);
 
+    // Derive session directory for subagent sessions and tool results
+    let session_dir = session_path.parent().map(|p| p.to_path_buf());
+    let tool_results_dir = session_dir.as_ref().map(|d| d.join("tool-results"));
+
     // Build tool registry
-    // Step 1: base tools (shared by both outer loop and subagents)
-    // Step 2: wrap in Arc for subagent use
-    // Step 3: build outer registry that adds AgentTool (which holds the base Arc)
     let last_user_query = Arc::new(RwLock::new(String::new()));
     let registry = {
         use crate::provider::moonshot::tool::bash::MoonshotBashTool;
         use crate::provider::moonshot::tool::web_fetch::MoonshotWebFetchTool;
         use crate::provider::moonshot::tool::web_search::WebSearchTool;
-        use crate::tool::agent::AgentTool;
+        use crate::tool::agent::{build_subagent_registries, AgentTool};
         use crate::tool::edit::EditFileTool;
         use crate::tool::glob::GlobTool;
         use crate::tool::grep::GrepTool;
@@ -82,44 +92,31 @@ pub async fn run(
             last_user_query.clone(),
         )));
 
-        // Wrap base tools in Arc for subagent use, then add AgentTool
-        let base_registry = Arc::new(r);
-        let mut outer = ToolRegistry::new();
-        // Re-register base tool definitions (AgentTool delegates to base_registry for subagents)
-        // The outer registry holds AgentTool + all base tools by re-registering
-        outer.register(Box::new(MoonshotBashTool::new()));
-        outer.register(Box::new(MoonshotWebFetchTool::new()));
-        outer.register(Box::new(ReadFileTool));
-        outer.register(Box::new(WriteFileTool));
-        outer.register(Box::new(EditFileTool));
-        outer.register(Box::new(GlobTool));
-        outer.register(Box::new(GrepTool));
-        outer.register(Box::new(WebSearchTool::new(
+        let subagent_registries = build_subagent_registries(&client, &last_user_query);
+        r.register(Box::new(AgentTool::new(
             client.clone(),
-            last_user_query.clone(),
-        )));
-        outer.register(Box::new(AgentTool::new(
-            client.clone(),
-            base_registry,
+            subagent_registries,
             system_prompt.clone(),
             context_tx.clone(),
+            None,
+            session_dir,
         )));
         log::info!(
             "Tool registry: {:?}",
-            outer
-                .definitions()
+            r.definitions()
                 .iter()
                 .map(|d| &d.function.name)
                 .collect::<Vec<_>>()
         );
-        outer
+        r
     };
 
     let config = AgentLoopConfig {
         client,
         registry: Arc::new(registry),
         system_prompt,
-        session_path: Some(session_path()),
+        session_path: Some(session_path),
+        tool_results_dir,
         token_budget: best_perf_tokens,
         cancel: CancellationToken::new(),
         compaction: Box::new(EvictOldestTurns),

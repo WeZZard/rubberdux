@@ -63,6 +63,8 @@ pub struct AgentLoopConfig {
     pub registry: Arc<ToolRegistry>,
     pub system_prompt: String,
     pub session_path: Option<PathBuf>,
+    /// Directory for persisting individual tool call results.
+    pub tool_results_dir: Option<PathBuf>,
     pub token_budget: usize,
     pub cancel: CancellationToken,
     pub compaction: Box<dyn CompactionStrategy>,
@@ -79,6 +81,7 @@ pub struct AgentLoop {
     registry: Arc<ToolRegistry>,
     system_prompt: String,
     session_path: Option<PathBuf>,
+    tool_results_dir: Option<PathBuf>,
     token_budget: usize,
     cancel: CancellationToken,
     compaction: Box<dyn CompactionStrategy>,
@@ -132,6 +135,7 @@ impl AgentLoop {
             registry: config.registry,
             system_prompt: config.system_prompt,
             session_path: config.session_path,
+            tool_results_dir: config.tool_results_dir,
             token_budget: config.token_budget,
             cancel: config.cancel,
             compaction: config.compaction,
@@ -421,7 +425,7 @@ impl AgentLoop {
 
         match turn_result {
             Ok(TurnResult::Done { text, entry_id }) => {
-                let conv = match self.active_conversation.take() {
+                let mut conv = match self.active_conversation.take() {
                     Some(c) => c,
                     None => return,
                 };
@@ -431,23 +435,21 @@ impl AgentLoop {
                     Self::send_output(&conv.reply, text, entry_id, is_final, conv.metadata)
                         .await;
                 } else {
-                    // Tasks were already registered in task_to_group during
-                    // Pending handling. Finalize: set the reply channel on
-                    // the group so completions can respond to the user.
-                    let asst_entry_id = conv.first_bg_asst_entry_id.unwrap_or(entry_id);
-                    if let Some(group) = self.active_groups.get_mut(&asst_entry_id) {
-                        group.reply = conv.reply.clone();
-                        group.metadata = conv.metadata;
-                        // Send non-final response (results still pending)
-                        Self::send_output(&conv.reply, text, entry_id, false, None)
-                            .await;
-                    } else {
-                        // Group already completed before Done — results are
-                        // in history. Send as final since nothing is pending.
-                        let is_final = self.active_groups.is_empty();
-                        Self::send_output(&conv.reply, text, entry_id, is_final, conv.metadata)
-                            .await;
+                    // Distribute the reply channel to ALL active groups
+                    // so every group completion can deliver results to
+                    // the channel. Metadata (e.g. telegram_message_id)
+                    // goes to the first group only.
+                    let first_asst = conv.first_bg_asst_entry_id.unwrap_or(entry_id);
+                    for (&key, group) in self.active_groups.iter_mut() {
+                        if group.reply.is_none() {
+                            group.reply = conv.reply.clone();
+                        }
+                        if key == first_asst && group.metadata.is_none() {
+                            group.metadata = conv.metadata.take();
+                        }
                     }
+                    // Send non-final response (results still pending)
+                    Self::send_output(&conv.reply, text, entry_id, false, None).await;
                 }
                 log::info!("LLM conversation completed");
             }
@@ -615,6 +617,15 @@ impl AgentLoop {
                     bg_task_ids.push(task_id);
                 }
                 _ => {}
+            }
+
+            // Persist tool result as individual file
+            if let Some(ref dir) = self.tool_results_dir {
+                let _ = std::fs::create_dir_all(dir);
+                let path = dir.join(format!("{}.txt", call.id));
+                if let Err(e) = std::fs::write(&path, &formatted) {
+                    log::warn!("Failed to write tool result {}: {}", call.id, e);
+                }
             }
 
             let tool_msg = Message::Tool {

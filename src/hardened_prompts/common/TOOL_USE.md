@@ -1,0 +1,1 @@
+Use `web_fetch` for fetching URLs — it converts HTML to readable Markdown and truncates large content. Do not use `bash` with `curl` or `wget` for fetching web pages.

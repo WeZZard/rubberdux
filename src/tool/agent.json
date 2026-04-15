@@ -2,16 +2,21 @@
   "type": "function",
   "function": {
     "name": "agent",
-    "description": "Launch a subagent to handle a complex, multi-step task autonomously. The subagent runs its own LLM loop with tool access, processes the task independently, and returns a summary when done. Use this for tasks that require multiple tool calls or extended reasoning. Do not call this tool more than once for the same task — one agent per task is sufficient.",
+    "description": "Launch a subagent to handle a task autonomously. Choose the lightest subagent type that can accomplish the task.\n\n- **explore**: Read-only. Code search, finding definitions, tracing call chains.\n- **plan**: Read-only. Design implementation plans, analyze tradeoffs.\n- **general_purpose**: Full access. Write code, run builds, execute tests.\n\nDo not call this tool more than once for the same task — one agent per task is sufficient.",
     "parameters": {
       "type": "object",
       "properties": {
+        "subagent_type": {
+          "type": "string",
+          "enum": ["explore", "plan", "general_purpose"],
+          "description": "The subagent execution strategy. Use 'explore' for read-only code search, 'plan' for read-only planning, 'general_purpose' for full tool access."
+        },
         "prompt": {
           "type": "string",
           "description": "A detailed description of the task for the subagent to perform. Include all necessary context — the subagent does not see the current conversation history."
         }
       },
-      "required": ["prompt"]
+      "required": ["subagent_type", "prompt"]
     }
   }
 }

@@ -1,6 +1,8 @@
 pub mod adapter;
 pub mod interpreter;
 
+use serde::{Deserialize, Serialize};
+
 use interpreter::InterpretedMessage;
 
 /// An event from a channel to the agent loop.
@@ -15,6 +17,7 @@ pub enum ChannelEvent {
     InternalEvent(InternalEvent),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 /// Channel-specific internal events.
 pub enum InternalEvent {
     /// Associates a channel-side message ID with an assistant message in history.
@@ -28,6 +31,7 @@ pub enum InternalEvent {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentResponse {
     pub text: String,
     pub entry_id: usize,

@@ -5,7 +5,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use rubberdux::agent::runtime::subagent::spawn_subagent;
-use rubberdux::prompt::subagent_preamble;
+use rubberdux::hardened_prompts::subagent_preamble;
 use rubberdux::provider::moonshot::MoonshotClient;
 use rubberdux::tool::agent::{build_subagent_registries, AgentTool};
 use rubberdux::tool::{SubagentType, ToolRegistry};
@@ -31,6 +31,7 @@ fn setup() -> (Arc<MoonshotClient>, ToolRegistry) {
         registries,
         "integration test system prompt".into(),
         context_tx,
+        None,
         None,
     );
 
@@ -162,6 +163,8 @@ async fn test_explore_subagent_happy_path() {
         "Find all tool source files".into(),
         registry,
         context_tx.subscribe(),
+        None,
+        None,
     );
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), handle.result_rx)
@@ -256,6 +259,8 @@ async fn test_plan_subagent_happy_path() {
         "Analyze project dependencies".into(),
         registry,
         context_tx.subscribe(),
+        None,
+        None,
     );
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), handle.result_rx)
@@ -352,6 +357,8 @@ async fn test_gp_subagent_happy_path() {
         "Run echo hello".into(),
         registry,
         context_tx.subscribe(),
+        None,
+        None,
     );
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), handle.result_rx)

@@ -30,3 +30,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 [dev-dependencies]
 wiremock = "0.6"
 serial_test = "3"
+
+[[test]]
+name = "telegram_channel_agent"
+path = "tests/system/telegram_channel_agent.rs"
