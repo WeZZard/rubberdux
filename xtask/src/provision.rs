@@ -48,12 +48,17 @@ pub async fn provision_images(image: Option<String>) -> Result<(), String> {
 
         println!("VM image {} is stale or missing. Reprovisioning...", base_vm_name);
 
-        if !oci_image_exists(oci_image)? {
-            println!("Pulling OCI image {}...", oci_image);
+        // Check if base VM exists - if so, we can clone from it instead of re-downloading OCI image
+        let source = if base_vm_exists(base_vm_name) {
+            println!("Base VM {} exists - cloning from it (no download needed)", base_vm_name);
+            base_vm_name.to_string()
+        } else {
+            println!("Base VM {} not found - pulling OCI image {}...", base_vm_name, oci_image);
             pull_oci_image(oci_image)?;
-        }
+            oci_image.to_string()
+        };
 
-        provision_base_vm(image_name, oci_image, base_vm_name)?;
+        provision_base_vm(image_name, &source, base_vm_name)?;
     }
 
     Ok(())
@@ -134,12 +139,12 @@ fn linux_agent_binary_path() -> PathBuf {
         .join("rubberdux")
 }
 
-fn oci_image_exists(oci_image: &str) -> Result<bool, String> {
-    let output = Command::new("tart")
-        .args(["get", oci_image])
+fn base_vm_exists(base_vm_name: &str) -> bool {
+    Command::new("tart")
+        .args(["get", base_vm_name])
         .output()
-        .map_err(|e| format!("Failed to check OCI image {}: {}", oci_image, e))?;
-    Ok(output.status.success())
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn pull_oci_image(oci_image: &str) -> Result<(), String> {
@@ -154,12 +159,12 @@ fn pull_oci_image(oci_image: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn provision_base_vm(image_name: &str, oci_image: &str, base_vm_name: &str) -> Result<(), String> {
+fn provision_base_vm(image_name: &str, source: &str, base_vm_name: &str) -> Result<(), String> {
     let tmp_name = format!("{}-building", base_vm_name);
 
-    println!("Cloning base image for {}...", base_vm_name);
+    println!("Cloning base image for {} from {}...", base_vm_name, source);
     let status = Command::new("tart")
-        .args(["clone", oci_image, &tmp_name])
+        .args(["clone", source, &tmp_name])
         .status()
         .map_err(|e| format!("tart clone failed: {}", e))?;
     if !status.success() {

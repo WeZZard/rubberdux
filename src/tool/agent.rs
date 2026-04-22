@@ -4,15 +4,13 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::net::tcp::OwnedWriteHalf;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 
 use crate::agent::runtime::subagent::{spawn_subagent, ContextEvent};
 use crate::hardened_prompts::subagent_preamble;
 use crate::provider::moonshot::MoonshotClient;
 use crate::provider::moonshot::tool::ToolDefinition;
 use crate::tool::{SubagentType, ToolRegistry};
-use crate::protocol::{self, AgentToHost};
 
 use super::ToolOutcome;
 
@@ -78,7 +76,6 @@ pub struct AgentTool {
     registries: HashMap<SubagentType, Arc<ToolRegistry>>,
     base_system_prompt: String,
     context_tx: broadcast::Sender<ContextEvent>,
-    rpc_writer: Option<Arc<Mutex<OwnedWriteHalf>>>,
     /// Session directory for persisting subagent sessions and metadata.
     session_dir: Option<PathBuf>,
 }
@@ -89,7 +86,6 @@ impl AgentTool {
         registries: HashMap<SubagentType, Arc<ToolRegistry>>,
         base_system_prompt: String,
         context_tx: broadcast::Sender<ContextEvent>,
-        rpc_writer: Option<Arc<Mutex<OwnedWriteHalf>>>,
         session_dir: Option<PathBuf>,
     ) -> Self {
         Self {
@@ -97,7 +93,6 @@ impl AgentTool {
             registries,
             base_system_prompt,
             context_tx,
-            rpc_writer,
             session_dir,
         }
     }
@@ -172,37 +167,6 @@ impl super::Tool for AgentTool {
                 subagent_preamble(subagent_type),
                 self.base_system_prompt
             );
-
-            // Route: ComputerUse with RPC → child VM spawn, otherwise in-process subagent
-            if subagent_type == SubagentType::ComputerUse
-                && let Some(ref writer) = self.rpc_writer
-            {
-                let msg = AgentToHost::SpawnVM {
-                    task_id: task_id.clone(),
-                    prompt,
-                    subagent_type: serde_json::to_string(&subagent_type)
-                        .unwrap()
-                        .trim_matches('"')
-                        .to_string(),
-                };
-                let mut w = writer.lock().await;
-                if let Err(e) = protocol::write_message(&mut w, &msg).await {
-                    return ToolOutcome::Immediate {
-                        content: format!("Failed to send SpawnVM to host: {}", e),
-                        is_error: true,
-                    };
-                }
-                log::info!("Requested computer-use VM agent {} from host", task_id);
-                return ToolOutcome::Immediate {
-                    content: format!(
-                        "Computer-use VM agent {} has been dispatched. The subagent is booting \
-                         in an isolated virtual machine. When it completes, you will \
-                         receive the result as a message in this conversation.",
-                        task_id
-                    ),
-                    is_error: false,
-                };
-            }
 
             log::info!(
                 "Spawning {:?} subagent {} for: {}",
@@ -488,45 +452,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_computer_use_with_rpc_returns_immediate() {
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        // Accept and immediately close so write_message fails cleanly,
-        // or we can just let the write fail because no acceptor is ready.
-        // Actually, write_message will succeed on TCP connect buffer until backpressure.
-        // Better: spawn an acceptor that reads one message.
-        let acceptor = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (mut r, _) = stream.into_split();
-            let _ = crate::protocol::read_message::<AgentToHost>(&mut r).await;
-        });
-
-        let client = dummy_client();
-        let registries = dummy_registries();
-        let (context_tx, _) = broadcast::channel(4);
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (_r, w) = stream.into_split();
-        let rpc_writer = Some(Arc::new(Mutex::new(w)));
-
-        let tool = AgentTool::new(
-            client,
-            registries,
-            "test system prompt".into(),
-            context_tx,
-            rpc_writer,
-            None,
-        );
-
-        let outcome = <AgentTool as Tool>::execute(&tool, r#"{"subagent_type":"computer_use","prompt":"click ok"}"#).await;
-        match outcome {
-            ToolOutcome::Immediate { content, is_error } => {
-                assert!(!is_error);
-                assert!(content.contains("Computer-use VM agent"), "expected VM dispatch message, got: {}", content);
-            }
+}
             other => panic!("Expected Immediate outcome, got {:?}", std::mem::discriminant(&other)),
         }
 
