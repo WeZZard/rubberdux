@@ -61,10 +61,12 @@ impl MoonshotClient {
         // The caller passes the complete tool list — no internal merging needed.
         let tools = tools.filter(|t| !t.is_empty());
 
-        // $web_search requires thinking to be explicitly disabled
+        // web_search requires thinking to be explicitly disabled
+        // Note: the registered tool name is "web_search", but the API builtin is "$web_search".
+        // We check for the registered name since that's what appears in the tools list.
         let has_web_search = tools
             .as_ref()
-            .map(|t| t.iter().any(|td| td.function.name == "$web_search"))
+            .map(|t| t.iter().any(|td| td.function.name == "web_search"))
             .unwrap_or(false);
 
         let thinking = if has_web_search {
