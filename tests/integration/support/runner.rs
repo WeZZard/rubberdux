@@ -58,6 +58,7 @@ pub async fn run() {
 
         let mut user_messages: Vec<String> = Vec::new();
         let mut assistant_slots: Vec<(OrderingDirective, Vec<String>)> = Vec::new();
+        let mut pending_user_batch: Vec<String> = Vec::new();
 
         for msg in case.messages.iter() {
             match msg {
@@ -70,13 +71,31 @@ pub async fn run() {
                     };
                     println!("  User: {}", text);
                     user_messages.push(text.clone());
-
-                    let _outputs = harness.send_message(&text, timeout).await;
+                    pending_user_batch.push(text);
                 }
                 Message::Assistant { directive, assertions } => {
+                    // Flush any accumulated user messages before processing the assistant slot.
+                    if !pending_user_batch.is_empty() {
+                        if pending_user_batch.len() == 1 {
+                            let _outputs = harness.send_message(&pending_user_batch[0], timeout).await;
+                        } else {
+                            let _outputs = harness.send_messages_batch(&pending_user_batch, timeout).await;
+                        }
+                        pending_user_batch.clear();
+                    }
                     assistant_slots.push((directive.clone(), assertions.clone()));
                 }
             }
+        }
+
+        // Flush any remaining user messages after the loop.
+        if !pending_user_batch.is_empty() {
+            if pending_user_batch.len() == 1 {
+                let _outputs = harness.send_message(&pending_user_batch[0], timeout).await;
+            } else {
+                let _outputs = harness.send_messages_batch(&pending_user_batch, timeout).await;
+            }
+            pending_user_batch.clear();
         }
 
         let trajectory = IntegrationTrajectory {

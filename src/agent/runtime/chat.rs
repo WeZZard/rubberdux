@@ -171,6 +171,18 @@ pub async fn run_with_session(
                         break;
                     }
                 }
+                ChannelEvent::ContextUpdate { text } => {
+                    let message = Message::User {
+                        content: UserContent::Text(text),
+                    };
+
+                    let event = LoopEvent::ContextUpdate(message);
+
+                    if input_port.send(event).await.is_err() {
+                        log::warn!("AgentLoop input channel closed");
+                        break;
+                    }
+                }
                 ChannelEvent::InternalEvent(internal) => {
                     let loop_event = match internal {
                         InternalEvent::UpdateAssistantMessageId {

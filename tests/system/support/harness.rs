@@ -12,14 +12,13 @@ use tokio::sync::mpsc;
 pub struct Trajectory {
     pub case_name: String,
     pub test_time: String,
-    pub user_message: String,
+    pub user_messages: Vec<String>,
     pub responses: Vec<AgentResponse>,
     pub session_path: PathBuf,
 }
 
-impl Trajectory {
-    /// Format main agent narration as structured markdown.
-    pub fn format_for_eval(&self) -> String {
+impl md_testing::Evaluatable for Trajectory {
+    fn format_for_eval(&self) -> String {
         let mut s = String::new();
 
         // Frontmatter
@@ -29,11 +28,17 @@ impl Trajectory {
         s.push_str("---\n\n");
 
         // Title
-        let title = humanize_case_name(&self.case_name);
+        let title = md_testing::narration::humanize_case_name(&self.case_name);
         s.push_str(&format!("# Test Case: {}\n\n", title));
 
+        // User messages
+        s.push_str("## User Messages\n\n");
+        for (i, msg) in self.user_messages.iter().enumerate() {
+            s.push_str(&format!("{}. {}\n\n", i + 1, msg));
+        }
+
         // Session entries
-        narrate_session(&self.session_path, &mut s);
+        md_testing::narration::narrate_session(&self.session_path, &mut s);
 
         // Channel delivery summary
         s.push_str("---\n\n");
@@ -48,169 +53,23 @@ impl Trajectory {
                 response.reply_to_message_id,
             ));
             s.push_str(&response.text);
-            s.push_str("\n\n");
+            s.push('\n');
+            s.push('\n');
         }
 
         s
     }
+}
 
+impl Trajectory {
     /// Write narration files for each subagent session.
     pub fn write_subagent_narrations(&self) {
-        let subagents_dir = self.session_path.parent().unwrap().join("subagents");
-        if !subagents_dir.is_dir() {
-            return;
-        }
-
-        let Ok(entries) = std::fs::read_dir(&subagents_dir) else {
-            return;
-        };
-
-        let mut jsonl_files: Vec<_> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .map(|x| x == "jsonl")
-                    .unwrap_or(false)
-            })
-            .collect();
-        jsonl_files.sort_by_key(|e| e.path());
-
-        for entry in jsonl_files {
-            let jsonl_path = entry.path();
-            let agent_id = jsonl_path
-                .file_stem()
-                .unwrap()
-                .to_string_lossy()
-                .to_string();
-
-            let mut s = String::new();
-            s.push_str("---\n");
-            s.push_str(&format!("agent_id: {}\n", agent_id));
-            s.push_str(&format!("parent_testcase: {}\n", self.case_name));
-            s.push_str(&format!("test_time: {}\n", self.test_time));
-            s.push_str("---\n\n");
-            s.push_str(&format!("# Subagent {}\n\n", agent_id));
-
-            // Include metadata if present
-            let meta_path = subagents_dir.join(format!("{}.meta.json", agent_id));
-            if let Ok(meta_text) = std::fs::read_to_string(&meta_path) {
-                s.push_str(&format!("**Metadata:** {}\n\n", meta_text.trim()));
-            }
-
-            // Narrate the subagent session
-            narrate_session(&jsonl_path, &mut s);
-
-            let narration_path = subagents_dir.join(format!("{}.md", agent_id));
-            let _ = std::fs::write(&narration_path, &s);
-        }
+        md_testing::narration::write_subagent_narrations(
+            &self.session_path,
+            &self.case_name,
+            &self.test_time,
+        );
     }
-}
-
-/// Convert a session JSONL file into human-readable markdown sections.
-fn narrate_session(session_path: &Path, out: &mut String) {
-    let content = match std::fs::read_to_string(session_path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let entry = match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        let role = entry["message"]
-            .get("role")
-            .and_then(|r| r.as_str())
-            .unwrap_or("unknown");
-
-        match role {
-            "system" => {}
-            "user" => {
-                let text = entry["message"]
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
-                out.push_str("---\n\n");
-                out.push_str("## User Message\n\n");
-                out.push_str(text);
-                out.push_str("\n\n");
-            }
-            "assistant" => {
-                out.push_str("---\n\n");
-                out.push_str("## Assistant Message\n\n");
-
-                let content_text = entry["message"]
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
-                if !content_text.is_empty() {
-                    out.push_str(content_text);
-                    out.push_str("\n\n");
-                }
-
-                if let Some(reasoning) = entry["message"]
-                    .get("reasoning_content")
-                    .and_then(|r| r.as_str())
-                {
-                    if !reasoning.is_empty() {
-                        out.push_str("**Reasoning:**\n\n");
-                        out.push_str(reasoning);
-                        out.push_str("\n\n");
-                    }
-                }
-
-                if let Some(calls) = entry["message"]
-                    .get("tool_calls")
-                    .and_then(|t| t.as_array())
-                {
-                    out.push_str("**Tool Calls:**\n\n");
-                    for tc in calls {
-                        let name = tc["function"]["name"].as_str().unwrap_or("?");
-                        let args = tc["function"]["arguments"].as_str().unwrap_or("");
-                        out.push_str(&format!("- `{}({})`\n", name, args));
-                    }
-                    out.push('\n');
-                }
-            }
-            "tool" => {
-                let tool_call_id = entry["message"]
-                    .get("tool_call_id")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("?");
-                let content_text = entry["message"]
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
-
-                out.push_str("---\n\n");
-                out.push_str(&format!("## Tool Result ({})\n\n", tool_call_id));
-                out.push_str(content_text);
-                out.push_str("\n\n");
-            }
-            _ => {}
-        }
-    }
-}
-
-fn humanize_case_name(name: &str) -> String {
-    name.strip_prefix("testcase_")
-        .unwrap_or(name)
-        .replace('_', " ")
-        .split_whitespace()
-        .map(|w| {
-            let mut chars = w.chars();
-            match chars.next() {
-                Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// Test harness that drives `chat::run_with_session()` at the channel boundary.
@@ -285,6 +144,29 @@ impl ChannelHarness {
         }
 
         responses
+    }
+
+    /// Send multiple user messages as a batch.  All but the last message are
+    /// injected as `ContextUpdate` (added to history without triggering LLM
+    /// processing).  The last message is sent as a normal `UserInput` which
+    /// triggers the LLM response.
+    pub async fn send_messages_batch(
+        &self,
+        messages: &[String],
+        timeout: Duration,
+    ) -> Vec<AgentResponse> {
+        assert!(!messages.is_empty(), "batch must contain at least one message");
+
+        // Send all but the last as context updates.
+        for text in &messages[..messages.len() - 1] {
+            let event = ChannelEvent::ContextUpdate {
+                text: text.clone(),
+            };
+            self.tx.send(event).await.expect("channel should be open");
+        }
+
+        // Send the last message as a normal user input to trigger LLM.
+        self.send_message(&messages[messages.len() - 1], timeout).await
     }
 }
 

@@ -60,6 +60,8 @@ pub async fn run() {
 
         let mut user_messages = Vec::new();
         let mut assistant_slots: Vec<(OrderingDirective, Vec<String>)> = Vec::new();
+        let mut message_batches: Vec<Vec<String>> = Vec::new();
+        let mut current_batch: Vec<String> = Vec::new();
 
         for msg in case.messages.iter() {
             match msg {
@@ -71,16 +73,31 @@ pub async fn run() {
                         }
                     };
                     user_messages.push(text.clone());
+                    current_batch.push(text);
                 }
                 Message::Assistant { directive, assertions } => {
+                    // End of a user-message batch; flush it.
+                    if !current_batch.is_empty() {
+                        message_batches.push(current_batch);
+                        current_batch = Vec::new();
+                    }
                     assistant_slots.push((directive.clone(), assertions.clone()));
                 }
             }
         }
 
+        // Flush any trailing user messages after the last assistant slot.
+        if !current_batch.is_empty() {
+            message_batches.push(current_batch);
+        }
+
         let mut all_responses = Vec::new();
-        for text in &user_messages {
-            let responses = harness.send_message(text, timeout).await;
+        for batch in &message_batches {
+            let responses = if batch.len() == 1 {
+                harness.send_message(&batch[0], timeout).await
+            } else {
+                harness.send_messages_batch(batch, timeout).await
+            };
             all_responses.extend(responses);
         }
 

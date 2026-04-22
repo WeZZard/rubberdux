@@ -13,6 +13,11 @@ pub enum ChannelEvent {
         reply_tx: Option<tokio::sync::mpsc::Sender<AgentResponse>>,
         telegram_message_id: Option<i32>,
     },
+    /// Context update that adds a message to history without triggering LLM processing.
+    /// Used for batched user messages where only the last message should trigger a response.
+    ContextUpdate {
+        text: String,
+    },
     /// Channel-internal event that mutates history without calling the LLM.
     InternalEvent(InternalEvent),
 }
