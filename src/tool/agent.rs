@@ -311,7 +311,7 @@ mod tests {
         let r = registries.get(&SubagentType::Explore).unwrap();
         let defs: Vec<String> = r.definitions().iter().map(|d| d.function.name.clone()).collect();
         assert_eq!(defs.len(), 5, "readonly registry should have exactly 5 tools, got {:?}", defs);
-        for expected in ["glob", "grep", "read_file", "web_fetch", "web_search"] {
+        for expected in ["glob", "grep", "read_file", "web_fetch", "$web_search"] {
             assert!(defs.contains(&expected.to_owned()), "readonly registry missing {}", expected);
         }
         for absent in ["bash", "write_file", "edit_file", "agent"] {
@@ -325,7 +325,7 @@ mod tests {
         let r = registries.get(&SubagentType::GeneralPurpose).unwrap();
         let defs: Vec<String> = r.definitions().iter().map(|d| d.function.name.clone()).collect();
         assert_eq!(defs.len(), 8, "gp registry should have exactly 8 tools, got {:?}", defs);
-        for expected in ["bash", "web_fetch", "read_file", "write_file", "edit_file", "glob", "grep", "web_search"] {
+        for expected in ["bash", "web_fetch", "read_file", "write_file", "edit_file", "glob", "grep", "$web_search"] {
             assert!(defs.contains(&expected.to_owned()), "gp registry missing {}", expected);
         }
         assert!(!defs.contains(&"agent".to_owned()), "gp registry should not have agent");
@@ -337,7 +337,7 @@ mod tests {
         let r = registries.get(&SubagentType::ComputerUse).unwrap();
         let defs: Vec<String> = r.definitions().iter().map(|d| d.function.name.clone()).collect();
         assert_eq!(defs.len(), 8, "computer_use registry should have exactly 8 tools, got {:?}", defs);
-        for expected in ["bash", "web_fetch", "read_file", "write_file", "edit_file", "glob", "grep", "web_search"] {
+        for expected in ["bash", "web_fetch", "read_file", "write_file", "edit_file", "glob", "grep", "$web_search"] {
             assert!(defs.contains(&expected.to_owned()), "computer_use registry missing {}", expected);
         }
         assert!(!defs.contains(&"agent".to_owned()), "computer_use registry should not have agent");

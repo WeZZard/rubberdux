@@ -1,7 +1,7 @@
 {
-  "type": "function",
+  "type": "builtin_function",
   "function": {
-    "name": "web_search",
+    "name": "$web_search",
     "description": "Search the web for current information. Use this when the user asks about recent news, events, or any information that requires up-to-date knowledge beyond your training data. When you need multiple searches, call this tool multiple times in one response — they execute concurrently.",
     "parameters": {
       "type": "object",

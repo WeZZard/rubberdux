@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::super::tool::ToolDefinition;
+use super::super::tool::{FunctionDefinition, ToolDefinition};
 use super::super::{Message, MoonshotClient, UserContent};
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,12 +61,10 @@ impl MoonshotClient {
         // The caller passes the complete tool list — no internal merging needed.
         let tools = tools.filter(|t| !t.is_empty());
 
-        // web_search requires thinking to be explicitly disabled
-        // Note: the registered tool name is "web_search", but the API builtin is "$web_search".
-        // We check for the registered name since that's what appears in the tools list.
+        // $web_search requires thinking to be explicitly disabled
         let has_web_search = tools
             .as_ref()
-            .map(|t| t.iter().any(|td| td.function.name == "web_search"))
+            .map(|t| t.iter().any(|td| td.function.name == "$web_search"))
             .unwrap_or(false);
 
         let thinking = if has_web_search {
@@ -192,5 +190,61 @@ mod tests {
             &response.choices[0].message,
             Message::Assistant { content: Some(c), .. } if c == "Hello!"
         ));
+    }
+
+    /// Integration test: verifies that when web_search tool is present, thinking is
+    /// properly disabled so the model actually calls $web_search instead of refusing.
+    ///
+    /// This test makes a real API call (costs tokens). Skip with `cargo test -- --skip integration`
+    /// if you want to avoid network calls.
+    #[tokio::test]
+    #[ignore = "makes real API call — run with `cargo test -- --ignored`"]
+    async fn test_web_search_triggers_tool_calls() {
+        let client = MoonshotClient::from_env();
+        let tools = vec![ToolDefinition {
+            r#type: "builtin_function".to_owned(),
+            function: FunctionDefinition {
+                name: "$web_search".to_owned(),
+                description: Some("Search the web".to_owned()),
+                parameters: None,
+            },
+        }];
+
+        let messages = vec![
+            Message::System {
+                content: "You must use web search for current information.".into(),
+            },
+            Message::User {
+                content: UserContent::Text("Latest Google news".into()),
+            },
+        ];
+
+        let response = client.chat(messages, Some(tools)).await;
+        assert!(response.is_ok(), "API call failed: {:?}", response.err());
+
+        let response = response.unwrap();
+        let choice = response.choices.first().expect("no choices in response");
+
+        // The critical assertion: with thinking disabled, the model should call
+        // the tool (finish_reason = tool_calls), not refuse (finish_reason = stop).
+        assert_eq!(
+            choice.finish_reason, "tool_calls",
+            "Model refused to use web_search. Thinking may not have been disabled. \
+             finish_reason={}, content={:?}",
+            choice.finish_reason,
+            choice.message.content_text()
+        );
+
+        assert!(
+            choice.message.tool_calls().is_some(),
+            "Expected tool_calls in response"
+        );
+
+        let tool_calls = choice.message.tool_calls().unwrap();
+        assert!(
+            tool_calls.iter().any(|tc| tc.function.name == "$web_search"),
+            "Expected $web_search in tool calls, got: {:?}",
+            tool_calls.iter().map(|tc| &tc.function.name).collect::<Vec<_>>()
+        );
     }
 }

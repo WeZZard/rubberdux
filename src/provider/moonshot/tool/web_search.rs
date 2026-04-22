@@ -30,7 +30,7 @@ impl WebSearchTool {
 
 impl Tool for WebSearchTool {
     fn name(&self) -> &str {
-        "web_search"
+        "$web_search"
     }
 
     fn definition(&self) -> ToolDefinition {
