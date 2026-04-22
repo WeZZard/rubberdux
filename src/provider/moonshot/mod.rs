@@ -3,6 +3,7 @@ pub mod tool;
 
 use serde::{Deserialize, Serialize};
 use tool::ToolCall;
+use unicode_segmentation::UnicodeSegmentation;
 
 #[cfg(feature = "host")]
 use crate::channel::interpreter::{Attachment, InterpretedMessage};
@@ -431,7 +432,8 @@ mod tests {
 
             if choice.finish_reason == "stop" {
                 let text = choice.message.content_text();
-                eprintln!("  STOPPED: {}", if text.len() > 120 { &text[..120] } else { text });
+                let stopped_preview: String = text.graphemes(true).take(120).collect();
+                eprintln!("  STOPPED: {}", stopped_preview);
                 break;
             }
 
@@ -556,7 +558,7 @@ mod tests {
             );
 
             if let Some(rc) = choice.message.reasoning_content() {
-                let rc_short = if rc.len() > 200 { &rc[..200] } else { rc };
+                let rc_short: String = rc.graphemes(true).take(200).collect();
                 eprintln!("  reasoning: {}...", rc_short);
             }
 
@@ -579,7 +581,7 @@ mod tests {
                 }
             } else {
                 let text = choice.message.content_text();
-                let short = if text.len() > 150 { &text[..150] } else { text };
+                let short: String = text.graphemes(true).take(150).collect();
                 eprintln!("  response: {}...", short);
             }
 
@@ -688,10 +690,12 @@ mod tests {
 
         eprintln!("\nStep 3: Model response (finish_reason={})", choice.finish_reason);
         if let Some(rc) = choice.message.reasoning_content() {
-            eprintln!("  reasoning: {}", if rc.len() > 300 { &rc[..300] } else { rc });
+            let rc_preview: String = rc.graphemes(true).take(300).collect();
+            eprintln!("  reasoning: {}", rc_preview);
         }
         let text = choice.message.content_text();
-        eprintln!("  content: {}", if text.len() > 300 { &text[..300] } else { text });
+        let text_preview: String = text.graphemes(true).take(300).collect();
+        eprintln!("  content: {}", text_preview);
 
         let new_tc = choice.message.tool_calls().map(|t| t.len()).unwrap_or(0);
         eprintln!("  new tool_calls: {}", new_tc);

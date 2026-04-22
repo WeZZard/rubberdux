@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/md-testing"]
+members = [".", "crates/md-testing", "xtask"]
 
 [package]
 name = "rubberdux"
@@ -45,6 +45,15 @@ tempfile = "3"
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["rt"] }
 md-testing = { path = "crates/md-testing" }
+unicode-segmentation = "1"
+spider = { version = "2", features = [
+    "chrome",
+    "chrome_stealth",
+    "chrome_intercept",
+    "chrome_headless_new",
+    "smart",
+    "sync"
+] }
 
 [dev-dependencies]
 wiremock = "0.6"

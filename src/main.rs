@@ -12,6 +12,7 @@ mod vm;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use unicode_segmentation::UnicodeSegmentation;
 
 #[cfg(feature = "host")]
 use teloxide::prelude::*;
@@ -80,7 +81,7 @@ async fn run_host() {
             // Send to the chat. For now, use a hardcoded chat approach.
             // The proper approach would be to track chat_id from the
             // incoming message and route back. This is a placeholder.
-            let preview = response.text.chars().take(100).collect::<String>();
+            let preview: String = response.text.graphemes(true).take(100).collect();
             log::info!("Agent response: {}", preview);
         }
     });

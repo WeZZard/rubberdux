@@ -2,13 +2,13 @@
   "type": "function",
   "function": {
     "name": "web_fetch",
-    "description": "Fetch the content of a web page URL and return it as markdown. Uses a headless browser to render JavaScript-heavy pages. This tool runs in the background — the result will be delivered automatically when ready. Respond to the user acknowledging the request is being processed.",
+    "description": "Fetch the content of a web page URL and return it as markdown. Supports JavaScript rendering for dynamic pages via Chrome/Chromium. Automatically falls back to static fetch if JS rendering is unavailable.",
     "parameters": {
       "type": "object",
       "properties": {
         "url": {
           "type": "string",
-          "description": "The URL to fetch (must be a fully-formed URL with http:// or https://)"
+          "description": "The URL to fetch"
         }
       },
       "required": ["url"]
