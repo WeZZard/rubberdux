@@ -4,6 +4,7 @@ pub mod tool;
 use serde::{Deserialize, Serialize};
 use tool::ToolCall;
 
+#[cfg(feature = "host")]
 use crate::channel::interpreter::{Attachment, InterpretedMessage};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +93,7 @@ impl Message {
         }
     }
 
+    #[cfg(feature = "host")]
     pub fn from_interpreted(interpreted: &InterpretedMessage) -> Self {
         if interpreted.attachments.is_empty() {
             return Message::User {

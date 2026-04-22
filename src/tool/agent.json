@@ -2,14 +2,14 @@
   "type": "function",
   "function": {
     "name": "agent",
-    "description": "Launch a subagent to handle a task autonomously. Choose the lightest subagent type that can accomplish the task.\n\n- **explore**: Read-only. Code search, finding definitions, tracing call chains.\n- **plan**: Read-only. Design implementation plans, analyze tradeoffs.\n- **general_purpose**: Full access. Write code, run builds, execute tests.\n\nDo not call this tool more than once for the same task — one agent per task is sufficient.",
+    "description": "Launch a subagent to handle a task autonomously. Choose the lightest subagent type that can accomplish the task.\n\n- **explore**: Read-only. Code search, finding definitions, tracing call chains.\n- **plan**: Read-only. Design implementation plans, analyze tradeoffs.\n- **general_purpose**: Full access. Write code, run builds, execute tests.\n- **computer_use**: Isolated GUI automation. Runs in a dedicated VM and may open apps, move the mouse, and send keys.\n\nDo not call this tool more than once for the same task — one agent per task is sufficient.",
     "parameters": {
       "type": "object",
       "properties": {
         "subagent_type": {
           "type": "string",
-          "enum": ["explore", "plan", "general_purpose"],
-          "description": "The subagent execution strategy. Use 'explore' for read-only code search, 'plan' for read-only planning, 'general_purpose' for full tool access."
+          "enum": ["explore", "plan", "general_purpose", "computer_use"],
+          "description": "The subagent execution strategy. Use 'explore' for read-only code search, 'plan' for read-only planning, 'general_purpose' for full tool access, 'computer_use' for isolated GUI automation."
         },
         "prompt": {
           "type": "string",

@@ -1,0 +1,7 @@
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+
+[env]
+MD_TESTING_LLM_BASE_URL = "http://localhost:8080/v1"
+MD_TESTING_LLM_API_KEY = "unused"
+MD_TESTING_LLM_MODEL = "mlx-community/Qwen3.6-35B-A3B-4bit"

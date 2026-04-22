@@ -11,19 +11,28 @@ pub struct VMImage {
     pub name: &'static str,
     pub oci_image: &'static str,
     pub base_vm_name: &'static str,
+    pub is_linux: bool,
 }
 
-/// All supported macOS images.
+/// All supported VM images.
 pub const AVAILABLE_IMAGES: &[VMImage] = &[
     VMImage {
         name: "macos15",
         oci_image: "ghcr.io/cirruslabs/macos-sequoia-xcode:latest",
-        base_vm_name: "rubberdux-base-macos15",
+        base_vm_name: "rubberdux-base-macos15-release",
+        is_linux: false,
     },
     VMImage {
         name: "macos26",
         oci_image: "ghcr.io/cirruslabs/macos-tahoe-xcode:latest",
-        base_vm_name: "rubberdux-base-macos26",
+        base_vm_name: "rubberdux-base-macos26-release",
+        is_linux: false,
+    },
+    VMImage {
+        name: "ubuntu24",
+        oci_image: "ghcr.io/cirruslabs/ubuntu:24.04",
+        base_vm_name: "rubberdux-base-ubuntu24-release",
+        is_linux: true,
     },
 ];
 
@@ -204,7 +213,9 @@ fn check_ssh_key() -> PrereqCheck {
 // ---------------------------------------------------------------------------
 
 /// Run setup for a specific image, or all images if None.
-pub async fn run_setup(image_name: Option<&str>) -> Result<(), Error> {
+/// When `if_needed` is true, skip images whose base VM already exists and whose
+/// provisioning hash (software.sh + agent binary) has not changed.
+pub async fn run_setup(image_name: Option<&str>, if_needed: bool) -> Result<(), Error> {
     println!("Rubberdux VM Setup\n");
 
     // Resolve which images to provision
@@ -277,6 +288,31 @@ pub async fn run_setup(image_name: Option<&str>) -> Result<(), Error> {
             .map(|o| o.status.success())
             .unwrap_or(false);
 
+        // Check if base VM already exists and is up to date
+        if if_needed {
+            let base_exists = Command::new("tart")
+                .args(["get", image.base_vm_name])
+                .output()
+                .await
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if base_exists {
+                match compute_provision_hash(image) {
+                    Ok(current_hash) => {
+                        let stored_hash = read_stored_hash(image.base_vm_name);
+                        if stored_hash.as_ref() == Some(&current_hash) {
+                            println!(
+                                "{} {} — up to date (hash matches)", step, image.base_vm_name);
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        println!("       Warning: could not compute hash: {}", e);
+                    }
+                }
+            }
+        }
+
         if !oci_exists {
             println!("{} Pulling {}...", step, image.oci_image);
             println!("       (this may take 20-40 minutes on first run)");
@@ -327,9 +363,12 @@ async fn provision_base_vm(image: &VMImage) -> Result<(), Error> {
         return Err(Error::Vm("tart clone failed".into()));
     }
 
-    // Set VM resources: match host CPU, 5/8 of host memory
-    let cpu_count = num_cpus();
-    let mem_mb = (total_memory_mb() * 5) / 8;
+    // Set VM resources: conservative defaults to avoid host contention.
+    // When running 2 VMs side-by-side, macOS enforces a hard limit of 2
+    // concurrent VMs and scarce IP slots.  6 CPUs / 8 GB is a safe default
+    // that leaves headroom for the host.
+    let cpu_count = std::cmp::min(num_cpus(), 6);
+    let mem_mb = std::cmp::min((total_memory_mb() * 5) / 8, 8192);
     println!(
         "       Configuring VM: {} CPUs, {} MB RAM...",
         cpu_count, mem_mb
@@ -344,6 +383,13 @@ async fn provision_base_vm(image: &VMImage) -> Result<(), Error> {
         .status()
         .await;
 
+    if image.is_linux {
+        let _ = Command::new("tart")
+            .args(["set", &tmp_name, "--disk-size", "50"])
+            .status()
+            .await;
+    }
+
     // Boot the VM, run provisioning via shared directory, then stop
     println!("       Booting VM for provisioning...");
     let provision_dir = provision_dir();
@@ -353,6 +399,10 @@ async fn provision_base_vm(image: &VMImage) -> Result<(), Error> {
     let install_script = include_str!("guest/install.sh");
     tokio::fs::write(provision_dir.join("install.sh"), install_script).await?;
 
+    // Write the software provisioning script
+    let software_script = include_str!("guest/software.sh");
+    tokio::fs::write(provision_dir.join("software.sh"), software_script).await?;
+
     // Write the SSH public key
     let pub_key_path = ssh_key_path().with_extension("pub");
     if pub_key_path.exists() {
@@ -361,9 +411,26 @@ async fn provision_base_vm(image: &VMImage) -> Result<(), Error> {
     }
 
     // Copy rubberdux binary to provision directory
-    let exe_path = std::env::current_exe()
-        .map_err(|e| Error::Vm(format!("failed to get current exe: {}", e)))?;
-    tokio::fs::copy(&exe_path, provision_dir.join("rubberdux")).await?;
+    if image.is_linux {
+        let linux_binary = std::env::current_dir()
+            .unwrap_or_default()
+            .join("target")
+            .join("aarch64-unknown-linux-musl")
+            .join("release")
+            .join("rubberdux");
+        if !linux_binary.exists() {
+            return Err(Error::Vm(format!(
+                "Linux agent binary not found at {}. Build it with:\n\
+                cargo build --no-default-features --features agent --target aarch64-unknown-linux-musl --release",
+                linux_binary.display()
+            )));
+        }
+        tokio::fs::copy(&linux_binary, provision_dir.join("rubberdux")).await?;
+    } else {
+        let exe_path = std::env::current_exe()
+            .map_err(|e| Error::Vm(format!("failed to get current exe: {}", e)))?;
+        tokio::fs::copy(&exe_path, provision_dir.join("rubberdux")).await?;
+    }
 
     // Start VM with shared directory
     let share_arg = format!("__provision:{}", provision_dir.display());
@@ -386,6 +453,11 @@ async fn provision_base_vm(image: &VMImage) -> Result<(), Error> {
     // Run install script inside VM via SSH
     // The default user on cirruslabs images is 'admin' with password 'admin'
     println!("       Running install script inside VM...");
+    let remote_cmd = if image.is_linux {
+        "sudo mkdir -p /mnt/shared && (sudo mount -t virtiofs com.apple.virtio-fs.automount /mnt/shared 2>/dev/null || true) && bash /mnt/shared/__provision/install.sh".to_string()
+    } else {
+        "bash '/Volumes/My Shared Files/__provision/install.sh'".to_string()
+    };
     let install_result = Command::new("sshpass")
         .args([
             "-p", "admin",
@@ -393,7 +465,7 @@ async fn provision_base_vm(image: &VMImage) -> Result<(), Error> {
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
             &format!("admin@{}", ip),
-            "bash '/Volumes/My Shared Files/__provision/install.sh'",
+            &remote_cmd,
         ])
         .output()
         .await
@@ -423,8 +495,75 @@ async fn provision_base_vm(image: &VMImage) -> Result<(), Error> {
         .status()
         .await;
 
+    // Write provisioning hash so future --if-needed runs can skip
+    if let Ok(hash) = compute_provision_hash(image) {
+        let _ = write_stored_hash(image.base_vm_name, &hash);
+    }
+
     println!("       Base VM '{}' ready.", image.base_vm_name);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Hash-based incremental rebuild helpers
+// ---------------------------------------------------------------------------
+
+fn provision_hash_path(base_vm_name: &str) -> PathBuf {
+    provision_dir().join(format!("{}.hash", base_vm_name))
+}
+
+fn read_stored_hash(base_vm_name: &str) -> Option<String> {
+    let path = provision_hash_path(base_vm_name);
+    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+}
+
+fn write_stored_hash(base_vm_name: &str, hash: &str) -> Result<(), Error> {
+    let path = provision_hash_path(base_vm_name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Vm(format!("failed to create provision dir: {}", e)))?;
+    }
+    std::fs::write(&path, hash)
+        .map_err(|e| Error::Vm(format!("failed to write hash file: {}", e)))?;
+    Ok(())
+}
+
+fn compute_provision_hash(image: &VMImage) -> Result<String, Error> {
+    use std::io::Read;
+
+    let mut hasher = sha256_hasher();
+
+    // Hash software.sh contents
+    let software_script = include_str!("guest/software.sh");
+    hasher.update(software_script.as_bytes());
+
+    // Hash agent binary
+    let binary_path = if image.is_linux {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join("target")
+            .join("aarch64-unknown-linux-musl")
+            .join("release")
+            .join("rubberdux")
+    } else {
+        std::env::current_exe()
+            .map_err(|e| Error::Vm(format!("failed to get current exe: {}", e)))?
+    };
+
+    let mut file = std::fs::File::open(&binary_path)
+        .map_err(|e| Error::Vm(format!("failed to open binary {}: {}", binary_path.display(), e)))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .map_err(|e| Error::Vm(format!("failed to read binary {}: {}", binary_path.display(), e)))?;
+    hasher.update(&buf);
+
+    Ok(hex::encode(hasher.finalize()))
+}
+
+use sha2::Digest;
+
+fn sha256_hasher() -> sha2::Sha256 {
+    sha2::Sha256::new()
 }
 
 // ---------------------------------------------------------------------------

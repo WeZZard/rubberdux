@@ -34,6 +34,7 @@ pub fn subagent_preamble(subagent_type: crate::tool::SubagentType) -> &'static s
         SubagentType::Explore => include_str!("agents/EXPLORE_PREAMBLE.md"),
         SubagentType::Plan => include_str!("agents/PLAN_PREAMBLE.md"),
         SubagentType::GeneralPurpose => include_str!("agents/GP_PREAMBLE.md"),
+        SubagentType::ComputerUse => include_str!("agents/COMPUTER_USE_PREAMBLE.md"),
     }
 }
 
@@ -44,7 +45,7 @@ mod tests {
 
     #[test]
     fn test_preambles_non_empty() {
-        for ty in [SubagentType::Explore, SubagentType::Plan, SubagentType::GeneralPurpose] {
+        for ty in [SubagentType::Explore, SubagentType::Plan, SubagentType::GeneralPurpose, SubagentType::ComputerUse] {
             let preamble = subagent_preamble(ty);
             assert!(!preamble.trim().is_empty(), "{:?} preamble should be non-empty", ty);
         }
@@ -55,9 +56,13 @@ mod tests {
         let explore = subagent_preamble(SubagentType::Explore);
         let plan = subagent_preamble(SubagentType::Plan);
         let gp = subagent_preamble(SubagentType::GeneralPurpose);
+        let cu = subagent_preamble(SubagentType::ComputerUse);
         assert_ne!(explore, plan, "Explore and Plan preambles must differ");
         assert_ne!(explore, gp, "Explore and GeneralPurpose preambles must differ");
         assert_ne!(plan, gp, "Plan and GeneralPurpose preambles must differ");
+        assert_ne!(cu, explore, "ComputerUse and Explore preambles must differ");
+        assert_ne!(cu, plan, "ComputerUse and Plan preambles must differ");
+        assert_ne!(cu, gp, "ComputerUse and GeneralPurpose preambles must differ");
     }
 }
 

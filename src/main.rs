@@ -1,14 +1,19 @@
 mod agent;
+#[cfg(feature = "host")]
 mod channel;
 mod error;
+#[cfg(feature = "host")]
 mod host;
 mod hardened_prompts;
+mod protocol;
 mod provider;
 mod tool;
 mod vm;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(feature = "host")]
 use teloxide::prelude::*;
 
 #[tokio::main]
@@ -20,30 +25,7 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
 
-    if args.iter().any(|a| a == "setup") {
-        if args.iter().any(|a| a == "--check") {
-            let checks = vm::setup::check_prerequisites().await;
-            vm::setup::print_prerequisites(&checks);
-        } else {
-            // Get optional image name: `rubberdux setup macos15` or `rubberdux setup` (all)
-            let image_name = args
-                .iter()
-                .position(|a| a == "setup")
-                .and_then(|i| args.get(i + 1))
-                .filter(|s| !s.starts_with('-'))
-                .map(|s| s.as_str());
-
-            if let Err(e) = vm::setup::run_setup(image_name).await {
-                log::error!("Setup failed: {}", e);
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
-
-    if args.iter().any(|a| a == "--host") {
-        run_host().await;
-    } else if args.iter().any(|a| a == "--agent") {
+    if args.iter().any(|a| a == "--agent") {
         let rpc_host = args
             .iter()
             .position(|a| a == "--rpc-host")
@@ -59,12 +41,21 @@ async fn main() {
 
         run_agent(&rpc_host, task_id.as_deref()).await;
     } else {
-        // Legacy mode: run the original in-process Telegram + AgentLoop
-        run_legacy().await;
+        #[cfg(feature = "host")]
+        {
+            // Default: host mode (manage VMs + bridge Telegram)
+            run_host().await;
+        }
+        #[cfg(not(feature = "host"))]
+        {
+            log::error!("Host mode requires the 'host' feature. Use --agent for agent mode.");
+            std::process::exit(1);
+        }
     }
 }
 
 /// Host mode: thin proxy that manages VMs and bridges Telegram.
+#[cfg(feature = "host")]
 async fn run_host() {
     log::info!("Starting rubberdux in HOST mode...");
 
@@ -99,7 +90,8 @@ async fn run_host() {
     });
 
     let host_task = tokio::spawn(async move {
-        host::run(event_rx, response_tx).await;
+        let host_config = host::HostConfig::from_env();
+        host::run(host_config, event_rx, response_tx).await;
     });
 
     tokio::select! {
@@ -118,19 +110,73 @@ async fn run_agent(rpc_host: &str, task_id: Option<&str>) {
 
     let prompt_dir = hardened_prompts::prompt_dir();
     let prompt_parts = hardened_prompts::load_prompt_parts(&prompt_dir);
-    let system_prompt = hardened_prompts::compose_system_prompt(&prompt_parts, None);
+    let mut system_prompt = hardened_prompts::compose_system_prompt(&prompt_parts, None);
+
+    // If this is a child VM, prepend the subagent-specific preamble if available.
+    if task_id.is_some() {
+        let share_dir = vm_share_dir();
+        let subagent_type_path = format!("{}/subagent_type.txt", share_dir);
+        if let Ok(contents) = tokio::fs::read_to_string(&subagent_type_path).await {
+            let trimmed = contents.trim();
+            if let Ok(subagent_type) =
+                serde_json::from_value::<crate::tool::SubagentType>(serde_json::json!(trimmed))
+            {
+                system_prompt = format!(
+                    "{}\n\n{}",
+                    hardened_prompts::subagent_preamble(subagent_type),
+                    system_prompt
+                );
+            } else {
+                log::warn!("Unrecognized subagent_type in {}: {}", subagent_type_path, trimmed);
+            }
+        }
+    }
 
     let client = Arc::new(provider::moonshot::MoonshotClient::from_env());
 
-    // Connect to host RPC
-    let stream = match tokio::net::TcpStream::connect(rpc_host).await {
-        Ok(s) => {
-            log::info!("Connected to host RPC at {}", rpc_host);
-            s
+    // Determine persistent data directory (set up by host via symlink)
+    let data_dir = std::env::var("RUBBERDUX_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/rubberdux-data"));
+
+    let sessions_dir = data_dir.join("sessions");
+    let tool_results_dir = data_dir.join("tool-results");
+    let subagents_dir = data_dir.join("subagents");
+
+    tokio::fs::create_dir_all(&sessions_dir).await.ok();
+    tokio::fs::create_dir_all(&tool_results_dir).await.ok();
+    tokio::fs::create_dir_all(&subagents_dir).await.ok();
+
+    let session_file = if let Some(tid) = task_id {
+        format!("{}.jsonl", tid)
+    } else {
+        "session.jsonl".to_string()
+    };
+    let session_path = sessions_dir.join(session_file);
+
+    // Connect to host RPC with retries to tolerate NAT startup on child VMs.
+    let stream = {
+        let mut last_err = None;
+        let mut stream = None;
+        for attempt in 0..30 {
+            match tokio::net::TcpStream::connect(rpc_host).await {
+                Ok(s) => {
+                    log::info!("Connected to host RPC at {} after {} attempts", rpc_host, attempt + 1);
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
         }
-        Err(e) => {
-            log::error!("Failed to connect to host RPC at {}: {}", rpc_host, e);
-            return;
+        match stream {
+            Some(s) => s,
+            None => {
+                log::error!("Failed to connect to host RPC at {}: {}", rpc_host, last_err.unwrap());
+                return;
+            }
         }
     };
 
@@ -175,15 +221,19 @@ async fn run_agent(rpc_host: &str, task_id: Option<&str>) {
             last_user_query.clone(),
         )));
 
-        let subagent_registries = build_subagent_registries(&client, &last_user_query);
-        r.register(Box::new(AgentTool::new(
-            client.clone(),
-            subagent_registries,
-            system_prompt.clone(),
-            context_tx.clone(),
-            Some(rpc_writer.clone()),
-            None,
-        )));
+        // Only the main VM gets the agent tool (and ability to spawn child VMs).
+        // Child VMs (task_id is Some) are single-purpose and should not recurse.
+        if task_id.is_none() {
+            let subagent_registries = build_subagent_registries(&client, &last_user_query);
+            r.register(Box::new(AgentTool::new(
+                client.clone(),
+                subagent_registries,
+                system_prompt.clone(),
+                context_tx.clone(),
+                Some(rpc_writer.clone()),
+                Some(subagents_dir),
+            )));
+        }
 
         r
     };
@@ -192,8 +242,8 @@ async fn run_agent(rpc_host: &str, task_id: Option<&str>) {
         client,
         registry: Arc::new(registry),
         system_prompt,
-        session_path: None,
-        tool_results_dir: None,
+        session_path: Some(session_path),
+        tool_results_dir: Some(tool_results_dir),
         token_budget: 153_600,
         cancel: cancel.clone(),
         compaction: Box::new(EvictOldestTurns),
@@ -207,8 +257,8 @@ async fn run_agent(rpc_host: &str, task_id: Option<&str>) {
     let input_for_rpc = input_port.clone();
     tokio::spawn(async move {
         loop {
-            let msg: Option<vm::rpc::HostToAgent> =
-                match vm::rpc::read_message(&mut rpc_reader).await {
+            let msg: Option<protocol::HostToAgent> =
+                match protocol::read_message(&mut rpc_reader).await {
                     Ok(m) => m,
                     Err(e) => {
                         log::error!("RPC read error: {}", e);
@@ -217,10 +267,11 @@ async fn run_agent(rpc_host: &str, task_id: Option<&str>) {
                 };
 
             match msg {
-                Some(vm::rpc::HostToAgent::UserMessage {
+                Some(protocol::HostToAgent::UserMessage {
                     text,
                     telegram_message_id,
                 }) => {
+                    log::info!("Agent received UserMessage from host: msg_id={:?}, text_len={}", telegram_message_id, text.len());
                     let message = Message::User {
                         content: UserContent::Text(text),
                     };
@@ -229,8 +280,10 @@ async fn run_agent(rpc_host: &str, task_id: Option<&str>) {
                     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<LoopOutput>(8);
                     let w = writer_for_rpc.clone();
                     tokio::spawn(async move {
+                        log::info!("Reply channel task started for msg_id={:?}", telegram_message_id);
                         while let Some(output) = reply_rx.recv().await {
-                            let msg = vm::rpc::AgentToHost::Response {
+                            log::info!("Agent received output from reply channel: entry_id={}, is_final={}, text_len={}", output.entry_id, output.is_final, output.text.len());
+                            let msg = protocol::AgentToHost::Response {
                                 text: output.text,
                                 entry_id: output.entry_id,
                                 is_final: output.is_final,
@@ -240,9 +293,12 @@ async fn run_agent(rpc_host: &str, task_id: Option<&str>) {
                                     .map(|m| *m),
                             };
                             let mut writer = w.lock().await;
-                            if let Err(e) = vm::rpc::write_message(&mut writer, &msg).await {
-                                log::error!("Failed to send response to host: {}", e);
-                                break;
+                            match protocol::write_message(&mut writer, &msg).await {
+                                Ok(_) => log::info!("Response sent to host successfully"),
+                                Err(e) => {
+                                    log::error!("Failed to send response to host: {}", e);
+                                    break;
+                                }
                             }
                         }
                     });
@@ -261,34 +317,77 @@ async fn run_agent(rpc_host: &str, task_id: Option<&str>) {
                         break;
                     }
                 }
-                Some(vm::rpc::HostToAgent::VMCompleted { task_id, result }) => {
-                    // Inject as a user message so the AgentLoop sees the result
+                Some(protocol::HostToAgent::VMCompleted { task_id, result }) => {
+                    // Inject as a user message with a reply channel so the AgentLoop
+                    // makes a new LLM call and sends the response back to the host.
                     let message = Message::User {
                         content: UserContent::Text(format!(
                             "[VM agent {} completed. This is a VM subagent result — the user has not seen this content. Decide whether and how to present it based on the original request.]\n{}",
                             task_id, result
                         )),
                     };
+                    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<LoopOutput>(8);
+                    let w = writer_for_rpc.clone();
+                    tokio::spawn(async move {
+                        while let Some(output) = reply_rx.recv().await {
+                            let msg = protocol::AgentToHost::Response {
+                                text: output.text,
+                                entry_id: output.entry_id,
+                                is_final: output.is_final,
+                                reply_to_message_id: None,
+                            };
+                            let mut writer = w.lock().await;
+                            if let Err(e) = protocol::write_message(&mut writer, &msg).await {
+                                log::error!("Failed to send VM follow-up to host: {}", e);
+                                break;
+                            }
+                        }
+                    });
                     use crate::agent::runtime::port::LoopEvent;
-                    let event = LoopEvent::ContextUpdate(message);
+                    let event = LoopEvent::UserMessage {
+                        message,
+                        reply: Some(reply_tx),
+                        metadata: None,
+                    };
                     if input_for_rpc.send(event).await.is_err() {
                         break;
                     }
                 }
-                Some(vm::rpc::HostToAgent::VMFailed { task_id, error }) => {
+                Some(protocol::HostToAgent::VMFailed { task_id, error }) => {
                     let message = Message::User {
                         content: UserContent::Text(format!(
                             "[VM agent {} failed: {}]",
                             task_id, error
                         )),
                     };
+                    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<LoopOutput>(8);
+                    let w = writer_for_rpc.clone();
+                    tokio::spawn(async move {
+                        while let Some(output) = reply_rx.recv().await {
+                            let msg = protocol::AgentToHost::Response {
+                                text: output.text,
+                                entry_id: output.entry_id,
+                                is_final: output.is_final,
+                                reply_to_message_id: None,
+                            };
+                            let mut writer = w.lock().await;
+                            if let Err(e) = protocol::write_message(&mut writer, &msg).await {
+                                log::error!("Failed to send VM failure follow-up to host: {}", e);
+                                break;
+                            }
+                        }
+                    });
                     use crate::agent::runtime::port::LoopEvent;
-                    let event = LoopEvent::ContextUpdate(message);
+                    let event = LoopEvent::UserMessage {
+                        message,
+                        reply: Some(reply_tx),
+                        metadata: None,
+                    };
                     if input_for_rpc.send(event).await.is_err() {
                         break;
                     }
                 }
-                Some(vm::rpc::HostToAgent::Shutdown) => {
+                Some(protocol::HostToAgent::Shutdown) => {
                     log::info!("Host requested shutdown");
                     cancel.cancel();
                     break;
@@ -305,8 +404,8 @@ async fn run_agent(rpc_host: &str, task_id: Option<&str>) {
     // If this is a task agent (child VM), read prompt from share and auto-run
     if let Some(tid) = task_id {
         // Read prompt from shared directory
-        let prompt_path = "/Volumes/My Shared Files/share/prompt.txt";
-        match tokio::fs::read_to_string(prompt_path).await {
+        let prompt_path = format!("{}/prompt.txt", vm_share_dir());
+        match tokio::fs::read_to_string(&prompt_path).await {
             Ok(prompt) => {
                 let message = Message::User {
                     content: UserContent::Text(prompt),
@@ -315,14 +414,14 @@ async fn run_agent(rpc_host: &str, task_id: Option<&str>) {
                 let w = rpc_writer.clone();
                 tokio::spawn(async move {
                     while let Some(output) = reply_rx.recv().await {
-                        let msg = vm::rpc::AgentToHost::Response {
+                        let msg = protocol::AgentToHost::Response {
                             text: output.text,
                             entry_id: output.entry_id,
                             is_final: output.is_final,
                             reply_to_message_id: None,
                         };
                         let mut writer = w.lock().await;
-                        let _ = vm::rpc::write_message(&mut writer, &msg).await;
+                        let _ = protocol::write_message(&mut writer, &msg).await;
                     }
                 });
 
@@ -348,28 +447,20 @@ async fn run_agent(rpc_host: &str, task_id: Option<&str>) {
     }
 }
 
-/// Legacy mode: original in-process Telegram + AgentLoop.
-async fn run_legacy() {
-    log::info!("Starting rubberdux (legacy mode)...");
-
-    let prompt_dir = hardened_prompts::prompt_dir();
-    let prompt_parts = hardened_prompts::load_prompt_parts(&prompt_dir);
-
-    let channel_partial = channel::adapter::telegram::channel_prompt();
-    let system_prompt = hardened_prompts::compose_system_prompt(&prompt_parts, Some(channel_partial));
-    log::info!("Composed system prompt ({} chars)", system_prompt.len());
-
-    let client = Arc::new(provider::moonshot::MoonshotClient::from_env());
-    log::info!("Moonshot client initialized (model: {})", client.model());
-
-    let (tx, rx) = tokio::sync::mpsc::channel(32);
-
-    tokio::spawn(agent::runtime::chat::run(rx, client, system_prompt));
-
-    let bot_token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_else(|_| {
-        log::error!("TELEGRAM_BOT_TOKEN is not set");
-        std::process::exit(1);
-    });
-    let bot = Bot::new(bot_token);
-    channel::adapter::telegram::run(bot, tx).await;
+/// Returns the Tart shared-directory path inside the VM.
+#[cfg(target_os = "macos")]
+fn vm_share_dir() -> &'static str {
+    "/Volumes/My Shared Files/share"
 }
+
+#[cfg(target_os = "linux")]
+fn vm_share_dir() -> &'static str {
+    "/mnt/shared/share"
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn vm_share_dir() -> &'static str {
+    "/mnt/shared/share"
+}
+
+

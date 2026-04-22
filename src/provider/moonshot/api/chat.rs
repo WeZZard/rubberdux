@@ -8,7 +8,7 @@ pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
+    pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,7 +78,7 @@ impl MoonshotClient {
         let request = ChatRequest {
             model: self.model().to_owned(),
             messages,
-            temperature: None,
+            temperature: Some(0.6),
             max_completion_tokens: None,
             tools,
             response_format: None,
@@ -86,10 +86,7 @@ impl MoonshotClient {
         };
 
         if let Ok(json) = serde_json::to_string(&request) {
-            log::debug!("Chat API request tools: {}",
-                serde_json::to_string(&request.tools).unwrap_or_default());
-            log::debug!("Chat API request thinking: {}",
-                serde_json::to_string(&request.thinking).unwrap_or_default());
+            log::info!("Chat API request JSON: {}", json);
         }
 
         let response = self
@@ -156,7 +153,7 @@ mod tests {
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["model"], "kimi-for-coding");
         assert_eq!(json["messages"].as_array().unwrap().len(), 2);
-        // Optional fields should be absent
+        // Temperature should be absent when None
         assert!(json.get("temperature").is_none());
         assert!(json.get("tools").is_none());
         assert!(json.get("thinking").is_none());

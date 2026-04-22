@@ -15,7 +15,7 @@ use crate::provider::moonshot::tool::ToolDefinition;
 
 /// Subagent execution strategy. Determines the tool registry and
 /// execution environment for a spawned subagent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubagentType {
     /// Read-only. Code search, finding definitions, tracing call chains.
@@ -24,6 +24,9 @@ pub enum SubagentType {
     Plan,
     /// Full access. Write code, run builds, execute tests.
     GeneralPurpose,
+    /// Isolated GUI automation. May open apps, move the mouse, and send keys.
+    /// Runs inside a dedicated child VM for host safety.
+    ComputerUse,
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +249,12 @@ mod tests {
     fn test_subagent_type_deserialize_general_purpose() {
         let t: SubagentType = serde_json::from_str(r#""general_purpose""#).unwrap();
         assert_eq!(t, SubagentType::GeneralPurpose);
+    }
+
+    #[test]
+    fn test_subagent_type_deserialize_computer_use() {
+        let t: SubagentType = serde_json::from_str(r#""computer_use""#).unwrap();
+        assert_eq!(t, SubagentType::ComputerUse);
     }
 
     #[test]

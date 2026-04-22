@@ -49,6 +49,9 @@ struct ActiveConversation {
     first_bg_asst_entry_id: Option<usize>,
     /// Opaque metadata from the input source (e.g. telegram_message_id).
     metadata: Option<Box<dyn std::any::Any + Send>>,
+    /// The Telegram message ID this conversation is replying to.
+    /// Stored separately so it can be cloned for intermediate responses.
+    reply_to_message_id: Option<i32>,
     /// Whether this conversation was triggered by a task completion.
     is_child_completion: bool,
 }
@@ -106,6 +109,8 @@ pub struct AgentLoop {
     task_to_group: HashMap<String, usize>,
     active_conversation: Option<ActiveConversation>,
     active_child_cancels: Vec<CancellationToken>,
+    /// Messages that arrived while a turn was in progress.
+    pending_messages: Vec<(Message, Option<mpsc::Sender<LoopOutput>>, Option<Box<dyn std::any::Any + Send>>)>,
 }
 
 impl AgentLoop {
@@ -154,6 +159,7 @@ impl AgentLoop {
             task_to_group: HashMap::new(),
             active_conversation: None,
             active_child_cancels: Vec::new(),
+            pending_messages: Vec::new(),
         };
 
         let input_port = InputPort::new(input_tx);
@@ -291,37 +297,39 @@ impl AgentLoop {
                 metadata,
             } => {
                 let text_estimate = message.content_text().len();
-                if self.current_tokens > 0 {
-                    self.compaction.compact(
-                        &mut self.history,
-                        self.token_budget,
-                        self.current_tokens + text_estimate / 4,
-                    );
+
+                let _ = self.context_tx.send(ContextEvent::UserMessage(message.clone()));
+
+                if self.active_conversation.is_some() {
+                    // A turn is already in progress; queue this message for later.
+                    // Do NOT add to history yet — the LLM should only see this message
+                    // when we actually start processing it.
+                    log::info!("Queueing message while turn in progress (pending: {})", self.pending_messages.len() + 1);
+                    self.pending_messages.push((message, reply, metadata));
+                } else {
+                    if self.current_tokens > 0 {
+                        self.compaction.compact(
+                            &mut self.history,
+                            self.token_budget,
+                            self.current_tokens + text_estimate / 4,
+                        );
+                    }
+
+                    let entry_id = self.history.push_user(message.clone());
+                    self.persist_entry(entry_id);
+                    let reply_to = metadata
+                        .as_ref()
+                        .and_then(|m| m.downcast_ref::<i32>().copied());
+                    self.active_conversation = Some(ActiveConversation {
+                        reply,
+                        pending_task_ids: Vec::new(),
+                        first_bg_asst_entry_id: None,
+                        metadata,
+                        reply_to_message_id: reply_to,
+                        is_child_completion: false,
+                    });
+                    let _ = self.trampoline_tx.send(()).await;
                 }
-
-                let entry_id = self.history.push_user(message.clone());
-                self.persist_entry(entry_id);
-
-                let _ = self.context_tx.send(ContextEvent::UserMessage(message));
-
-                self.notify_entry(entry_id, false);
-
-                if reply.is_none() {
-                    return;
-                }
-
-                if let Some(prev) = self.active_conversation.take() {
-                    self.finalize_conversation(prev);
-                }
-
-                self.active_conversation = Some(ActiveConversation {
-                    reply,
-                    pending_task_ids: Vec::new(),
-                    first_bg_asst_entry_id: None,
-                    metadata,
-                    is_child_completion: false,
-                });
-                let _ = self.trampoline_tx.send(()).await;
             }
             LoopEvent::ContextUpdate(message) => {
                 let entry_id = self.history.push_user(message.clone());
@@ -405,11 +413,16 @@ impl AgentLoop {
         // don't overwrite it — the results are in history and the next
         // LLM turn will see them. Only create a new conversation if idle.
         if self.active_conversation.is_none() {
+            let reply_to = group
+                .metadata
+                .as_ref()
+                .and_then(|m| m.downcast_ref::<i32>().copied());
             self.active_conversation = Some(ActiveConversation {
                 reply: group.reply,
                 pending_task_ids: Vec::new(),
                 first_bg_asst_entry_id: None,
                 metadata: group.metadata,
+                reply_to_message_id: reply_to,
                 is_child_completion: true,
             });
             let _ = self.trampoline_tx.send(()).await;
@@ -422,6 +435,12 @@ impl AgentLoop {
 
     async fn drive_conversation(&mut self) {
         let turn_result = self.run_tool_turn().await;
+        log::info!(
+            "drive_conversation: turn_result={:?}, active_conversation={:?}, pending_messages={}",
+            turn_result.as_ref().map(|_| "Ok"),
+            self.active_conversation.as_ref().map(|c| c.reply_to_message_id),
+            self.pending_messages.len()
+        );
 
         match turn_result {
             Ok(TurnResult::Done { text, entry_id }) => {
@@ -432,7 +451,10 @@ impl AgentLoop {
 
                 if conv.pending_task_ids.is_empty() {
                     let is_final = self.active_groups.is_empty();
-                    Self::send_output(&conv.reply, text, entry_id, is_final, conv.metadata)
+                    let metadata: Option<Box<dyn std::any::Any + Send>> = conv
+                        .reply_to_message_id
+                        .map(|id| Box::new(id) as _);
+                    Self::send_output(&conv.reply, text, entry_id, is_final, metadata)
                         .await;
                 } else {
                     // Distribute the reply channel to ALL active groups
@@ -448,10 +470,49 @@ impl AgentLoop {
                             group.metadata = conv.metadata.take();
                         }
                     }
-                    // Send non-final response (results still pending)
-                    Self::send_output(&conv.reply, text, entry_id, false, None).await;
+                    // Send non-final response (results still pending).
+                    // Preserve reply_to_message_id so the host can route back
+                    // to the correct Telegram message.
+                    let metadata: Option<Box<dyn std::any::Any + Send>> = conv
+                        .reply_to_message_id
+                        .map(|id| Box::new(id) as _);
+                    Self::send_output(&conv.reply, text, entry_id, false, metadata).await;
                 }
                 log::info!("LLM conversation completed");
+                // If there are pending messages, start the next turn.
+                if !self.pending_messages.is_empty() {
+                    let (message, reply, metadata) = self.pending_messages.remove(0);
+                    let text_estimate = message.content_text().len();
+                    log::info!(
+                        "Processing pending message: text_len={}, reply_to={:?}, history_size={}",
+                        text_estimate,
+                        metadata.as_ref().and_then(|m| m.downcast_ref::<i32>().copied()),
+                        self.history.len()
+                    );
+                    if self.current_tokens > 0 {
+                        self.compaction.compact(
+                            &mut self.history,
+                            self.token_budget,
+                            self.current_tokens + text_estimate / 4,
+                        );
+                    }
+                    let entry_id = self.history.push_user(message);
+                    self.persist_entry(entry_id);
+                    self.notify_entry(entry_id, false);
+                    let reply_to = metadata
+                        .as_ref()
+                        .and_then(|m| m.downcast_ref::<i32>().copied());
+                    self.active_conversation = Some(ActiveConversation {
+                        reply,
+                        pending_task_ids: Vec::new(),
+                        first_bg_asst_entry_id: None,
+                        metadata,
+                        reply_to_message_id: reply_to,
+                        is_child_completion: false,
+                    });
+                    let _ = self.trampoline_tx.send(()).await;
+                    log::info!("Started next turn from pending queue (remaining: {})", self.pending_messages.len());
+                }
             }
             Ok(TurnResult::Continue) => {
                 let _ = self.trampoline_tx.send(()).await;
@@ -499,7 +560,7 @@ impl AgentLoop {
                     format!("Sorry, I encountered an error: {}", e),
                     self.history.last_id().unwrap_or(0),
                     true,
-                    None,
+                    conv.metadata,
                 )
                 .await;
             }
@@ -674,8 +735,19 @@ impl AgentLoop {
         is_final: bool,
         metadata: Option<Box<dyn std::any::Any + Send>>,
     ) {
+        let reply_to = metadata.as_ref()
+            .and_then(|m| m.downcast_ref::<i32>().copied());
+        log::info!(
+            "send_output called: text_len={}, entry_id={}, is_final={}, reply_to={:?}, has_reply={}",
+            text.len(),
+            entry_id,
+            is_final,
+            reply_to,
+            reply.is_some()
+        );
         if let Some(tx) = reply {
             if !text.is_empty() || is_final {
+                log::info!("Sending output via reply channel");
                 let _ = tx
                     .send(LoopOutput {
                         text,
@@ -684,7 +756,11 @@ impl AgentLoop {
                         metadata,
                     })
                     .await;
+            } else {
+                log::info!("Skipping output: text empty and not final");
             }
+        } else {
+            log::warn!("send_output called but reply channel is None");
         }
     }
 

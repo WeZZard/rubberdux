@@ -36,7 +36,7 @@ echo "Build succeeded."
 
 # Launch as background process
 echo "Launching rubberdux (log: $LOG_FILE)..."
-nohup cargo run --release > "$LOG_FILE" 2>&1 &
+nohup cargo run --release -- --host > "$LOG_FILE" 2>&1 &
 CHILD_PID=$!
 echo "$CHILD_PID" > "$PID_FILE"
 echo "rubberdux started (PID $CHILD_PID)"
