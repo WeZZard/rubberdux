@@ -1,16 +1,19 @@
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use md_testing::{Message, UserContent, OrderingDirective};
-use md_testing::llm::{LlmClient, LlmError};
+use md_testing::llm::{ChatMessage, LlmClient, LlmError};
 use md_testing::evaluator::{AssertionEvaluator, Evaluatable};
 use md_testing::guidance::render_guidance;
 use md_testing::narration;
 use md_testing::ordering::{match_assistant_slots, MatchError};
 
-use super::harness::{build_system_prompt, ChannelHarness, Trajectory};
+use super::agent_loop_harness::AgentLoopHarness;
 
-/// Run all system test cases from `tests/system/cases/`.
+/// Run all integration test cases from the given directory.
+/// Only runs cases with `target: agent-loop`.
 pub async fn run() {
     dotenvy::dotenv().ok();
 
@@ -22,30 +25,25 @@ pub async fn run() {
 
     let evaluator = AssertionEvaluator::new(llm.clone())
         .with_model(&model)
-        .with_consistency_votes(3);
+        .with_consistency_votes(1);
 
     let cases_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
-        .join("system")
+        .join("integration")
         .join("cases");
     let cases = md_testing::discovery::discover_cases(&cases_dir);
     assert!(!cases.is_empty(), "No test cases found in {:?}", cases_dir);
 
     let (run_dir, run_timestamp) = artifact_run_dir();
     let system_prompt = build_system_prompt();
+    let mut failed_cases: Vec<String> = Vec::new();
 
-    for case in cases {
-        if case.front_matter.target != "telegram-channel" {
+    for case in &cases {
+        if case.front_matter.target != "agent-loop" {
             continue;
         }
 
-        // Skip tests that require VM features (not supported by ChannelHarness)
-        if case.front_matter.features.contains(&"vm".to_string()) {
-            println!("\n=== Skipping case: {} (requires VM) ===", case.name);
-            continue;
-        }
-
-        println!("\n=== Running case: {} ===", case.name);
+        println!("\n=== Running case: {} (agent-loop) ===", case.name);
 
         let case_dir = run_dir.join(&case.name);
         std::fs::create_dir_all(&case_dir).expect("failed to create artifact dir");
@@ -53,12 +51,12 @@ pub async fn run() {
         let session_dir = case_dir.join("session");
         std::fs::create_dir_all(&session_dir).expect("failed to create session dir");
         let session_path = session_dir.join("main-agent.jsonl");
-        let harness =
-            ChannelHarness::new(&system_prompt, session_path.clone()).await;
+
+        let harness = AgentLoopHarness::new(&system_prompt, session_path.clone()).await;
 
         let timeout = Duration::from_secs(case.front_matter.timeout.max(60));
 
-        let mut user_messages = Vec::new();
+        let mut user_messages: Vec<String> = Vec::new();
         let mut assistant_slots: Vec<(OrderingDirective, Vec<String>)> = Vec::new();
 
         for msg in case.messages.iter() {
@@ -70,7 +68,10 @@ pub async fn run() {
                             render_guidance(guidance, &llm, &model).await
                         }
                     };
+                    println!("  User: {}", text);
                     user_messages.push(text.clone());
+
+                    let _outputs = harness.send_message(&text, timeout).await;
                 }
                 Message::Assistant { directive, assertions } => {
                     assistant_slots.push((directive.clone(), assertions.clone()));
@@ -78,27 +79,23 @@ pub async fn run() {
             }
         }
 
-        let mut all_responses = Vec::new();
-        for text in &user_messages {
-            let responses = harness.send_message(text, timeout).await;
-            all_responses.extend(responses);
-        }
-
-        let trajectory = Trajectory {
+        let trajectory = IntegrationTrajectory {
             case_name: case.name.clone(),
             test_time: run_timestamp.clone(),
-            user_messages: user_messages.iter().map(|t| t.clone()).collect(),
-            responses: all_responses,
             session_path: session_path.clone(),
+            user_messages,
         };
 
         let narration_text = trajectory.format_for_eval();
         std::fs::write(session_dir.join("main-agent.md"), &narration_text)
             .expect("failed to write narration");
 
-        trajectory.write_subagent_narrations();
+        md_testing::narration::write_subagent_narrations(
+            &session_path,
+            &case.name,
+            &run_timestamp,
+        );
 
-        println!("  Received {} response(s)", trajectory.responses.len());
         println!("  Artifacts: {}", case_dir.display());
 
         // Count actual assistant messages from the session transcript.
@@ -115,7 +112,7 @@ pub async fn run() {
         let matched_indices = match match_assistant_slots(&directives, actual_assistant_count) {
             Ok(indices) => indices,
             Err(e) => {
-                eval_results.push_str(&format!("## Ordering Match Error\n\n{}\n\n", e));
+                eval_results.push_str(&format!("## Ordering Match Error\n\n{}}}\n\n", e));
                 println!("  Ordering match failed: {}", e);
                 all_passed = false;
                 Vec::new()
@@ -123,16 +120,14 @@ pub async fn run() {
         };
 
         for assertion in &case.storyline {
-            let result = evaluator.evaluate_storyline(&trajectory, assertion).await;
-
+            let result = evaluator
+                .evaluate_storyline(&trajectory, assertion)
+                .await;
             eval_results.push_str(&format!("## Storyline: {}\n", assertion));
             eval_results.push_str(&format!("- Passed: {}\n", result.passed));
             eval_results.push_str(&format!("- Reasoning: {}\n\n", result.reasoning));
-
             println!("  Storyline: {}", assertion);
             println!("    Passed: {}", result.passed);
-            println!("    Reasoning: {}", result.reasoning);
-
             if !result.passed {
                 all_passed = false;
             }
@@ -160,11 +155,8 @@ pub async fn run() {
                 eval_results.push_str(&format!("Assertion: {}\n", assertion));
                 eval_results.push_str(&format!("- Passed: {}\n", result.passed));
                 eval_results.push_str(&format!("- Reasoning: {}\n\n", result.reasoning));
-
                 println!("  Assistant Message {} (slot {}): {}", actual_idx.map(|i| i.to_string()).unwrap_or_else(|| "?".to_string()), slot_idx, assertion);
                 println!("    Passed: {}", result.passed);
-                println!("    Reasoning: {}", result.reasoning);
-
                 if !result.passed {
                     all_passed = false;
                 }
@@ -175,15 +167,51 @@ pub async fn run() {
             .expect("failed to write evaluation");
 
         if !all_passed {
-            eprintln!(
-                "\nFAILED: One or more assertions failed for case '{}'. See {}",
-                case.name,
-                case_dir.display()
-            );
+            failed_cases.push(case.name.clone());
         }
     }
 
-    println!("\n=== All cases completed. Artifacts: {} ===", run_dir.display());
+    if !failed_cases.is_empty() {
+        panic!(
+            "{} case(s) failed: {:?}. Artifacts: {}",
+            failed_cases.len(),
+            failed_cases,
+            run_dir.display()
+        );
+    }
+
+    println!("\n=== All {} cases passed. Artifacts: {} ===", cases.len(), run_dir.display());
+}
+
+/// Trajectory for integration tests (agent-loop, no channel responses).
+struct IntegrationTrajectory {
+    case_name: String,
+    test_time: String,
+    session_path: PathBuf,
+    user_messages: Vec<String>,
+}
+
+impl Evaluatable for IntegrationTrajectory {
+    fn format_for_eval(&self) -> String {
+        let mut s = String::new();
+
+        s.push_str("---\n");
+        s.push_str(&format!("testcase_name: {}\n", self.case_name));
+        s.push_str(&format!("test_time: {}\n", self.test_time));
+        s.push_str("---\n\n");
+
+        let title = narration::humanize_case_name(&self.case_name);
+        s.push_str(&format!("# Test Case: {}\n\n", title));
+
+        s.push_str("## User Messages\n\n");
+        for (i, msg) in self.user_messages.iter().enumerate() {
+            s.push_str(&format!("{}. {}\n\n", i + 1, msg));
+        }
+
+        narration::narrate_session(&self.session_path, &mut s);
+
+        s
+    }
 }
 
 /// LlmClient implementation for md-testing using MLX/local LLM env vars.
@@ -227,7 +255,7 @@ impl LlmClient for MlxLlmClient {
     fn chat_raw(
         &self,
         body: String,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, LlmError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<String, LlmError>> + Send + '_>> {
         let url = self.url("/chat/completions");
         let auth = self.auth_header();
         Box::pin(async move {
@@ -247,6 +275,13 @@ impl LlmClient for MlxLlmClient {
     }
 }
 
+/// Build the system prompt the same way production does.
+fn build_system_prompt() -> String {
+    let prompt_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
+    let parts = rubberdux::hardened_prompts::load_prompt_parts(&prompt_dir);
+    rubberdux::hardened_prompts::compose_system_prompt(&parts, None)
+}
+
 /// Create the artifact directory for this test run.
 fn artifact_run_dir() -> (PathBuf, String) {
     let secs = SystemTime::now()
@@ -264,7 +299,7 @@ fn artifact_run_dir() -> (PathBuf, String) {
         year, month, day, hours, minutes, seconds
     );
     let dir_name = format!(
-        "{:04}{:02}{:02}_{:02}{:02}{:02}-system",
+        "{:04}{:02}{:02}_{:02}{:02}{:02}-integration-testcases",
         year, month, day, hours, minutes, seconds
     );
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -1,5 +1,22 @@
 # CLAUDE.md
 
+## Glossary
+
+**Transcript:**
+
+`*.jsonl` file. Ecah line is a user or assistant message.
+
+**Narration:**
+
+`*.jsonl` file message contents formatted in markdown like:
+
+```markdown
+## User, YYYY-MM-DD, hh:mm:ss-Tz
+<!-- User message contents -->
+## Assistant, YYYY-MM-DD, hh:mm:ss-Tz
+<!-- Assistant message contents -->
+```
+
 ## Build & Run
 
 ```bash
@@ -9,9 +26,17 @@ cargo build --release # release build
 cargo test           # run tests
 cargo clippy         # lint
 
-# Run (requires TELEGRAM_BOT_TOKEN env var)
-TELEGRAM_BOT_TOKEN=<bot_token> cargo run
+# Run (requires TELEGRAM_BOT_TOKEN env var and Tart VM setup)
+TELEGRAM_BOT_TOKEN=<bot_token> RUBBERDUX_VM_IMAGE=macos26 cargo run -- --host
 ```
+
+## macOS VM Concurrency Limits
+
+- Apple Silicon Macs enforce a hard limit of **2 concurrent macOS VMs** via `Virtualization.framework`.
+- If a prior test run leaks a VM, the next run that needs a child VM will fail or time out because the slot is already consumed.
+- System tests call `cleanup_stale_vms()` before booting VMs, and the harness panics if any `rubberdux-*` VMs are still running after cleanup.
+- To run more than 2 VMs concurrently you must boot a **development kernel collection** with `hv_apple_isa_vm_quota` override (requires SIP disable, custom boot policy, and matching KDK from Apple). This is unsupported by Apple and breaks OS updates.
+- When running 2 VMs side-by-side, restrict resources per VM (e.g., 8 GB RAM and 6 CPUs) to avoid host contention and IP-timeout failures.
 
 ## Coding Conventions
 
@@ -99,10 +124,57 @@ Cross-cutting files that don't belong to a single domain sit at `src/` root.
 
 **Mock data policy:** Only unit tests may use mocked data. Integration tests, system tests, and end-to-end tests must use real model calls.
 
+### Test Case Naming Convention
+
+`.testcase.md` files follow the format:
+
+```
+{session_context}_{channel}_{direction}_{turn_type}_{purpose}.testcase.md
+```
+
+| Component | Abbreviation | Description |
+|-----------|-------------|-------------|
+| `session_context` | `new` / `existing` | Fresh session vs. with conversation history |
+| `channel` | `agent_loop` / `telegram` | Agent loop only / Telegram channel |
+| `direction` | `u2a` / `a2u` | User-to-assistant / Assistant-to-user |
+| `turn_type` | `1t` / `mt` | Single-turn / Multi-turn |
+| `purpose` | descriptive | What behavior the test verifies |
+
+**Examples:**
+- `new_agent_loop_u2a_1t_greeting.testcase.md` — Fresh session, agent loop, user sends greeting, single turn
+- `new_telegram_u2a_1t_greeting.testcase.md` — Fresh session, Telegram channel, user sends greeting, single turn
+- `existing_agent_loop_u2a_1t_session_continuation.testcase.md` — Existing session, agent loop, user continues conversation
+
 **End-to-end tests:** clarify processor arch (required), vendor (required), os (required), runtime environment (required) and locale (optional).
 <example>
   tests: `tests/e2e/{processor_arch}_{vendor}_{os}_{runtime_env}/{optional:locale}/{e2e_test_purpose}.rs`
 </example>
+
+### Ordering Directives in Test Cases
+
+Assistant message sections may carry an ordering directive as a prefix on the heading:
+
+```markdown
+## CHECK: Assistant Message
+<!-- assertion -->
+```
+
+- **`CHECK:`** — Matches this assistant message somewhere after the previous match. Gaps (unmatched assistant messages between expected slots) are allowed. The last expected slot is anchored to the last actual assistant message; any trailing assistant messages after the final expected slot cause the test to fail.
+- **Bare `## Assistant Message`** — Shorthand for `## CHECK: Assistant Message` (implicit CHECK).
+
+Only `CHECK:` is implemented. Unsupported directives (e.g. `CHECK-NEXT:`, `CHECK-DAG:`, `CHECK-NOT:`) are rejected at parse time.
+
+### Front Matter: `timeout`
+
+Each `.testcase.md` may specify a per-turn timeout in seconds:
+
+```yaml
+---
+timeout: 60
+---
+```
+
+Default is 60 seconds. Override when the test involves slow operations (tool calls, subagent dispatch, web search).
 
 ### Comment Scoping Rule
 
