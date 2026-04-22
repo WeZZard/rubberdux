@@ -37,7 +37,6 @@ pulldown-cmark = "0.13"
 telegram-markdown-v2 = "0.2"
 base64 = "0.22"
 htmd = "0.1"
-headless_chrome = "1"
 whisper-rs = { version = "0.13", optional = true }
 hound = "3"
 sha2 = "0.10"

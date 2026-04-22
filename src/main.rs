@@ -80,7 +80,8 @@ async fn run_host() {
             // Send to the chat. For now, use a hardcoded chat approach.
             // The proper approach would be to track chat_id from the
             // incoming message and route back. This is a placeholder.
-            log::info!("Agent response: {}", &response.text[..response.text.len().min(100)]);
+            let preview = response.text.chars().take(100).collect::<String>();
+            log::info!("Agent response: {}", preview);
         }
     });
 

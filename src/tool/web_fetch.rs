@@ -38,7 +38,7 @@ impl super::Tool for WebFetchTool {
 }
 
 const MAX_CONTENT_LENGTH: usize = 100_000;
-const PAGE_LOAD_TIMEOUT_SECS: u64 = 30;
+const FETCH_TIMEOUT_SECS: u64 = 30;
 
 pub async fn execute(args: &serde_json::Value) -> ToolOutcome {
     let url = match args["url"].as_str() {
@@ -63,8 +63,8 @@ pub async fn execute(args: &serde_json::Value) -> ToolOutcome {
     let path = output_path.clone();
     let tid = task_id.clone();
 
-    tokio::task::spawn_blocking(move || {
-        let content = match fetch_rendered(&url) {
+    tokio::spawn(async move {
+        let content = match fetch_url(&url).await {
             Ok(text) => text,
             Err(e) => format!("Failed to fetch {}: {}", url, e),
         };
@@ -84,32 +84,35 @@ pub async fn execute(args: &serde_json::Value) -> ToolOutcome {
     ToolOutcome::Background { task_id, output_path, receiver: rx }
 }
 
-fn fetch_rendered(url: &str) -> Result<String, String> {
-    let browser = headless_chrome::Browser::default()
-        .map_err(|e| format!("Failed to launch browser: {}", e))?;
+async fn fetch_url(url: &str) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-    let tab = browser
-        .new_tab()
-        .map_err(|e| format!("Failed to create tab: {}", e))?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch {}: {}", url, e))?;
 
-    tab.set_default_timeout(std::time::Duration::from_secs(PAGE_LOAD_TIMEOUT_SECS));
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {} for {}", status, url));
+    }
 
-    tab.navigate_to(url)
-        .map_err(|e| format!("Failed to navigate to {}: {}", url, e))?;
-
-    tab.wait_until_navigated()
-        .map_err(|e| format!("Navigation timeout for {}: {}", url, e))?;
-
-    let html = tab
-        .get_content()
-        .map_err(|e| format!("Failed to get page content: {}", e))?;
+    let html = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read response body from {}: {}", url, e))?;
 
     let markdown = htmd::convert(&html).unwrap_or_else(|_| html);
 
     if markdown.len() > MAX_CONTENT_LENGTH {
+        let truncated: String = markdown.chars().take(MAX_CONTENT_LENGTH).collect();
         Ok(format!(
             "{}\n\n[Content truncated at {} characters]",
-            &markdown[..MAX_CONTENT_LENGTH],
+            truncated,
             MAX_CONTENT_LENGTH
         ))
     } else {
