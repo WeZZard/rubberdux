@@ -132,7 +132,7 @@ mod tests {
     }
 
     fn temp_manager() -> (Arc<SessionManager>, crate::session::SessionId) {
-        let home = std::env::temp_dir().join(format!("rubberdux-test-{}", std::process::id()));
+        let home = tempfile::tempdir().unwrap().into_path();
         let mgr = Arc::new(SessionManager {
             home_dir: home.clone(),
             sessions_dir: home.join("sessions"),

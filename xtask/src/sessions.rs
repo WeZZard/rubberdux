@@ -29,7 +29,7 @@ pub fn list_sessions() {
         None
     };
     
-    let mut entries: Vec<_> = fs::read_dir(sessions_dir)
+    let mut entries: Vec<_> = fs::read_dir(&sessions_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
@@ -46,7 +46,7 @@ pub fn list_sessions() {
     println!("Sessions:");
     for entry in entries {
         let is_latest = latest.as_ref()
-            .map(|l| l.file_name().map(|n| n == entry).unwrap_or(false))
+            .map(|l| l.file_name().map(|n| n.to_string_lossy() == entry).unwrap_or(false))
             .unwrap_or(false);
         
         let marker = if is_latest { " (latest)" } else { "" };
@@ -117,7 +117,7 @@ pub fn clear_sessions() {
         None
     };
     
-    let entries: Vec<_> = fs::read_dir(sessions_dir)
+    let entries: Vec<_> = fs::read_dir(&sessions_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))

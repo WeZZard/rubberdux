@@ -12,13 +12,12 @@ impl SessionId {
     }
 
     pub fn to_string(&self) -> String {
-        self.0.format("%Y-%m-%d-%H-%M-%S-%Z").to_string()
+        self.0.format("%Y-%m-%d-%H-%M-%S-UTC").to_string()
     }
 
     pub fn from_string(s: &str) -> Option<Self> {
-        chrono::DateTime::parse_from_str(s, "%Y-%m-%d-%H-%M-%S-%Z")
-            .ok()
-            .map(|dt| Self(dt.with_timezone(&chrono::Utc)))
+        let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d-%H-%M-%S-UTC").ok()?;
+        Some(Self(chrono::DateTime::from_naive_utc_and_offset(naive, chrono::Utc)))
     }
 }
 
@@ -247,7 +246,11 @@ mod tests {
     use std::env;
 
     fn temp_home() -> PathBuf {
-        env::temp_dir().join(format!("rubberdux-test-{}", std::process::id()))
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("rubberdux-test-{}", ts))
     }
 
     fn manager_with_home(home: &Path) -> SessionManager {
@@ -266,7 +269,7 @@ mod tests {
         let s = id.to_string();
         // Should match YYYY-MM-DD-hh-mm-ss-UTC
         assert!(s.contains("-UTC"), "Session ID should end with -UTC: {}", s);
-        assert_eq!(s.len(), 24, "Session ID should be 24 chars: {}", s);
+        assert_eq!(s.len(), 23, "Session ID should be 23 chars: {}", s);
     }
 
     #[test]

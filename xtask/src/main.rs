@@ -2,10 +2,12 @@ use clap::{Parser, Subcommand};
 
 mod provision;
 mod launch;
+mod stop;
 mod sessions;
 
 use provision::provision_images;
 use launch::launch_rubberdux;
+use stop::stop_rubberdux;
 use sessions::{list_sessions, archive_session, delete_session, clear_sessions};
 
 #[derive(Parser)]
@@ -24,6 +26,8 @@ enum Commands {
     },
     /// Provision VMs, build, and launch rubberdux
     Launch,
+    /// Stop running rubberdux process and VMs
+    Stop,
     /// Manage sessions
     Sessions {
         #[command(subcommand)]
@@ -60,6 +64,12 @@ async fn main() {
         Commands::Launch => {
             if let Err(e) = launch_rubberdux().await {
                 eprintln!("Launch failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Stop => {
+            if let Err(e) = stop_rubberdux().await {
+                eprintln!("Stop failed: {}", e);
                 std::process::exit(1);
             }
         }

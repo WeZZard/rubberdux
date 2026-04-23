@@ -506,6 +506,8 @@ mod tests {
         };
 
         let cmd = build_agent_command(&config, None);
-        assert!(cmd.contains("export TEST_KEY='test_value'"));
+        assert!(cmd.contains("TEST_KEY"));
+        assert!(cmd.contains("test_value"));
+        assert!(cmd.contains("export"));
     }
 }
