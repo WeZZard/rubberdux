@@ -246,7 +246,6 @@ mod tests {
             "test system prompt".into(),
             context_tx,
             None,
-            None,
         )
     }
 
@@ -408,7 +407,6 @@ mod tests {
             "test system prompt".into(),
             context_tx,
             None,
-            None,
         );
         let outcome = <AgentTool as Tool>::execute(
             &tool,
@@ -452,10 +450,4 @@ mod tests {
         }
     }
 
-}
-            other => panic!("Expected Immediate outcome, got {:?}", std::mem::discriminant(&other)),
-        }
-
-        acceptor.abort();
-    }
 }

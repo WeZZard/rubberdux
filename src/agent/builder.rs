@@ -117,3 +117,122 @@ impl AgentLoopBuilder {
         (agent_loop, input_port, context_tx)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::RwLock;
+
+    fn dummy_client() -> Arc<MoonshotClient> {
+        Arc::new(MoonshotClient::new(
+            reqwest::Client::new(),
+            "http://localhost:0".into(),
+            "test-key".into(),
+            "test-model".into(),
+        ))
+    }
+
+    fn temp_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("rubberdux-test-{}", std::process::id()))
+    }
+
+    #[test]
+    fn test_builder_creates_agent_loop_happy_path() {
+        let client = dummy_client();
+        let data_dir = temp_dir();
+        let builder = AgentLoopBuilder::new("Test system prompt".into(), data_dir.clone());
+        
+        let (agent_loop, input_port, context_tx) = builder.build(client);
+        
+        // Verify directories were created
+        assert!(data_dir.join("sessions").exists(), "sessions dir should be created");
+        assert!(data_dir.join("tool-results").exists(), "tool-results dir should be created");
+        assert!(data_dir.join("subagents").exists(), "subagents dir should be created");
+        
+        // Clean up
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn test_builder_with_custom_token_budget() {
+        let client = dummy_client();
+        let data_dir = temp_dir();
+        let builder = AgentLoopBuilder::new("Test".into(), data_dir.clone())
+            .with_token_budget(50_000);
+        
+        let (_, _, _) = builder.build(client);
+        
+        // If we could inspect the AgentLoop's config, we'd verify budget
+        // For now, we just verify it doesn't panic
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn test_builder_without_agent_tool() {
+        let client = dummy_client();
+        let data_dir = temp_dir();
+        let builder = AgentLoopBuilder::new("Test".into(), data_dir.clone())
+            .with_agent_tool(false);
+        
+        let (_, _, _) = builder.build(client);
+        
+        // Verify it builds successfully without agent tool
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn test_builder_with_custom_session_file() {
+        let client = dummy_client();
+        let data_dir = temp_dir();
+        let builder = AgentLoopBuilder::new("Test".into(), data_dir.clone())
+            .with_session_file("custom.jsonl".into());
+        
+        let (_, _, _) = builder.build(client);
+        
+        // Verify custom session file path would be used
+        // (We can't easily inspect the AgentLoop's private config)
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn test_builder_creates_directories_on_existing_parent() {
+        let client = dummy_client();
+        let data_dir = temp_dir();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        
+        let builder = AgentLoopBuilder::new("Test".into(), data_dir.clone());
+        let (_, _, _) = builder.build(client);
+        
+        assert!(data_dir.join("sessions").exists());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn test_builder_handles_empty_system_prompt() {
+        let client = dummy_client();
+        let data_dir = temp_dir();
+        let builder = AgentLoopBuilder::new("".into(), data_dir.clone());
+        
+        let (_, _, _) = builder.build(client);
+        
+        // Should not panic with empty prompt
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn test_context_tx_can_subscribe() {
+        let client = dummy_client();
+        let data_dir = temp_dir();
+        let builder = AgentLoopBuilder::new("Test".into(), data_dir.clone());
+        
+        let (_, _, context_tx) = builder.build(client);
+        
+        let mut rx = context_tx.subscribe();
+        context_tx.send(ContextEvent::Cancel).unwrap();
+        
+        let received = rx.try_recv();
+        assert!(received.is_ok(), "Should receive context event");
+        
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+}

@@ -23,9 +23,13 @@ fn main() {
     println!("cargo:rerun-if-changed=agents/");
     println!("cargo:rerun-if-changed=build.rs");
 
-    // 1. Build Linux agent binary
-    if let Err(e) = ensure_linux_agent_binary() {
-        panic!("Failed to build Linux agent binary: {}", e);
+    // 1. Build Linux agent binary (skip if requested)
+    if std::env::var("RUBBERDUX_SKIP_LINUX_AGENT_BUILD").is_err() {
+        if let Err(e) = ensure_linux_agent_binary() {
+            panic!("Failed to build Linux agent binary: {}", e);
+        }
+    } else {
+        println!("cargo:warning=Skipping Linux agent binary build (RUBBERDUX_SKIP_LINUX_AGENT_BUILD is set)");
     }
 
     // NOTE: VM image provisioning is intentionally NOT triggered during `cargo build`.

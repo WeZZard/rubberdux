@@ -179,8 +179,8 @@ pub async fn run(
     });
 
     // Track reply channels from Telegram adapter
-    let reply_senders: Arc<Mutex<HashMap<Option<i32>, mpsc::Sender<AgentResponse>>>>
-        = Arc::new(Mutex::new(HashMap::new()));
+    let reply_senders: Arc<Mutex<HashMap<Option<i32>, mpsc::Sender<AgentResponse>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     // Bridge: Telegram → AgentLoop
     let reply_senders_for_telegram = reply_senders.clone();
@@ -206,7 +206,7 @@ pub async fn run(
                         interpreted.text.len()
                     );
 
-                    let (loop_reply_tx, mut loop_reply_rx) = mpsc::channel(8);
+                    let (loop_reply_tx, mut loop_reply_rx) = mpsc::channel::<crate::agent::runtime::port::LoopOutput>(8);
 
                     // Spawn response handler → Telegram
                     let reply_senders_clone = reply_senders_for_telegram.clone();
@@ -232,8 +232,8 @@ pub async fn run(
                     let message = Message::User {
                         content: UserContent::Text(interpreted.text),
                     };
-                    let metadata: Option<Box<dyn std::any::Any + Send>>
-                        = telegram_message_id.map(|id| Box::new(id) as _);
+                    let metadata: Option<Box<dyn std::any::Any + Send>> =
+                        telegram_message_id.map(|id| Box::new(id) as _);
 
                     let event = LoopEvent::UserMessage {
                         message,
@@ -265,280 +265,10 @@ pub async fn run(
 
     log::info!("Host shutdown complete.");
 }
-        if let Some(cpus) = config.cpu_count {
-            mgr = mgr.with_cpu_count(cpus);
-        }
-        Arc::new(Mutex::new(mgr))
-    };
-
-    // Start RPC server
-    let listener = match TcpListener::bind(("0.0.0.0", config.rpc_port)).await {
-        Ok(l) => {
-            let actual_port = l.local_addr().unwrap().port();
-            log::info!("RPC server listening on port {}", actual_port);
-            l
-        }
-        Err(e) => {
-            log::error!("Failed to bind RPC port {}: {}", config.rpc_port, e);
-            return;
-        }
-    };
-
-    let actual_rpc_port = listener.local_addr().unwrap().port();
-    let mut config = config;
-    config.rpc_port = actual_rpc_port;
-
-    // Boot main VM
-    let _main_ip = {
-        let mut mgr = manager.lock().await;
-        match mgr.create_and_start("main", None, config.agent_data_dir.as_deref()).await {
-            Ok(ip) => {
-                log::info!("Main VM booted at {}", ip);
-                ip
-            }
-            Err(e) => {
-                log::error!("Failed to boot main VM: {}", e);
-                return;
-            }
-        }
-    };
-
-    // Wait for SSH in main VM
-    {
-        let mgr = manager.lock().await;
-        if let Err(e) = mgr.wait_for_ssh("main").await {
-            log::error!("Main VM SSH not ready: {}", e);
-            return;
-        }
-    }
-
-    // Copy latest agent binary to VM (ensures updates are deployed without rebuilding base VM)
-    {
-        let mgr = manager.lock().await;
-        if let Err(e) = mgr.copy_agent_binary("main").await {
-            log::warn!("Failed to copy agent binary to main VM: {}", e);
-        }
-    }
-
-    // Start rubberdux --agent inside the main VM
-    let agent_cmd = build_agent_command(&config, None);
-    {
-        let mgr = manager.lock().await;
-        match mgr.exec("main", &agent_cmd).await {
-            Ok(result) => {
-                if result.exit_code != 0 {
-                    log::warn!(
-                        "Agent launch returned exit {}: {}",
-                        result.exit_code, result.stderr
-                    );
-                }
-                log::info!("Started agent inside main VM");
-            }
-            Err(e) => {
-                log::error!("Failed to start agent in main VM: {}", e);
-                return;
-            }
-        }
-    }
-
-    // Accept the main VM's RPC connection
-    log::info!("Waiting for main VM agent to connect...");
-    let main_stream = match listener.accept().await {
-        Ok((stream, addr)) => {
-            log::info!("Main VM agent connected from {}", addr);
-            stream
-        }
-        Err(e) => {
-            log::error!("Failed to accept main VM connection: {}", e);
-            return;
-        }
-    };
-
-    let (main_reader, main_writer) = main_stream.into_split();
-    let main_writer = Arc::new(Mutex::new(main_writer));
-
-    // Track child VM connections: task_id → writer
-    let child_writers: Arc<Mutex<HashMap<String, Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-
-    // Track reply channels from Telegram adapter so VM responses can be routed back.
-    // Key: telegram_message_id -> reply channel for that specific message.
-    let reply_senders: Arc<Mutex<HashMap<Option<i32>, mpsc::Sender<AgentResponse>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-
-    // Spawn: Telegram -> Main VM bridge
-    let writer_for_telegram = main_writer.clone();
-    let reply_senders_for_telegram = reply_senders.clone();
-    let mut telegram_rx = telegram_rx;
-    tokio::spawn(async move {
-        while let Some(event) = telegram_rx.recv().await {
-            match event {
-                ChannelEvent::UserInput {
-                    interpreted,
-                    telegram_message_id,
-                    reply_tx,
-                } => {
-                    // Store the reply channel keyed by message_id so VM responses
-                    // can be routed back to the correct Telegram message.
-                    if let Some(tx) = reply_tx {
-                        reply_senders_for_telegram
-                            .lock()
-                            .await
-                            .insert(telegram_message_id, tx);
-                    }
-                    log::info!(
-                        "Forwarding message to VM: msg_id={:?}, text_len={}",
-                        telegram_message_id,
-                        interpreted.text.len()
-                    );
-                    let msg = HostToAgent::UserMessage {
-                        text: interpreted.text,
-                        telegram_message_id,
-                    };
-                    let mut w = writer_for_telegram.lock().await;
-                    match protocol::write_message(&mut w, &msg).await {
-                        Ok(_) => log::info!("Message forwarded successfully"),
-                        Err(e) => {
-                            log::error!("Failed to forward to main VM: {}", e);
-                            break;
-                        }
-                    }
-                }
-                ChannelEvent::ContextUpdate { text } => {
-                    log::info!(
-                        "ContextUpdate received on host (test-only feature): text_len={}",
-                        text.len()
-                    );
-                    // ContextUpdate is a test-only feature for batched user messages.
-                    // In production host mode, we ignore it since the VM agent
-                    // handles user messages individually via UserInput events.
-                }
-                ChannelEvent::InternalEvent(_) => {
-                    // Internal events stay on the host side for now
-                }
-            }
-        }
-    });
-
-    // Spawn: Main VM -> Host message handler
-    let manager_for_reader = manager.clone();
-    let _child_writers = child_writers.clone();
-    let listener_arc = Arc::new(listener);
-    let listener_for_spawn = listener_arc.clone();
-    let main_writer_for_response = main_writer.clone();
-    let config_for_spawn = config.clone();
-    let reply_senders_for_vm = reply_senders.clone();
-    tokio::spawn(async move {
-        let mut reader = main_reader;
-        loop {
-            let msg: Option<AgentToHost> = match protocol::read_message(&mut reader).await {
-                Ok(m) => m,
-                Err(e) => {
-                    log::error!("RPC read error from main VM: {}", e);
-                    break;
-                }
-            };
-
-            let msg = match msg {
-                Some(m) => m,
-                None => {
-                    log::info!("Main VM disconnected");
-                    break;
-                }
-            };
-
-            match msg {
-                AgentToHost::Response {
-                    text,
-                    entry_id,
-                    is_final,
-                    reply_to_message_id,
-                } => {
-                    log::info!(
-                        "Received response from VM: entry_id={}, is_final={}, reply_to={:?}, text_len={}",
-                        entry_id,
-                        is_final,
-                        reply_to_message_id,
-                        text.len()
-                    );
-                    let response = AgentResponse {
-                        text,
-                        entry_id,
-                        is_final,
-                        reply_to_message_id,
-                    };
-                    // Route response back to the Telegram adapter's reply channel
-                    // using the message_id as the key.
-                    if let Some(tx) = reply_senders_for_vm
-                        .lock()
-                        .await
-                        .get(&reply_to_message_id)
-                    {
-                        log::info!("Routing response to Telegram reply channel for msg_id={:?}", reply_to_message_id);
-                        let _ = tx.send(response.clone()).await;
-                    } else {
-                        log::warn!(
-                            "No reply channel found for message_id={:?}, dropping response",
-                            reply_to_message_id
-                        );
-                    }
-                    // Also send to the debug/legacy channel
-                    if telegram_response_tx.send(response).await.is_err() {
-                        log::warn!("Telegram response channel closed");
-                        break;
-                    }
-                }
-                AgentToHost::SpawnVM {
-                    task_id,
-                    prompt,
-                    subagent_type,
-                } => {
-                    log::info!("Main VM requested child VM: {}", task_id);
-                    let mgr = manager_for_reader.clone();
-                    let tid = task_id.clone();
-                    let sub_ty = subagent_type.clone();
-                    let writer = main_writer_for_response.clone();
-                    let listener = listener_for_spawn.clone();
-                    let cfg = config_for_spawn.clone();
-
-                    tokio::spawn(async move {
-                        let result =
-                            run_child_vm(mgr, &tid, &prompt, &sub_ty, &cfg, listener).await;
-
-                        let response = match result {
-                            Ok(summary) => HostToAgent::VMCompleted {
-                                task_id: tid,
-                                result: summary,
-                            },
-                            Err(e) => HostToAgent::VMFailed {
-                                task_id: tid,
-                                error: e.to_string(),
-                            },
-                        };
-
-                        let mut w = writer.lock().await;
-                        if let Err(e) = protocol::write_message(&mut w, &response).await {
-                            log::error!("Failed to send VM result to main agent: {}", e);
-                        }
-                    });
-                }
-            }
-        }
-    });
-
-    // Keep the host alive until shutdown
-    log::info!("Host running. Press Ctrl+C to stop.");
-    tokio::signal::ctrl_c().await.ok();
-
-    log::info!("Shutting down VMs...");
-    let mut mgr = manager.lock().await;
-    mgr.destroy_all().await;
-    log::info!("Host shutdown complete.");
-}
 
 /// Run a child VM to completion and return the final output.
 /// Guarantees the child VM is destroyed even if the agent fails or errors occur.
-async fn run_child_vm(
+pub async fn run_child_vm(
     manager: Arc<Mutex<VMManager>>,
     task_id: &str,
     prompt: &str,
@@ -671,4 +401,97 @@ async fn run_child_vm(
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shell_quote_simple() {
+        assert_eq!(shell_quote("hello"), "'hello'");
+    }
+
+    #[test]
+    fn test_shell_quote_with_single_quote() {
+        assert_eq!(shell_quote("it's"), "'it'\"'\"'s'");
+    }
+
+    #[test]
+    fn test_host_config_from_env_defaults() {
+        // Test that HostConfig::from_env() doesn't panic when env vars are missing
+        // by setting required vars if not present
+        let config = HostConfig::from_env();
+        assert_eq!(config.rpc_port, DEFAULT_RPC_PORT);
+    }
+
+    #[test]
+    fn test_host_config_custom_rpc_port() {
+        unsafe {
+            std::env::set_var("RUBBERDUX_RPC_PORT", "12345");
+            let config = HostConfig::from_env();
+            assert_eq!(config.rpc_port, 12345);
+            std::env::remove_var("RUBBERDUX_RPC_PORT");
+        }
+    }
+
+    #[test]
+    fn test_build_agent_command_basic() {
+        let config = HostConfig {
+            vm_image: "test".into(),
+            share_root: PathBuf::from("./test-shares"),
+            rpc_port: 19384,
+            host_ip: "192.168.64.1".into(),
+            agent_binary_path: None,
+            agent_env: HashMap::new(),
+            agent_data_dir: None,
+            memory_mb: None,
+            cpu_count: None,
+        };
+
+        let cmd = build_agent_command(&config, None);
+        assert!(cmd.contains("rubberdux"));
+        assert!(cmd.contains("--agent"));
+        assert!(cmd.contains("192.168.64.1:19384"));
+    }
+
+    #[test]
+    fn test_build_agent_command_with_task_id() {
+        let config = HostConfig {
+            vm_image: "test".into(),
+            share_root: PathBuf::from("./test-shares"),
+            rpc_port: 19384,
+            host_ip: "192.168.64.1".into(),
+            agent_binary_path: None,
+            agent_env: HashMap::new(),
+            agent_data_dir: None,
+            memory_mb: None,
+            cpu_count: None,
+        };
+
+        let cmd = build_agent_command(&config, Some("task-123"));
+        assert!(cmd.contains("--task-id"));
+        assert!(cmd.contains("task-123"));
+    }
+
+    #[test]
+    fn test_build_agent_command_with_env() {
+        let mut env = HashMap::new();
+        env.insert("TEST_KEY".to_string(), "test_value".to_string());
+        
+        let config = HostConfig {
+            vm_image: "test".into(),
+            share_root: PathBuf::from("./test-shares"),
+            rpc_port: 19384,
+            host_ip: "192.168.64.1".into(),
+            agent_binary_path: None,
+            agent_env: env,
+            agent_data_dir: None,
+            memory_mb: None,
+            cpu_count: None,
+        };
+
+        let cmd = build_agent_command(&config, None);
+        assert!(cmd.contains("export TEST_KEY='test_value'"));
+    }
 }
