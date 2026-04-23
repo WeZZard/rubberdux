@@ -2,6 +2,9 @@ pub mod agent_loop;
 #[cfg(feature = "host")]
 pub mod chat;
 pub mod compaction;
+pub mod history_store;
 pub mod port;
 pub mod session;
 pub mod subagent;
+pub mod task_coordinator;
+pub mod turn_driver;

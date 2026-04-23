@@ -17,7 +17,7 @@ For all tests that exercise the AgentLoop (integration, system, e2e), transcript
 
 ### Where to store
 ```
-test_results/
+tests/results/
 └── YYYYMMDD_HHMMSS-integration/
     └── <test_name>/
         ├── transcript.jsonl     # Raw conversation (Entry objects)

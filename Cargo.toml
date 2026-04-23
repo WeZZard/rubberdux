@@ -1,5 +1,6 @@
 [workspace]
-members = [".", "crates/md-testing", "xtask"]
+members = [".", "crates/md-testing", "crates/md-testing-lsp", "xtask"]
+exclude = ["ide-support/zed-md-testing"]
 
 [package]
 name = "rubberdux"

@@ -21,7 +21,8 @@ pub fn artifact_dir(test_name: &str) -> PathBuf {
     );
 
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("test_results")
+        .join("tests")
+        .join("results")
         .join(dir_name)
         .join(test_name);
 

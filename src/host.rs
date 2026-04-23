@@ -246,7 +246,7 @@ pub async fn run(
                     let message = Message::User {
                         content: UserContent::Text(interpreted.text),
                     };
-                    let metadata: Option<Box<dyn std::any::Any + Send>> =
+                    let metadata: Option<Box<dyn std::any::Any + Send + Sync>> =
                         telegram_message_id.map(|id| Box::new(id) as _);
 
                     let event = LoopEvent::UserMessage {

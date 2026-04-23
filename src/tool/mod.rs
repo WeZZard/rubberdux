@@ -91,6 +91,7 @@ impl ToolRegistry {
 // ---------------------------------------------------------------------------
 
 /// Result delivered by a background task through its oneshot channel.
+#[derive(Debug, Clone)]
 pub struct BackgroundTaskResult {
     pub task_id: String,
     pub content: String,

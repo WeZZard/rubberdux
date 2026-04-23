@@ -1,0 +1,4 @@
+name = "Test Case Markdown"
+grammar = "markdown"
+path_suffixes = ["testcase.md"]
+line_comments = ["<!-- "]

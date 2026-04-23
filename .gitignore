@@ -3,3 +3,7 @@
 /sessions
 /test_results
 /vm-shares
+tests/results/
+ide-support/zed-md-testing/target/
+*.wasm
+Cargo.lock

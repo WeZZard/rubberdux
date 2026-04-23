@@ -35,6 +35,7 @@ pub async fn run() {
     assert!(!cases.is_empty(), "No test cases found in {:?}", cases_dir);
 
     let (run_dir, run_timestamp) = artifact_run_dir();
+    let dir_name = run_dir.file_name().unwrap().to_string_lossy().to_string();
     let system_prompt = build_system_prompt();
     let mut failed_cases: Vec<String> = Vec::new();
 
@@ -185,6 +186,84 @@ pub async fn run() {
         std::fs::write(case_dir.join("evaluation.md"), &eval_results)
             .expect("failed to write evaluation");
 
+        // Write machine-readable results.json for LSP
+        let case_content = std::fs::read_to_string(
+            cases_dir.join(format!("{}.testcase.md", case.name))
+        ).unwrap_or_default();
+        let assertion_lines = md_testing::map_assertion_lines(&case_content, case);
+        let mut results_assertions = Vec::new();
+
+        // Storyline assertions
+        let storyline_line = md_testing::find_heading_line(&case_content, "Storyline")
+            .unwrap_or(1);
+        for (i, assertion) in case.storyline.iter().enumerate() {
+            let line = assertion_lines.iter()
+                .find(|l| l.msg_index == 0 && l.assertion == *assertion)
+                .map(|l| l.line)
+                .unwrap_or(storyline_line);
+            let result = evaluator.evaluate_storyline(&trajectory, assertion).await;
+            results_assertions.push(md_testing::AssertionResult {
+                scope: md_testing::AssertionScope::Storyline,
+                line,
+                assertion: assertion.clone(),
+                passed: result.passed,
+                reasoning: result.reasoning,
+            });
+        }
+
+        // Ordering match result
+        let ordering_line = md_testing::find_assistant_heading_lines(&case_content)
+            .first()
+            .copied()
+            .unwrap_or(1);
+        if let Err(ref e) = match_assistant_slots(&directives, actual_assistant_count) {
+            results_assertions.push(md_testing::AssertionResult {
+                scope: md_testing::AssertionScope::OrderingMatch,
+                line: ordering_line,
+                assertion: "Ordering match".to_string(),
+                passed: false,
+                reasoning: e.to_string(),
+            });
+        }
+
+        // Assistant assertions
+        let assistant_lines = md_testing::find_assistant_heading_lines(&case_content);
+        for (slot_idx, (_, assertions)) in assistant_slots.iter().enumerate() {
+            let actual_idx = matched_indices.get(slot_idx).copied();
+            let heading_line = assistant_lines.get(slot_idx).copied().unwrap_or(1);
+            for assertion in assertions {
+                let result = if let Some(idx) = actual_idx {
+                    evaluator.evaluate_assistant(&trajectory, assertion, idx).await
+                } else {
+                    md_testing::evaluator::EvaluationResult {
+                        passed: false,
+                        reasoning: "Could not match assistant message — ordering match failed".to_string(),
+                    }
+                };
+                results_assertions.push(md_testing::AssertionResult {
+                    scope: md_testing::AssertionScope::AssistantMessage {
+                        slot_index: slot_idx,
+                        actual_index: actual_idx,
+                    },
+                    line: heading_line,
+                    assertion: assertion.clone(),
+                    passed: result.passed,
+                    reasoning: result.reasoning,
+                });
+            }
+        }
+
+        let test_results = md_testing::TestResults {
+            testcase_name: case.name.clone(),
+            run_id: dir_name.clone(),
+            timestamp: run_timestamp.clone(),
+            target: case.front_matter.target.clone(),
+            passed: all_passed,
+            assertions: results_assertions,
+        };
+        test_results.write(&case_dir.join("results.json"))
+            .expect("failed to write results.json");
+
         if !all_passed {
             failed_cases.push(case.name.clone());
         }
@@ -322,9 +401,10 @@ fn artifact_run_dir() -> (PathBuf, String) {
         year, month, day, hours, minutes, seconds
     );
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("test_results")
+        .join("tests")
+        .join("results")
         .join(dir_name);
-    std::fs::create_dir_all(&dir).expect("failed to create test_results dir");
+    std::fs::create_dir_all(&dir).expect("failed to create results dir");
     (dir, timestamp)
 }
 

@@ -7,6 +7,8 @@ pub mod llm;
 pub mod evaluator;
 pub mod guidance;
 pub mod ordering;
+pub mod results;
+pub mod lines;
 
 pub use parser::{TestCase, FrontMatter, Message, UserContent, OrderingDirective};
 pub use linter::{lint, LintError};
@@ -15,3 +17,5 @@ pub use discovery::discover_cases;
 pub use evaluator::{Evaluatable, EvaluationResult, AssertionEvaluator};
 pub use llm::{LlmClient, LlmError, ChatMessage};
 pub use ordering::{match_assistant_slots, MatchError};
+pub use results::{TestResults, AssertionResult, AssertionScope};
+pub use lines::{AssertionLine, map_assertion_lines, find_heading_line, find_assistant_heading_lines, find_user_heading_lines};

@@ -3,6 +3,8 @@ use tokio::sync::{broadcast, mpsc};
 use crate::agent::entry::Entry;
 use crate::provider::moonshot::Message;
 
+use crate::tool::BackgroundTaskResult;
+
 /// An event injected into the agent loop from any input source.
 pub enum LoopEvent {
     /// A message to process via LLM.
@@ -11,12 +13,25 @@ pub enum LoopEvent {
         /// Where to send the response. None = silent injection (no response expected).
         reply: Option<mpsc::Sender<LoopOutput>>,
         /// Opaque metadata from the input source (e.g. telegram_message_id).
-        metadata: Option<Box<dyn std::any::Any + Send>>,
+        metadata: Option<Box<dyn std::any::Any + Send + Sync>>,
     },
     /// Context update to inject into history without triggering LLM processing.
     ContextUpdate(Message),
     /// Internal history/prompt mutation.
     Internal(InternalMutation),
+}
+
+/// Event types for the refactored AgentLoop event router.
+pub enum AgentEvent {
+    /// A message from the user.
+    UserMessage {
+        message: Message,
+        reply: Option<mpsc::Sender<LoopOutput>>,
+    },
+    /// A background task completed.
+    TaskCompletion(BackgroundTaskResult),
+    /// Cancellation signal.
+    Cancel,
 }
 
 /// An output emitted by the agent loop for a conversation response.
@@ -25,7 +40,7 @@ pub struct LoopOutput {
     pub entry_id: usize,
     pub is_final: bool,
     /// Opaque metadata forwarded from the input event.
-    pub metadata: Option<Box<dyn std::any::Any + Send>>,
+    pub metadata: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 /// History mutations that don't trigger LLM processing.

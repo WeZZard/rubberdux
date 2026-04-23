@@ -157,7 +157,7 @@ pub async fn run_with_session(
 
                     let reply = reply_tx.map(bridge_reply);
 
-                    let metadata: Option<Box<dyn std::any::Any + Send>> =
+                    let metadata: Option<Box<dyn std::any::Any + Send + Sync>> =
                         telegram_message_id.map(|id| Box::new(id) as _);
 
                     let event = LoopEvent::UserMessage {
@@ -423,7 +423,7 @@ mod tests {
         ];
 
         let start = Instant::now();
-        let results = super::super::agent_loop::execute_tool_calls(&calls, &registry).await;
+        let results = super::super::turn_driver::execute_tool_calls(&calls, &registry).await;
         let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 3);
@@ -479,7 +479,7 @@ mod tests {
         ];
 
         let start = Instant::now();
-        let results = super::super::agent_loop::execute_tool_calls(&calls, &registry).await;
+        let results = super::super::turn_driver::execute_tool_calls(&calls, &registry).await;
         let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 3);
@@ -529,7 +529,7 @@ mod tests {
         // depends_on references a nonexistent ID
         let calls = vec![make_tool_call("1", "d", Some("nonexistent"))];
 
-        let results = super::super::agent_loop::execute_tool_calls(&calls, &registry).await;
+        let results = super::super::turn_driver::execute_tool_calls(&calls, &registry).await;
         assert_eq!(results.len(), 1);
         match &results[0].1 {
             ToolOutcome::Immediate { content, is_error } => {
