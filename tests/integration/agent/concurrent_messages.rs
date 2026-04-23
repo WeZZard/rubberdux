@@ -52,7 +52,7 @@ async fn setup_agent_loop(mock_uri: &str, test_name: &str) -> (
         context_tx: None,
     };
 
-    let (agent_loop, input_port) = AgentLoop::new(config);
+    let (agent_loop, input_port) = AgentLoop::new(config).await;
     let agent_handle = tokio::spawn(async move {
         agent_loop.run().await;
     });

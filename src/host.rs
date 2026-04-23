@@ -185,7 +185,7 @@ pub async fn run(
 
     let builder = AgentLoopBuilder::new(system_prompt, session_manager)
         .with_session_id(session_id);
-    let (agent_loop, input_port, _context_tx) = builder.build(client);
+    let (agent_loop, input_port, _context_tx) = builder.build(client).await;
 
     // Spawn AgentLoop
     tokio::spawn(async move {

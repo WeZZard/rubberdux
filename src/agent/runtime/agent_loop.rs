@@ -13,7 +13,6 @@ use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
 use crate::tool::BackgroundTaskResult;
 
 use super::compaction::CompactionStrategy;
-use super::session::load_session;
 use super::subagent::{ContextEvent, SubagentResult};
 
 // ---------------------------------------------------------------------------
@@ -65,7 +64,11 @@ pub struct AgentLoop {
 
     // Channels
     input_rx: mpsc::Receiver<LoopEvent>,
+    #[allow(dead_code)]
+    bg_tx: mpsc::Sender<BackgroundTaskResult>,
     bg_rx: mpsc::Receiver<BackgroundTaskResult>,
+    #[allow(dead_code)]
+    child_agent_tx: mpsc::Sender<SubagentResult>,
     child_agent_rx: mpsc::Receiver<SubagentResult>,
     context_tx: broadcast::Sender<ContextEvent>,
     entry_notify_tx: broadcast::Sender<EntryNotification>,
@@ -73,13 +76,16 @@ pub struct AgentLoop {
     // Task tracking
     active_groups: TaskGroupSet,
 
+    // Compaction
+    compaction: Box<dyn CompactionStrategy>,
+
     // Cancellation
     cancel: CancellationToken,
 }
 
 impl AgentLoop {
     /// Create a new AgentLoop and its InputPort for injecting events.
-    pub fn new(config: AgentLoopConfig) -> (Self, InputPort) {
+    pub async fn new(config: AgentLoopConfig) -> (Self, InputPort) {
         let (input_tx, input_rx) = mpsc::channel(32);
 
         let history_store: Arc<dyn HistoryStore> = match &config.session_path {
@@ -87,11 +93,11 @@ impl AgentLoop {
             None => Arc::new(MemoryStore::new()),
         };
 
-        // For now, load synchronously to maintain compatibility.
-        // TODO: make this async when fully switched to HistoryStore.
-        let history = match &config.session_path {
-            Some(path) => load_session(path, &config.system_prompt),
-            None => {
+        // Load history asynchronously via HistoryStore.
+        let history = match history_store.load(&config.system_prompt).await {
+            Ok(h) => h,
+            Err(e) => {
+                log::warn!("Failed to load session, starting fresh: {}", e);
                 let mut h = EntryHistory::new();
                 h.push_system(Message::System {
                     content: config.system_prompt.clone(),
@@ -100,8 +106,8 @@ impl AgentLoop {
             }
         };
 
-        let (_bg_tx, bg_rx) = mpsc::channel::<BackgroundTaskResult>(32);
-        let (_child_agent_tx, child_agent_rx) = mpsc::channel::<SubagentResult>(32);
+        let (bg_tx, bg_rx) = mpsc::channel::<BackgroundTaskResult>(32);
+        let (child_agent_tx, child_agent_rx) = mpsc::channel::<SubagentResult>(32);
         let context_tx = config.context_tx.unwrap_or_else(|| broadcast::channel(64).0);
         let (entry_notify_tx, _) = broadcast::channel(256);
 
@@ -109,6 +115,8 @@ impl AgentLoop {
             config.client.clone(),
             config.registry.clone(),
             config.tool_results_dir.clone(),
+            bg_tx.clone(),
+            child_agent_tx.clone(),
         );
 
         let agent_loop = Self {
@@ -121,11 +129,14 @@ impl AgentLoop {
             state: AgentState::Idle,
             pending_messages: Vec::new(),
             input_rx,
+            bg_tx,
             bg_rx,
+            child_agent_tx,
             child_agent_rx,
             context_tx,
             entry_notify_tx,
             active_groups: TaskGroupSet::new(),
+            compaction: config.compaction,
             cancel: config.cancel,
         };
 
@@ -338,7 +349,33 @@ impl AgentLoop {
         let current_reply_to = reply_to;
 
         loop {
+            // Compact history if token budget exceeded before driving a turn.
+            if self.current_tokens > self.token_budget {
+                log::info!(
+                    "Token budget exceeded: {} > {}, compacting history",
+                    self.current_tokens,
+                    self.token_budget
+                );
+                self.compaction.compact(
+                    &mut self.history,
+                    self.token_budget,
+                    self.current_tokens,
+                );
+                // Re-estimate after compaction (conservative: half the current)
+                self.current_tokens = self.current_tokens / 2;
+            }
+
             let outcome = self.turn_driver.drive(&mut self.history).await;
+
+            // Update token count from the LLM response.
+            match &outcome {
+                TurnOutcome::Text { prompt_tokens, .. }
+                | TurnOutcome::Tools { prompt_tokens, .. } => {
+                    self.current_tokens = *prompt_tokens;
+                }
+                TurnOutcome::Failed { .. } => {}
+            }
+
             let should_continue = self
                 .handle_turn_outcome(
                     outcome,
@@ -365,7 +402,7 @@ impl AgentLoop {
         reply_to_message_id: Option<i32>,
     ) -> bool {
         match outcome {
-            TurnOutcome::Text { text, entry_id } => {
+            TurnOutcome::Text { text, entry_id, .. } => {
                 self.persist_entry(entry_id).await;
                 self.notify_entry(entry_id, true);
 
@@ -386,6 +423,7 @@ impl AgentLoop {
                 text,
                 entry_id,
                 background_tasks,
+                ..
             } => {
                 self.persist_entry(entry_id).await;
                 self.notify_entry(entry_id, false);
@@ -408,11 +446,15 @@ impl AgentLoop {
                     true
                 } else {
                     // Background tasks dispatched.
+                    // Preserve reply_to metadata so final responses are replies to the correct message.
+                    let metadata = reply_to_message_id.map(|id| {
+                        Box::new(id) as Box<dyn std::any::Any + Send + Sync>
+                    });
                     self.active_groups.register(
                         entry_id,
                         &background_tasks,
                         reply.clone(),
-                        None, // metadata is only needed for final replies
+                        metadata,
                     );
                     self.state = AgentState::Processing;
                     false
@@ -457,8 +499,8 @@ impl AgentLoop {
                 self.notify_entry(entry_id, false);
             }
 
-            // If idle, start a new turn with the completed results.
-            if self.state == AgentState::Idle {
+            // If no more active groups, start a new turn with the completed results.
+            if self.active_groups.is_empty() {
                 let reply_to = completed
                     .group
                     .metadata

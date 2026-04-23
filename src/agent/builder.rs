@@ -57,7 +57,7 @@ impl AgentLoopBuilder {
     }
 
     /// Build the AgentLoop and return it along with its input port and context broadcaster.
-    pub fn build(self, client: Arc<MoonshotClient>) -> (AgentLoop, InputPort, broadcast::Sender<ContextEvent>) {
+    pub async fn build(self, client: Arc<MoonshotClient>) -> (AgentLoop, InputPort, broadcast::Sender<ContextEvent>) {
         let session_id = self.session_id.expect("session_id must be set before building");
         let main_agent_dir = self.session_manager.main_agent_dir(&session_id);
         let tool_results_dir = main_agent_dir.join("tool_results");
@@ -110,7 +110,7 @@ impl AgentLoopBuilder {
             context_tx: Some(context_tx.clone()),
         };
 
-        let (agent_loop, input_port) = AgentLoop::new(config);
+        let (agent_loop, input_port) = AgentLoop::new(config).await;
 
         (agent_loop, input_port, context_tx)
     }
@@ -142,14 +142,14 @@ mod tests {
         (mgr, session_id)
     }
 
-    #[test]
-    fn test_builder_creates_agent_loop_happy_path() {
+    #[tokio::test]
+    async fn test_builder_creates_agent_loop_happy_path() {
         let client = dummy_client();
         let (mgr, session_id) = temp_manager();
         let builder = AgentLoopBuilder::new("Test system prompt".into(), mgr.clone())
             .with_session_id(session_id.clone());
         
-        let (agent_loop, input_port, context_tx) = builder.build(client);
+        let (agent_loop, input_port, context_tx) = builder.build(client).await;
         
         // Verify main agent dir was created
         assert!(mgr.main_agent_dir(&session_id).exists(), "main agent dir should exist");
@@ -159,52 +159,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&mgr.home_dir);
     }
 
-    #[test]
-    fn test_builder_with_custom_token_budget() {
+    #[tokio::test]
+    async fn test_builder_with_custom_token_budget() {
         let client = dummy_client();
         let (mgr, session_id) = temp_manager();
         let builder = AgentLoopBuilder::new("Test".into(), mgr.clone())
             .with_session_id(session_id)
             .with_token_budget(50_000);
         
-        let (_, _, _) = builder.build(client);
+        let (_, _, _) = builder.build(client).await;
         
         let _ = std::fs::remove_dir_all(&mgr.home_dir);
     }
 
-    #[test]
-    fn test_builder_without_agent_tool() {
+    #[tokio::test]
+    async fn test_builder_without_agent_tool() {
         let client = dummy_client();
         let (mgr, session_id) = temp_manager();
         let builder = AgentLoopBuilder::new("Test".into(), mgr.clone())
             .with_session_id(session_id)
             .with_agent_tool(false);
         
-        let (_, _, _) = builder.build(client);
+        let (_, _, _) = builder.build(client).await;
         
         let _ = std::fs::remove_dir_all(&mgr.home_dir);
     }
 
-    #[test]
-    fn test_builder_handles_empty_system_prompt() {
+    #[tokio::test]
+    async fn test_builder_handles_empty_system_prompt() {
         let client = dummy_client();
         let (mgr, session_id) = temp_manager();
         let builder = AgentLoopBuilder::new("".into(), mgr.clone())
             .with_session_id(session_id);
         
-        let (_, _, _) = builder.build(client);
+        let (_, _, _) = builder.build(client).await;
         
         let _ = std::fs::remove_dir_all(&mgr.home_dir);
     }
 
-    #[test]
-    fn test_context_tx_can_subscribe() {
+    #[tokio::test]
+    async fn test_context_tx_can_subscribe() {
         let client = dummy_client();
         let (mgr, session_id) = temp_manager();
         let builder = AgentLoopBuilder::new("Test".into(), mgr.clone())
             .with_session_id(session_id);
         
-        let (_, _, context_tx) = builder.build(client);
+        let (_, _, context_tx) = builder.build(client).await;
         
         let mut rx = context_tx.subscribe();
         context_tx.send(ContextEvent::Cancel).unwrap();

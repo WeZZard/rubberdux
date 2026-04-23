@@ -222,3 +222,9 @@ Comments explain the purpose of the item they're attached to, not how other part
 - Do not introduce workflow engines or heavy orchestration frameworks.
 - Do not use `unsafe` without explicit approval.
 - Do not add dependencies without justification.
+
+## OpenCode
+
+You **MUST** save plan to `.opencode/plans/{YYYY-MM-DD-hh-mm-ss-Tz}-{plan-name}`.md when you (OpenCode) are asked to save/consolidate the plan.
+You **MUST** use `{YYYY-MM-DD-hh-mm-ss-Tz}` has the prefix of the plan file.
+You **MUST** use lower case in the plan file name.

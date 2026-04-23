@@ -68,7 +68,7 @@ pub fn spawn_subagent(
             context_tx: None,
         };
 
-        let (agent_loop, input_port) = AgentLoop::new(config);
+        let (agent_loop, input_port) = AgentLoop::new(config).await;
 
         // Send the initial prompt as a UserMessage with a reply channel
         // so the AgentLoop starts a conversation (reply: None would be

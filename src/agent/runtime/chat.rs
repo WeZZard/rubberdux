@@ -123,7 +123,7 @@ pub async fn run_with_session(
         context_tx: Some(context_tx),
     };
 
-    let (agent_loop, input_port) = AgentLoop::new(config);
+    let (agent_loop, input_port) = AgentLoop::new(config).await;
 
     // Telegram adapter: convert ChannelEvent -> LoopEvent
     let last_user_query_adapter = last_user_query.clone();

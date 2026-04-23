@@ -22,16 +22,22 @@ pub struct AgentLoopHarness {
 impl AgentLoopHarness {
     pub async fn new(system_prompt: &str, session_path: PathBuf) -> Self {
         let client = Arc::new(MoonshotClient::from_env());
+        let registry = build_tool_registry(client.clone());
+        Self::new_with_registry(system_prompt, session_path, client, Arc::new(registry)).await
+    }
 
+    pub async fn new_with_registry(
+        system_prompt: &str,
+        session_path: PathBuf,
+        client: Arc<MoonshotClient>,
+        registry: Arc<ToolRegistry>,
+    ) -> Self {
         let session_dir = session_path.parent().map(|p| p.to_path_buf());
         let tool_results_dir = session_dir.as_ref().map(|d| d.join("tool-results"));
 
-        // Build full tool registry (same as production)
-        let registry = build_tool_registry(client.clone());
-
         let config = AgentLoopConfig {
             client,
-            registry: Arc::new(registry),
+            registry,
             system_prompt: system_prompt.to_string(),
             session_path: Some(session_path.clone()),
             tool_results_dir,
@@ -41,7 +47,7 @@ impl AgentLoopHarness {
             context_tx: None,
         };
 
-        let (agent_loop, input_port) = AgentLoop::new(config);
+        let (agent_loop, input_port) = AgentLoop::new(config).await;
         let handle = tokio::spawn(async move {
             agent_loop.run().await;
         });

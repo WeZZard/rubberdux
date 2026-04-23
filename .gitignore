@@ -7,3 +7,5 @@ tests/results/
 ide-support/zed-md-testing/target/
 *.wasm
 Cargo.lock
+
+.opencode/plans
