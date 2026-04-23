@@ -157,12 +157,25 @@ pub async fn run(
     use crate::agent::runtime::port::LoopEvent;
     use crate::provider::moonshot::{Message, UserContent};
 
-    // Build local AgentLoop
-    let data_dir = std::env::var("RUBBERDUX_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./sessions"));
+    // Initialize session manager and create new session
+    let session_manager = Arc::new(crate::session::SessionManager::new());
+    let model = std::env::var("RUBBERDUX_LLM_MODEL").unwrap_or_else(|_| "kimi-for-coding".into());
+    let (session_id, session_dir) = session_manager.create_session(model)
+        .expect("Failed to create session");
+    
+    log::info!("Created session: {} at {}", session_id.to_string(), session_dir.display());
 
-    let _ = std::fs::create_dir_all(&data_dir);
+    // Set up logging to session directory
+    let log_path = session_manager.session_log_path(&session_id);
+    // Note: env_logger already initialized in main(), but we can redirect if needed
+    
+    // Create project root symlink if missing
+    let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if !project_root.join("sessions").exists() {
+        if let Err(e) = crate::session::SessionManager::create_project_symlink(&project_root) {
+            log::warn!("Failed to create project sessions symlink: {}", e);
+        }
+    }
 
     let prompt_dir = crate::hardened_prompts::prompt_dir();
     let prompt_parts = crate::hardened_prompts::load_prompt_parts(&prompt_dir);
@@ -170,7 +183,8 @@ pub async fn run(
 
     let client = Arc::new(crate::provider::moonshot::MoonshotClient::from_env());
 
-    let builder = AgentLoopBuilder::new(system_prompt, data_dir);
+    let builder = AgentLoopBuilder::new(system_prompt, session_manager)
+        .with_session_id(session_id);
     let (agent_loop, input_port, _context_tx) = builder.build(client);
 
     // Spawn AgentLoop

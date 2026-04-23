@@ -9,6 +9,7 @@ use crate::agent::runtime::compaction::EvictOldestTurns;
 use crate::agent::runtime::port::InputPort;
 use crate::agent::runtime::subagent::ContextEvent;
 use crate::provider::moonshot::MoonshotClient;
+use crate::session::SessionManager;
 use crate::tool::ToolRegistry;
 use crate::tool::agent::{build_subagent_registries, AgentTool};
 use crate::tool::edit::EditFileTool;
@@ -23,25 +24,25 @@ use crate::provider::moonshot::tool::web_search::WebSearchTool;
 /// Configuration for building an AgentLoop.
 pub struct AgentLoopBuilder {
     pub system_prompt: String,
-    pub data_dir: PathBuf,
-    pub session_file: String,
+    pub session_manager: Arc<SessionManager>,
+    pub session_id: Option<crate::session::SessionId>,
     pub token_budget: usize,
     pub with_agent_tool: bool,
 }
 
 impl AgentLoopBuilder {
-    pub fn new(system_prompt: String, data_dir: PathBuf) -> Self {
+    pub fn new(system_prompt: String, session_manager: Arc<SessionManager>) -> Self {
         Self {
             system_prompt,
-            data_dir,
-            session_file: "session.jsonl".to_string(),
+            session_manager,
+            session_id: None,
             token_budget: 153_600,
             with_agent_tool: true,
         }
     }
 
-    pub fn with_session_file(mut self, file: String) -> Self {
-        self.session_file = file;
+    pub fn with_session_id(mut self, session_id: crate::session::SessionId) -> Self {
+        self.session_id = Some(session_id);
         self
     }
 
@@ -57,15 +58,11 @@ impl AgentLoopBuilder {
 
     /// Build the AgentLoop and return it along with its input port and context broadcaster.
     pub fn build(self, client: Arc<MoonshotClient>) -> (AgentLoop, InputPort, broadcast::Sender<ContextEvent>) {
-        let sessions_dir = self.data_dir.join("sessions");
-        let tool_results_dir = self.data_dir.join("tool-results");
-        let subagents_dir = self.data_dir.join("subagents");
+        let session_id = self.session_id.expect("session_id must be set before building");
+        let main_agent_dir = self.session_manager.main_agent_dir(&session_id);
+        let tool_results_dir = main_agent_dir.join("tool_results");
 
-        let _ = std::fs::create_dir_all(&sessions_dir);
-        let _ = std::fs::create_dir_all(&tool_results_dir);
-        let _ = std::fs::create_dir_all(&subagents_dir);
-
-        let session_path = sessions_dir.join(&self.session_file);
+        let session_path = main_agent_dir.join("session.jsonl");
 
         let (context_tx, _) = broadcast::channel::<ContextEvent>(64);
         let cancel = CancellationToken::new();
@@ -93,7 +90,8 @@ impl AgentLoopBuilder {
                     subagent_registries,
                     self.system_prompt.clone(),
                     context_tx.clone(),
-                    Some(subagents_dir),
+                    Some(self.session_manager.clone()),
+                    Some(session_id),
                 )));
             }
 
@@ -122,6 +120,7 @@ impl AgentLoopBuilder {
 mod tests {
     use super::*;
     use std::sync::RwLock;
+    use crate::session::SessionManager;
 
     fn dummy_client() -> Arc<MoonshotClient> {
         Arc::new(MoonshotClient::new(
@@ -132,98 +131,78 @@ mod tests {
         ))
     }
 
-    fn temp_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("rubberdux-test-{}", std::process::id()))
+    fn temp_manager() -> (Arc<SessionManager>, crate::session::SessionId) {
+        let home = std::env::temp_dir().join(format!("rubberdux-test-{}", std::process::id()));
+        let mgr = Arc::new(SessionManager {
+            home_dir: home.clone(),
+            sessions_dir: home.join("sessions"),
+            latest_link: home.join("latest"),
+        });
+        let (session_id, _) = mgr.create_session("test-model".into()).unwrap();
+        (mgr, session_id)
     }
 
     #[test]
     fn test_builder_creates_agent_loop_happy_path() {
         let client = dummy_client();
-        let data_dir = temp_dir();
-        let builder = AgentLoopBuilder::new("Test system prompt".into(), data_dir.clone());
+        let (mgr, session_id) = temp_manager();
+        let builder = AgentLoopBuilder::new("Test system prompt".into(), mgr.clone())
+            .with_session_id(session_id.clone());
         
         let (agent_loop, input_port, context_tx) = builder.build(client);
         
-        // Verify directories were created
-        assert!(data_dir.join("sessions").exists(), "sessions dir should be created");
-        assert!(data_dir.join("tool-results").exists(), "tool-results dir should be created");
-        assert!(data_dir.join("subagents").exists(), "subagents dir should be created");
+        // Verify main agent dir was created
+        assert!(mgr.main_agent_dir(&session_id).exists(), "main agent dir should exist");
+        assert!(mgr.main_agent_dir(&session_id).join("tool_results").exists());
         
         // Clean up
-        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&mgr.home_dir);
     }
 
     #[test]
     fn test_builder_with_custom_token_budget() {
         let client = dummy_client();
-        let data_dir = temp_dir();
-        let builder = AgentLoopBuilder::new("Test".into(), data_dir.clone())
+        let (mgr, session_id) = temp_manager();
+        let builder = AgentLoopBuilder::new("Test".into(), mgr.clone())
+            .with_session_id(session_id)
             .with_token_budget(50_000);
         
         let (_, _, _) = builder.build(client);
         
-        // If we could inspect the AgentLoop's config, we'd verify budget
-        // For now, we just verify it doesn't panic
-        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&mgr.home_dir);
     }
 
     #[test]
     fn test_builder_without_agent_tool() {
         let client = dummy_client();
-        let data_dir = temp_dir();
-        let builder = AgentLoopBuilder::new("Test".into(), data_dir.clone())
+        let (mgr, session_id) = temp_manager();
+        let builder = AgentLoopBuilder::new("Test".into(), mgr.clone())
+            .with_session_id(session_id)
             .with_agent_tool(false);
         
         let (_, _, _) = builder.build(client);
         
-        // Verify it builds successfully without agent tool
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
-    #[test]
-    fn test_builder_with_custom_session_file() {
-        let client = dummy_client();
-        let data_dir = temp_dir();
-        let builder = AgentLoopBuilder::new("Test".into(), data_dir.clone())
-            .with_session_file("custom.jsonl".into());
-        
-        let (_, _, _) = builder.build(client);
-        
-        // Verify custom session file path would be used
-        // (We can't easily inspect the AgentLoop's private config)
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
-    #[test]
-    fn test_builder_creates_directories_on_existing_parent() {
-        let client = dummy_client();
-        let data_dir = temp_dir();
-        std::fs::create_dir_all(&data_dir).unwrap();
-        
-        let builder = AgentLoopBuilder::new("Test".into(), data_dir.clone());
-        let (_, _, _) = builder.build(client);
-        
-        assert!(data_dir.join("sessions").exists());
-        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&mgr.home_dir);
     }
 
     #[test]
     fn test_builder_handles_empty_system_prompt() {
         let client = dummy_client();
-        let data_dir = temp_dir();
-        let builder = AgentLoopBuilder::new("".into(), data_dir.clone());
+        let (mgr, session_id) = temp_manager();
+        let builder = AgentLoopBuilder::new("".into(), mgr.clone())
+            .with_session_id(session_id);
         
         let (_, _, _) = builder.build(client);
         
-        // Should not panic with empty prompt
-        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&mgr.home_dir);
     }
 
     #[test]
     fn test_context_tx_can_subscribe() {
         let client = dummy_client();
-        let data_dir = temp_dir();
-        let builder = AgentLoopBuilder::new("Test".into(), data_dir.clone());
+        let (mgr, session_id) = temp_manager();
+        let builder = AgentLoopBuilder::new("Test".into(), mgr.clone())
+            .with_session_id(session_id);
         
         let (_, _, context_tx) = builder.build(client);
         
@@ -233,6 +212,6 @@ mod tests {
         let received = rx.try_recv();
         assert!(received.is_ok(), "Should receive context event");
         
-        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&mgr.home_dir);
     }
 }

@@ -7,6 +7,7 @@ mod host;
 mod hardened_prompts;
 mod protocol;
 mod provider;
+mod session;
 mod tool;
 mod vm;
 

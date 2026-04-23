@@ -4,8 +4,7 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/../../../.." && pwd)"
 cd "$PROJECT_DIR"
 
-SESSION_DIR="${RUBBERDUX_SESSION_DIR:-./sessions}"
-PID_FILE="$SESSION_DIR/rubberdux.pid"
+PID_FILE="$PROJECT_DIR/rubberdux.pid"
 
 # Stop the running process
 if [ -f "$PID_FILE" ]; then
@@ -27,37 +26,21 @@ else
     echo "No PID file found. Nothing to stop."
 fi
 
-# Clean up session artifacts
-CLEANED=0
-
-if [ -f "$SESSION_DIR/launch.log" ]; then
-    rm -f "$SESSION_DIR/launch.log"
-    CLEANED=$((CLEANED + 1))
+# Stop any Tart VMs
+VM_COUNT=0
+if command -v tart &> /dev/null; then
+    while IFS= read -r line; do
+        if echo "$line" | grep -q "rubberdux-"; then
+            VM_NAME=$(echo "$line" | awk '{print $2}')
+            echo "Stopping VM: $VM_NAME"
+            tart stop "$VM_NAME" 2>/dev/null || true
+            VM_COUNT=$((VM_COUNT + 1))
+        fi
+    done < <(tart list 2>/dev/null | grep "running" || true)
 fi
 
-if [ -d "$SESSION_DIR/tasks" ]; then
-    COUNT=$(find "$SESSION_DIR/tasks" -type f | wc -l | tr -d ' ')
-    rm -rf "$SESSION_DIR/tasks"
-    echo "Removed tasks/ ($COUNT files)"
-    CLEANED=$((CLEANED + COUNT))
+if [ "$VM_COUNT" -gt 0 ]; then
+    echo "Stopped $VM_COUNT VM(s)."
 fi
 
-if [ -d "$SESSION_DIR/subagents" ]; then
-    COUNT=$(find "$SESSION_DIR/subagents" -type f | wc -l | tr -d ' ')
-    rm -rf "$SESSION_DIR/subagents"
-    echo "Removed subagents/ ($COUNT files)"
-    CLEANED=$((CLEANED + COUNT))
-fi
-
-if [ -d "$SESSION_DIR/tool-results" ]; then
-    COUNT=$(find "$SESSION_DIR/tool-results" -type f | wc -l | tr -d ' ')
-    rm -rf "$SESSION_DIR/tool-results"
-    echo "Removed tool-results/ ($COUNT files)"
-    CLEANED=$((CLEANED + COUNT))
-fi
-
-if [ "$CLEANED" -gt 0 ]; then
-    echo "Cleaned $CLEANED artifact(s)."
-else
-    echo "No artifacts to clean."
-fi
+echo "Cleanup complete."

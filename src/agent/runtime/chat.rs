@@ -98,7 +98,8 @@ pub async fn run_with_session(
             subagent_registries,
             system_prompt.clone(),
             context_tx.clone(),
-            session_dir,
+            None,
+            None,
         )));
         log::info!(
             "Tool registry: {:?}",

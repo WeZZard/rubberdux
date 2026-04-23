@@ -10,6 +10,7 @@ use crate::agent::runtime::subagent::{spawn_subagent, ContextEvent};
 use crate::hardened_prompts::subagent_preamble;
 use crate::provider::moonshot::MoonshotClient;
 use crate::provider::moonshot::tool::ToolDefinition;
+use crate::session::{AgentMetadata, SessionManager};
 use crate::tool::{SubagentType, ToolRegistry};
 
 use super::ToolOutcome;
@@ -76,8 +77,10 @@ pub struct AgentTool {
     registries: HashMap<SubagentType, Arc<ToolRegistry>>,
     base_system_prompt: String,
     context_tx: broadcast::Sender<ContextEvent>,
-    /// Session directory for persisting subagent sessions and metadata.
-    session_dir: Option<PathBuf>,
+    /// Session manager for creating subagent directories.
+    session_manager: Option<Arc<SessionManager>>,
+    /// Current session ID for creating subagent directories.
+    session_id: Option<crate::session::SessionId>,
 }
 
 impl AgentTool {
@@ -86,14 +89,16 @@ impl AgentTool {
         registries: HashMap<SubagentType, Arc<ToolRegistry>>,
         base_system_prompt: String,
         context_tx: broadcast::Sender<ContextEvent>,
-        session_dir: Option<PathBuf>,
+        session_manager: Option<Arc<SessionManager>>,
+        session_id: Option<crate::session::SessionId>,
     ) -> Self {
         Self {
             client,
             registries,
             base_system_prompt,
             context_tx,
-            session_dir,
+            session_manager,
+            session_id,
         }
     }
 }
@@ -175,26 +180,29 @@ impl super::Tool for AgentTool {
                 &prompt[..prompt.len().min(100)]
             );
 
-            // Persist subagent session and metadata alongside the main session
+            // Persist subagent session and metadata using SessionManager
             let (subagent_session, subagent_tool_results) =
-                if let Some(ref dir) = self.session_dir {
-                    let subagents_dir = dir.join("subagents");
-                    let _ = std::fs::create_dir_all(&subagents_dir);
-
-                    let meta = serde_json::json!({
-                        "agent_id": task_id,
-                        "subagent_type": format!("{:?}", subagent_type),
-                    });
-                    let meta_path = subagents_dir.join(format!("{}.meta.json", task_id));
-                    if let Ok(json) = serde_json::to_string_pretty(&meta) {
-                        let _ = std::fs::write(&meta_path, json);
+                if let (Some(mgr), Some(session_id)) = (&self.session_manager, &self.session_id) {
+                    let metadata = AgentMetadata::for_subagent(
+                        "kimi-for-coding".into(), // TODO: get actual model from client
+                        task_id.clone(),
+                        session_id.to_string(),
+                        format!("{:?}", subagent_type),
+                    );
+                    
+                    match mgr.create_subagent_dir(session_id, &task_id, &metadata, &prompt) {
+                        Ok(agent_dir) => {
+                            let tool_results_dir = agent_dir.join("tool_results");
+                            (
+                                Some(agent_dir.join("session.jsonl")),
+                                Some(tool_results_dir),
+                            )
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to create subagent dir: {}", e);
+                            (None, None)
+                        }
                     }
-
-                    let tool_results_dir = dir.join("tool-results");
-                    (
-                        Some(subagents_dir.join(format!("{}.jsonl", task_id))),
-                        Some(tool_results_dir),
-                    )
                 } else {
                     (None, None)
                 };
@@ -245,6 +253,7 @@ mod tests {
             registries,
             "test system prompt".into(),
             context_tx,
+            None,
             None,
         )
     }
@@ -406,6 +415,7 @@ mod tests {
             HashMap::new(), // empty registries
             "test system prompt".into(),
             context_tx,
+            None,
             None,
         );
         let outcome = <AgentTool as Tool>::execute(

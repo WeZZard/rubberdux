@@ -5,17 +5,6 @@ use tokio::time::{sleep, Duration};
 
 use crate::provision::provision_images;
 
-fn current_timestamp() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    let tm = time::OffsetDateTime::from_unix_timestamp(secs as i64).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
-    format!("{:04}{:02}{:02}_{:02}{:02}{:02}",
-        tm.year(), tm.month() as u8, tm.day(),
-        tm.hour(), tm.minute(), tm.second())
-}
-
 pub async fn launch_rubberdux() -> Result<(), String> {
     let project_dir = std::env::current_dir()
         .map_err(|e| format!("Failed to get current directory: {}", e))?;
@@ -27,19 +16,34 @@ pub async fn launch_rubberdux() -> Result<(), String> {
         let _ = dotenvy::from_path(&env_path);
     }
 
+    // Set RUBBERDUX_HOME if not set
+    if std::env::var("RUBBERDUX_HOME").is_err() {
+        let home = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".rubberdux");
+        std::env::set_var("RUBBERDUX_HOME", &home);
+        println!("Set RUBBERDUX_HOME to {}", home.display());
+    }
+
+    // Create project root symlink if missing
+    let sessions_link = project_dir.join("sessions");
+    if !sessions_link.exists() {
+        let home = PathBuf::from(std::env::var("RUBBERDUX_HOME").unwrap());
+        let target = home.join("sessions");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target, &sessions_link)
+                .map_err(|e| format!("Failed to create sessions symlink: {}", e))?;
+            println!("Created sessions symlink: {} -> {}", sessions_link.display(), target.display());
+        }
+    }
+
     // Provision VMs
     println!("Provisioning VMs...");
     provision_images(None).await?;
 
-    let session_dir = PathBuf::from(
-        std::env::var("RUBBERDUX_SESSION_DIR").unwrap_or_else(|_| "./sessions".into()));
-    let log_file = session_dir.join("launch.log");
-    let pid_file = session_dir.join("rubberdux.pid");
-
-    fs::create_dir_all(&session_dir).await
-        .map_err(|e| format!("Failed to create session dir: {}", e))?;
-
     // Stop existing instance
+    let pid_file = project_dir.join("sessions").join("rubberdux.pid");
     if pid_file.exists() {
         let old_pid = fs::read_to_string(&pid_file).await.unwrap_or_default();
         let old_pid = old_pid.trim();
@@ -79,22 +83,6 @@ pub async fn launch_rubberdux() -> Result<(), String> {
         }
     }
 
-    // Archive previous session
-    let session_file = session_dir.join("main-agent.jsonl");
-    if session_file.exists() {
-        let archive_dir = session_dir.join("archive");
-        fs::create_dir_all(&archive_dir).await
-            .map_err(|e| format!("Failed to create archive dir: {}", e))?;
-        let archive_name = format!(
-            "main-agent.{}.jsonl",
-            current_timestamp()
-        );
-        let archive_path = archive_dir.join(&archive_name);
-        fs::rename(&session_file, &archive_path).await
-            .map_err(|e| format!("Failed to archive session: {}", e))?;
-        println!("Archived previous session to {}", archive_name);
-    }
-
     // Build
     println!("Building rubberdux...");
     let status = Command::new("cargo")
@@ -107,22 +95,26 @@ pub async fn launch_rubberdux() -> Result<(), String> {
     println!("Build succeeded.");
 
     // Launch as background process
-    println!("Launching rubberdux (log: {})...", log_file.display());
+    println!("Launching rubberdux...");
     let child = Command::new("nohup")
         .args([
             "cargo", "run", "--release", "--", "--host"
         ])
-        .stdout(std::fs::File::create(&log_file).map_err(|e| format!("Failed to create log file: {}", e))?)
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("Failed to launch rubberdux: {}", e))?;
 
     let pid = child.id();
-    fs::write(&pid_file, pid.to_string()).await
+    
+    // Write PID file to project root for easy access
+    let root_pid_file = project_dir.join("rubberdux.pid");
+    fs::write(&root_pid_file, pid.to_string()).await
         .map_err(|e| format!("Failed to write PID file: {}", e))?;
+    
     println!("rubberdux started (PID {})", pid);
 
-    // Wait briefly for startup, then tail initial log
+    // Wait briefly for startup
     sleep(Duration::from_secs(2)).await;
 
     // Check if process is still running
@@ -133,20 +125,12 @@ pub async fn launch_rubberdux() -> Result<(), String> {
         .unwrap_or(false);
 
     if still_running {
-        println!("--- Startup log (first 50 lines) ---");
-        let log_content = fs::read_to_string(&log_file).await.unwrap_or_default();
-        for line in log_content.lines().take(50) {
-            println!("{}", line);
-        }
-        println!("--- End startup log ---");
-        println!();
         println!("rubberdux is running. PID: {}", pid);
-        println!("Full log: {}", log_file.display());
-        println!("Stop with: kill {}", pid);
+        println!("Session will be created in $RUBBERDUX_HOME/sessions/");
+        println!("Latest session symlink: $RUBBERDUX_HOME/latest");
+        println!("Stop with: cargo xtask stop");
     } else {
-        println!("rubberdux exited immediately. Full log:");
-        let log_content = fs::read_to_string(&log_file).await.unwrap_or_default();
-        println!("{}", log_content);
+        println!("rubberdux exited immediately. Check logs in $RUBBERDUX_HOME/sessions/");
         return Err("rubberdux exited immediately".into());
     }
 

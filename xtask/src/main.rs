@@ -2,9 +2,11 @@ use clap::{Parser, Subcommand};
 
 mod provision;
 mod launch;
+mod sessions;
 
 use provision::provision_images;
 use launch::launch_rubberdux;
+use sessions::{list_sessions, archive_session, delete_session, clear_sessions};
 
 #[derive(Parser)]
 #[command(name = "xtask")]
@@ -22,6 +24,27 @@ enum Commands {
     },
     /// Provision VMs, build, and launch rubberdux
     Launch,
+    /// Manage sessions
+    Sessions {
+        #[command(subcommand)]
+        action: SessionCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionCommands {
+    /// List all sessions
+    List,
+    /// Archive a session
+    Archive {
+        session_id: String,
+    },
+    /// Delete a session
+    Delete {
+        session_id: String,
+    },
+    /// Clear all sessions except latest
+    Clear,
 }
 
 #[tokio::main]
@@ -38,6 +61,14 @@ async fn main() {
             if let Err(e) = launch_rubberdux().await {
                 eprintln!("Launch failed: {}", e);
                 std::process::exit(1);
+            }
+        }
+        Commands::Sessions { action } => {
+            match action {
+                SessionCommands::List => list_sessions(),
+                SessionCommands::Archive { session_id } => archive_session(&session_id),
+                SessionCommands::Delete { session_id } => delete_session(&session_id),
+                SessionCommands::Clear => clear_sessions(),
             }
         }
     }
