@@ -30,7 +30,11 @@ impl MockBackgroundTool {
 
     /// Trigger completion from test code. Panics if no background task is pending.
     pub fn complete(&self, content: &str) {
-        let tx = self.completion_tx.lock().unwrap().take()
+        let tx = self
+            .completion_tx
+            .lock()
+            .unwrap()
+            .take()
             .expect("No pending background task to complete");
         let _ = tx.send(BackgroundTaskResult {
             task_id: format!("mock_{}", self.name),

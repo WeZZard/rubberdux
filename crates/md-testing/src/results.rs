@@ -27,7 +27,9 @@ pub struct AssertionResult {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AssertionScope {
     Storyline,
-    UserMessage { msg_index: usize },
+    UserMessage {
+        msg_index: usize,
+    },
     AssistantMessage {
         slot_index: usize,
         actual_index: Option<usize>,

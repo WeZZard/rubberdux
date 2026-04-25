@@ -71,7 +71,10 @@ mod tests {
             depends_on: None,
         };
         let json = serde_json::to_value(&tc).unwrap();
-        assert!(json.get("depends_on").is_none(), "depends_on: None should be omitted");
+        assert!(
+            json.get("depends_on").is_none(),
+            "depends_on: None should be omitted"
+        );
 
         // With depends_on
         let tc2 = ToolCall {

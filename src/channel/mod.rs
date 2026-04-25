@@ -15,9 +15,7 @@ pub enum ChannelEvent {
     },
     /// Context update that adds a message to history without triggering LLM processing.
     /// Used for batched user messages where only the last message should trigger a response.
-    ContextUpdate {
-        text: String,
-    },
+    ContextUpdate { text: String },
     /// Channel-internal event that mutates history without calling the LLM.
     InternalEvent(InternalEvent),
 }
@@ -26,14 +24,9 @@ pub enum ChannelEvent {
 /// Channel-specific internal events.
 pub enum InternalEvent {
     /// Associates a channel-side message ID with an assistant message in history.
-    UpdateAssistantMessageId {
-        entry_id: usize,
-        message_id: i32,
-    },
+    UpdateAssistantMessageId { entry_id: usize, message_id: i32 },
     /// Provides an updated reaction section for the system prompt.
-    UpdateAvailableReactions {
-        reaction_section: String,
-    },
+    UpdateAvailableReactions { reaction_section: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

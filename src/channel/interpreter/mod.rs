@@ -117,43 +117,41 @@ pub fn interpret_reaction(
     // Determine added reactions (in new but not in old)
     for new_r in &reaction.new_reaction {
         let is_new = !reaction.old_reaction.iter().any(|old| old == new_r);
-        if is_new
-            && let Some(emoji) = new_r.emoji() {
-                let doc = Document {
-                    nodes: vec![Node::Reaction(ReactionElement {
-                        from: "user".into(),
-                        action: "add".into(),
-                        emoji: emoji.to_string(),
-                        message_id: message_id.to_string(),
-                        date: Some(date.clone()),
-                    })],
-                };
-                results.push(InterpretedMessage {
-                    text: markup::serialize(&doc),
-                    attachments: vec![],
-                });
-            }
+        if is_new && let Some(emoji) = new_r.emoji() {
+            let doc = Document {
+                nodes: vec![Node::Reaction(ReactionElement {
+                    from: "user".into(),
+                    action: "add".into(),
+                    emoji: emoji.to_string(),
+                    message_id: message_id.to_string(),
+                    date: Some(date.clone()),
+                })],
+            };
+            results.push(InterpretedMessage {
+                text: markup::serialize(&doc),
+                attachments: vec![],
+            });
+        }
     }
 
     // Determine removed reactions (in old but not in new)
     for old_r in &reaction.old_reaction {
         let is_removed = !reaction.new_reaction.iter().any(|new| new == old_r);
-        if is_removed
-            && let Some(emoji) = old_r.emoji() {
-                let doc = Document {
-                    nodes: vec![Node::Reaction(ReactionElement {
-                        from: "user".into(),
-                        action: "remove".into(),
-                        emoji: emoji.to_string(),
-                        message_id: message_id.to_string(),
-                        date: Some(date.clone()),
-                    })],
-                };
-                results.push(InterpretedMessage {
-                    text: markup::serialize(&doc),
-                    attachments: vec![],
-                });
-            }
+        if is_removed && let Some(emoji) = old_r.emoji() {
+            let doc = Document {
+                nodes: vec![Node::Reaction(ReactionElement {
+                    from: "user".into(),
+                    action: "remove".into(),
+                    emoji: emoji.to_string(),
+                    message_id: message_id.to_string(),
+                    date: Some(date.clone()),
+                })],
+            };
+            results.push(InterpretedMessage {
+                text: markup::serialize(&doc),
+                attachments: vec![],
+            });
+        }
     }
 
     results

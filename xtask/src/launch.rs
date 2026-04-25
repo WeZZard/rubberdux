@@ -6,8 +6,8 @@ use tokio::time::{sleep, Duration};
 use crate::provision::provision_images;
 
 pub async fn launch_rubberdux() -> Result<(), String> {
-    let project_dir = std::env::current_dir()
-        .map_err(|e| format!("Failed to get current directory: {}", e))?;
+    let project_dir =
+        std::env::current_dir().map_err(|e| format!("Failed to get current directory: {}", e))?;
 
     // Read .env file if present
     let env_path = project_dir.join(".env");
@@ -37,7 +37,11 @@ pub async fn launch_rubberdux() -> Result<(), String> {
         {
             std::os::unix::fs::symlink(&target, &sessions_link)
                 .map_err(|e| format!("Failed to create sessions symlink: {}", e))?;
-            println!("Created sessions symlink: {} -> {}", sessions_link.display(), target.display());
+            println!(
+                "Created sessions symlink: {} -> {}",
+                sessions_link.display(),
+                target.display()
+            );
         }
     }
 
@@ -57,7 +61,8 @@ pub async fn launch_rubberdux() -> Result<(), String> {
     let log_file = session_dir.join("launch.log");
     let pid_file = session_dir.join("rubberdux.pid");
 
-    fs::create_dir_all(&session_dir).await
+    fs::create_dir_all(&session_dir)
+        .await
         .map_err(|e| format!("Failed to create session directory: {}", e))?;
 
     // Provision VMs
@@ -71,27 +76,21 @@ pub async fn launch_rubberdux() -> Result<(), String> {
         if !old_pid.is_empty() {
             if let Ok(pid) = old_pid.parse::<i32>() {
                 println!("Stopping existing instance (PID {})...", pid);
-                let _ = Command::new("kill")
-                    .arg(old_pid)
-                    .status();
+                let _ = Command::new("kill").arg(old_pid).status();
                 sleep(Duration::from_secs(1)).await;
-                let _ = Command::new("kill")
-                    .args(["-9", old_pid])
-                    .status();
+                let _ = Command::new("kill").args(["-9", old_pid]).status();
             }
         }
         let _ = fs::remove_file(&pid_file).await;
     }
 
     // Stop leaked VMs
-    let vm_list = Command::new("tart")
-        .args(["list"])
-        .output()
-        .ok();
+    let vm_list = Command::new("tart").args(["list"]).output().ok();
     if let Some(output) = vm_list {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
-            if line.starts_with("local") && line.contains("rubberdux-") && line.contains("running") {
+            if line.starts_with("local") && line.contains("rubberdux-") && line.contains("running")
+            {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 2 {
                     let vm_name = parts[1];
@@ -108,10 +107,19 @@ pub async fn launch_rubberdux() -> Result<(), String> {
     let session_jsonl = session_dir.join("session.jsonl");
     if session_jsonl.exists() {
         let now = time::OffsetDateTime::now_utc();
-        let timestamp = format!("{:04}{:02}{:02}_{:02}{:02}{:02}", now.year(), now.month() as u8, now.day(), now.hour(), now.minute(), now.second());
+        let timestamp = format!(
+            "{:04}{:02}{:02}_{:02}{:02}{:02}",
+            now.year(),
+            now.month() as u8,
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second()
+        );
         let archive_name = format!("session.{}.jsonl", timestamp);
         let archive_path = session_dir.join(&archive_name);
-        fs::rename(&session_jsonl, &archive_path).await
+        fs::rename(&session_jsonl, &archive_path)
+            .await
             .map_err(|e| format!("Failed to archive session: {}", e))?;
         println!("Archived previous session to {}", archive_name);
     }
@@ -131,20 +139,20 @@ pub async fn launch_rubberdux() -> Result<(), String> {
     println!("Launching rubberdux (log: {})...", log_file.display());
     let log_file_std = std::fs::File::create(&log_file)
         .map_err(|e| format!("Failed to create log file: {}", e))?;
-    let log_file_stderr = log_file_std.try_clone()
+    let log_file_stderr = log_file_std
+        .try_clone()
         .map_err(|e| format!("Failed to clone log file handle: {}", e))?;
 
     let child = Command::new("nohup")
-        .args([
-            "cargo", "run", "--release", "--", "--host"
-        ])
+        .args(["cargo", "run", "--release", "--", "--host"])
         .stdout(Stdio::from(log_file_std))
         .stderr(Stdio::from(log_file_stderr))
         .spawn()
         .map_err(|e| format!("Failed to launch rubberdux: {}", e))?;
 
     let pid = child.id();
-    fs::write(&pid_file, pid.to_string()).await
+    fs::write(&pid_file, pid.to_string())
+        .await
         .map_err(|e| format!("Failed to write PID file: {}", e))?;
     println!("rubberdux started (PID {})", pid);
 

@@ -1,11 +1,11 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serial_test::serial;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use rubberdux::agent::runtime::subagent::{spawn_subagent, ContextEvent};
+use rubberdux::agent::runtime::subagent::{ContextEvent, spawn_subagent};
 use rubberdux::hardened_prompts::subagent_preamble;
 use rubberdux::provider::moonshot::{Message, MoonshotClient, UserContent};
 use rubberdux::tool::{SubagentType, ToolRegistry};
@@ -26,17 +26,13 @@ fn readonly_registry(client: &Arc<MoonshotClient>) -> Arc<ToolRegistry> {
     use rubberdux::tool::grep::GrepTool;
     use rubberdux::tool::read::ReadFileTool;
 
-    let last_query = Arc::new(RwLock::new(String::new()));
     Arc::new({
         let mut r = ToolRegistry::new();
         r.register(Box::new(GlobTool));
         r.register(Box::new(GrepTool));
         r.register(Box::new(ReadFileTool));
         r.register(Box::new(MoonshotWebFetchTool::new()));
-        r.register(Box::new(WebSearchTool::new(
-            client.clone(),
-            last_query.clone(),
-        )));
+        r.register(Box::new(WebSearchTool::new(client.clone())));
         r
     })
 }

@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use md_testing::TestResults;
 use tokio::sync::RwLock;
-use tower_lsp::lsp_types::*;
 use tower_lsp::Client;
+use tower_lsp::lsp_types::*;
 
 /// Stores and manages test results from the results directory.
 #[derive(Debug)]
@@ -50,12 +50,11 @@ impl ResultsStore {
                     let docs = documents.read().await;
                     for (uri, content) in docs.iter() {
                         if uri.path().ends_with(".testcase.md") {
-                            let diagnostics = crate::diagnostics::build_diagnostics(
-                                content,
-                                uri,
-                                &self,
-                            ).await;
-                            client.publish_diagnostics(uri.clone(), diagnostics, None).await;
+                            let diagnostics =
+                                crate::diagnostics::build_diagnostics(content, uri, &self).await;
+                            client
+                                .publish_diagnostics(uri.clone(), diagnostics, None)
+                                .await;
                         }
                     }
                 }
@@ -65,9 +64,7 @@ impl ResultsStore {
 
     /// Scan the results directory and load the latest results for each test case.
     /// Returns true if any results were updated.
-    async fn scan_results_dir(&self,
-        results_dir: &Path,
-    ) -> bool {
+    async fn scan_results_dir(&self, results_dir: &Path) -> bool {
         if !results_dir.exists() {
             return false;
         }
@@ -89,7 +86,8 @@ impl ResultsStore {
 
         // For each run directory, load results.json files
         for run_dir in run_dirs {
-            let _run_id = run_dir.file_name()
+            let _run_id = run_dir
+                .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
@@ -138,9 +136,7 @@ impl ResultsStore {
     }
 
     /// Get the latest results for a test case by name.
-    pub async fn get_results(&self,
-        case_name: &str,
-    ) -> Option<TestResults> {
+    pub async fn get_results(&self, case_name: &str) -> Option<TestResults> {
         self.results.read().await.get(case_name).cloned()
     }
 }

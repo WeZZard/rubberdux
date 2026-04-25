@@ -74,9 +74,7 @@ pub fn parse(content: &str, name: &str) -> Result<TestCase, String> {
                 let (comments, plain_text) = collect_section_content(&events, &mut pos)?;
 
                 if !comments.is_empty() && !plain_text.is_empty() {
-                    return Err(
-                        "User message cannot mix HTML comments and plain text".to_string(),
-                    );
+                    return Err("User message cannot mix HTML comments and plain text".to_string());
                 }
 
                 if !comments.is_empty() {
@@ -85,8 +83,7 @@ pub fn parse(content: &str, name: &str) -> Result<TestCase, String> {
                     messages.push(Message::User(UserContent::PlainText(plain_text)));
                 } else {
                     return Err(
-                        "User message must contain either HTML comments or plain text"
-                            .to_string(),
+                        "User message must contain either HTML comments or plain text".to_string(),
                     );
                 }
             } else if heading_text == "Assistant Message" {
@@ -101,7 +98,7 @@ pub fn parse(content: &str, name: &str) -> Result<TestCase, String> {
 
                 if comments.is_empty() {
                     return Err(
-                        "Assistant message must contain at least one HTML comment".to_string(),
+                        "Assistant message must contain at least one HTML comment".to_string()
                     );
                 }
 
@@ -129,9 +126,8 @@ pub fn parse(content: &str, name: &str) -> Result<TestCase, String> {
                         }
 
                         if comments.is_empty() {
-                            return Err(
-                                "Assistant message must contain at least one HTML comment".to_string(),
-                            );
+                            return Err("Assistant message must contain at least one HTML comment"
+                                .to_string());
                         }
 
                         messages.push(Message::Assistant {
@@ -158,19 +154,13 @@ pub fn parse(content: &str, name: &str) -> Result<TestCase, String> {
     }
 
     if messages.is_empty() {
-        return Err(
-            "Test case must have at least one message after Storyline".to_string(),
-        );
+        return Err("Test case must have at least one message after Storyline".to_string());
     }
 
     // Validate: first message must be User
     match &messages.first() {
         Some(Message::User(_)) => {}
-        _ => {
-            return Err(
-                "First message after Storyline must be '## User Message'".to_string(),
-            )
-        }
+        _ => return Err("First message after Storyline must be '## User Message'".to_string()),
     }
 
     Ok(TestCase {
@@ -260,7 +250,7 @@ fn parse_storyline(events: &[Event], pos: &mut usize) -> Result<Vec<String>, Str
             return Err(format!(
                 "Expected '## Storyline' as first section, found '## {}'",
                 text
-            ))
+            ));
         }
         None => return Err("Test case must start with '## Storyline'".to_string()),
     }
@@ -468,10 +458,16 @@ Hello!
         }
 
         match &case.messages[1] {
-            Message::Assistant { directive, assertions } => {
+            Message::Assistant {
+                directive,
+                assertions,
+            } => {
                 assert!(matches!(directive, OrderingDirective::Check));
                 assert_eq!(assertions.len(), 1);
-                assert_eq!(assertions[0], "The assistant should respond with a greeting");
+                assert_eq!(
+                    assertions[0],
+                    "The assistant should respond with a greeting"
+                );
             }
             _ => panic!("Expected assistant message"),
         }
@@ -724,7 +720,10 @@ Hello
         let case = parse(content, "check-prefix").unwrap();
         assert_eq!(case.messages.len(), 2);
         match &case.messages[1] {
-            Message::Assistant { directive, assertions } => {
+            Message::Assistant {
+                directive,
+                assertions,
+            } => {
                 assert!(matches!(directive, OrderingDirective::Check));
                 assert_eq!(assertions.len(), 1);
                 assert_eq!(assertions[0], "Should greet");
@@ -747,7 +746,10 @@ Hello
 
         let case = parse(content, "bare").unwrap();
         match &case.messages[1] {
-            Message::Assistant { directive, assertions } => {
+            Message::Assistant {
+                directive,
+                assertions,
+            } => {
                 assert!(matches!(directive, OrderingDirective::Check));
                 assert_eq!(assertions[0], "Should greet");
             }
@@ -770,7 +772,11 @@ Hello
         let result = parse(content, "unsupported");
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("CHECK-NEXT"), "Expected error about unsupported directive, got: {}", err);
+        assert!(
+            err.contains("CHECK-NEXT"),
+            "Expected error about unsupported directive, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -788,7 +794,10 @@ Hello
         let result = parse(content, "directive-on-user");
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("User Message"), "Expected error about directive on wrong heading, got: {}", err);
+        assert!(
+            err.contains("User Message"),
+            "Expected error about directive on wrong heading, got: {}",
+            err
+        );
     }
 }
-

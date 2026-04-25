@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -15,9 +15,7 @@ use super::session::session_path;
 const DEFAULT_BEST_PERFORMANCE_TOKENS: usize = 153_600;
 
 /// Bridge a `LoopOutput` reply channel into the channel-specific `AgentResponse` sender.
-fn bridge_reply(
-    original_tx: mpsc::Sender<AgentResponse>,
-) -> mpsc::Sender<LoopOutput> {
+fn bridge_reply(original_tx: mpsc::Sender<AgentResponse>) -> mpsc::Sender<LoopOutput> {
     let (loop_tx, mut loop_rx) = mpsc::channel::<LoopOutput>(8);
     tokio::spawn(async move {
         while let Some(output) = loop_rx.recv().await {
@@ -58,21 +56,18 @@ pub async fn run_with_session(
         .unwrap_or(DEFAULT_BEST_PERFORMANCE_TOKENS);
 
     // Create context broadcast early so AgentTool can subscribe
-    let (context_tx, _) = tokio::sync::broadcast::channel::<
-        super::subagent::ContextEvent,
-    >(64);
+    let (context_tx, _) = tokio::sync::broadcast::channel::<super::subagent::ContextEvent>(64);
 
     // Derive session directory for subagent sessions and tool results
     let session_dir = session_path.parent().map(|p| p.to_path_buf());
     let tool_results_dir = session_dir.as_ref().map(|d| d.join("tool-results"));
 
     // Build tool registry
-    let last_user_query = Arc::new(RwLock::new(String::new()));
     let registry = {
         use crate::provider::moonshot::tool::bash::MoonshotBashTool;
         use crate::provider::moonshot::tool::web_fetch::MoonshotWebFetchTool;
         use crate::provider::moonshot::tool::web_search::WebSearchTool;
-        use crate::tool::agent::{build_subagent_registries, AgentTool};
+        use crate::tool::agent::{AgentTool, build_subagent_registries};
         use crate::tool::edit::EditFileTool;
         use crate::tool::glob::GlobTool;
         use crate::tool::grep::GrepTool;
@@ -87,12 +82,9 @@ pub async fn run_with_session(
         r.register(Box::new(EditFileTool));
         r.register(Box::new(GlobTool));
         r.register(Box::new(GrepTool));
-        r.register(Box::new(WebSearchTool::new(
-            client.clone(),
-            last_user_query.clone(),
-        )));
+        r.register(Box::new(WebSearchTool::new(client.clone())));
 
-        let subagent_registries = build_subagent_registries(&client, &last_user_query);
+        let subagent_registries = build_subagent_registries(&client);
         r.register(Box::new(AgentTool::new(
             client.clone(),
             subagent_registries,
@@ -116,6 +108,9 @@ pub async fn run_with_session(
         registry: Arc::new(registry),
         system_prompt,
         session_path: Some(session_path),
+        session_id: None,
+        agent_id: Some("main".into()),
+        recorder: None,
         tool_results_dir,
         token_budget: best_perf_tokens,
         cancel: CancellationToken::new(),
@@ -126,7 +121,6 @@ pub async fn run_with_session(
     let (agent_loop, input_port) = AgentLoop::new(config).await;
 
     // Telegram adapter: convert ChannelEvent -> LoopEvent
-    let last_user_query_adapter = last_user_query.clone();
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
             match event {
@@ -145,11 +139,6 @@ pub async fn run_with_session(
                     } else {
                         interpreted.text.clone()
                     };
-
-                    // Update shared last_user_query for WebSearchTool
-                    if let Ok(mut q) = last_user_query_adapter.write() {
-                        *q = interpreted.text.clone();
-                    }
 
                     let message = Message::User {
                         content: UserContent::Text(text),
@@ -423,7 +412,17 @@ mod tests {
         ];
 
         let start = Instant::now();
-        let results = super::super::turn_driver::execute_tool_calls(&calls, &registry).await;
+        let recorder = crate::trajectory::noop_recorder();
+        let results = super::super::turn_driver::execute_tool_calls(
+            &calls,
+            &registry,
+            &recorder,
+            None,
+            "main",
+            "turn_test",
+            "task_test",
+        )
+        .await;
         let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 3);
@@ -479,7 +478,17 @@ mod tests {
         ];
 
         let start = Instant::now();
-        let results = super::super::turn_driver::execute_tool_calls(&calls, &registry).await;
+        let recorder = crate::trajectory::noop_recorder();
+        let results = super::super::turn_driver::execute_tool_calls(
+            &calls,
+            &registry,
+            &recorder,
+            None,
+            "main",
+            "turn_test",
+            "task_test",
+        )
+        .await;
         let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 3);
@@ -529,7 +538,17 @@ mod tests {
         // depends_on references a nonexistent ID
         let calls = vec![make_tool_call("1", "d", Some("nonexistent"))];
 
-        let results = super::super::turn_driver::execute_tool_calls(&calls, &registry).await;
+        let recorder = crate::trajectory::noop_recorder();
+        let results = super::super::turn_driver::execute_tool_calls(
+            &calls,
+            &registry,
+            &recorder,
+            None,
+            "main",
+            "turn_test",
+            "task_test",
+        )
+        .await;
         assert_eq!(results.len(), 1);
         match &results[0].1 {
             ToolOutcome::Immediate { content, is_error } => {

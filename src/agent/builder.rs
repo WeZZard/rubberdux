@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::broadcast;
@@ -9,17 +8,17 @@ use crate::agent::runtime::compaction::EvictOldestTurns;
 use crate::agent::runtime::port::InputPort;
 use crate::agent::runtime::subagent::ContextEvent;
 use crate::provider::moonshot::MoonshotClient;
+use crate::provider::moonshot::tool::bash::MoonshotBashTool;
+use crate::provider::moonshot::tool::web_fetch::MoonshotWebFetchTool;
+use crate::provider::moonshot::tool::web_search::WebSearchTool;
 use crate::session::SessionManager;
 use crate::tool::ToolRegistry;
-use crate::tool::agent::{build_subagent_registries, AgentTool};
+use crate::tool::agent::{AgentTool, build_subagent_registries};
 use crate::tool::edit::EditFileTool;
 use crate::tool::glob::GlobTool;
 use crate::tool::grep::GrepTool;
 use crate::tool::read::ReadFileTool;
 use crate::tool::write::WriteFileTool;
-use crate::provider::moonshot::tool::bash::MoonshotBashTool;
-use crate::provider::moonshot::tool::web_fetch::MoonshotWebFetchTool;
-use crate::provider::moonshot::tool::web_search::WebSearchTool;
 
 /// Configuration for building an AgentLoop.
 pub struct AgentLoopBuilder {
@@ -57,8 +56,13 @@ impl AgentLoopBuilder {
     }
 
     /// Build the AgentLoop and return it along with its input port and context broadcaster.
-    pub async fn build(self, client: Arc<MoonshotClient>) -> (AgentLoop, InputPort, broadcast::Sender<ContextEvent>) {
-        let session_id = self.session_id.expect("session_id must be set before building");
+    pub async fn build(
+        self,
+        client: Arc<MoonshotClient>,
+    ) -> (AgentLoop, InputPort, broadcast::Sender<ContextEvent>) {
+        let session_id = self
+            .session_id
+            .expect("session_id must be set before building");
         let main_agent_dir = self.session_manager.main_agent_dir(&session_id);
         let tool_results_dir = main_agent_dir.join("tool_results");
 
@@ -66,8 +70,6 @@ impl AgentLoopBuilder {
 
         let (context_tx, _) = broadcast::channel::<ContextEvent>(64);
         let cancel = CancellationToken::new();
-
-        let last_user_query = Arc::new(std::sync::RwLock::new(String::new()));
 
         let registry = {
             let mut r = ToolRegistry::new();
@@ -78,20 +80,17 @@ impl AgentLoopBuilder {
             r.register(Box::new(EditFileTool));
             r.register(Box::new(GlobTool));
             r.register(Box::new(GrepTool));
-            r.register(Box::new(WebSearchTool::new(
-                client.clone(),
-                last_user_query.clone(),
-            )));
+            r.register(Box::new(WebSearchTool::new(client.clone())));
 
             if self.with_agent_tool {
-                let subagent_registries = build_subagent_registries(&client, &last_user_query);
+                let subagent_registries = build_subagent_registries(&client);
                 r.register(Box::new(AgentTool::new(
                     client.clone(),
                     subagent_registries,
                     self.system_prompt.clone(),
                     context_tx.clone(),
                     Some(self.session_manager.clone()),
-                    Some(session_id),
+                    Some(session_id.clone()),
                 )));
             }
 
@@ -103,6 +102,9 @@ impl AgentLoopBuilder {
             registry: Arc::new(registry),
             system_prompt: self.system_prompt,
             session_path: Some(session_path),
+            session_id: Some(session_id.to_string()),
+            agent_id: Some("main".into()),
+            recorder: None,
             tool_results_dir: Some(tool_results_dir),
             token_budget: self.token_budget,
             cancel: cancel.clone(),
@@ -119,7 +121,6 @@ impl AgentLoopBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::RwLock;
     use crate::session::SessionManager;
 
     fn dummy_client() -> Arc<MoonshotClient> {
@@ -148,13 +149,20 @@ mod tests {
         let (mgr, session_id) = temp_manager();
         let builder = AgentLoopBuilder::new("Test system prompt".into(), mgr.clone())
             .with_session_id(session_id.clone());
-        
+
         let (agent_loop, input_port, context_tx) = builder.build(client).await;
-        
+
         // Verify main agent dir was created
-        assert!(mgr.main_agent_dir(&session_id).exists(), "main agent dir should exist");
-        assert!(mgr.main_agent_dir(&session_id).join("tool_results").exists());
-        
+        assert!(
+            mgr.main_agent_dir(&session_id).exists(),
+            "main agent dir should exist"
+        );
+        assert!(
+            mgr.main_agent_dir(&session_id)
+                .join("tool_results")
+                .exists()
+        );
+
         // Clean up
         let _ = std::fs::remove_dir_all(&mgr.home_dir);
     }
@@ -166,9 +174,9 @@ mod tests {
         let builder = AgentLoopBuilder::new("Test".into(), mgr.clone())
             .with_session_id(session_id)
             .with_token_budget(50_000);
-        
+
         let (_, _, _) = builder.build(client).await;
-        
+
         let _ = std::fs::remove_dir_all(&mgr.home_dir);
     }
 
@@ -179,9 +187,9 @@ mod tests {
         let builder = AgentLoopBuilder::new("Test".into(), mgr.clone())
             .with_session_id(session_id)
             .with_agent_tool(false);
-        
+
         let (_, _, _) = builder.build(client).await;
-        
+
         let _ = std::fs::remove_dir_all(&mgr.home_dir);
     }
 
@@ -189,11 +197,10 @@ mod tests {
     async fn test_builder_handles_empty_system_prompt() {
         let client = dummy_client();
         let (mgr, session_id) = temp_manager();
-        let builder = AgentLoopBuilder::new("".into(), mgr.clone())
-            .with_session_id(session_id);
-        
+        let builder = AgentLoopBuilder::new("".into(), mgr.clone()).with_session_id(session_id);
+
         let (_, _, _) = builder.build(client).await;
-        
+
         let _ = std::fs::remove_dir_all(&mgr.home_dir);
     }
 
@@ -201,17 +208,16 @@ mod tests {
     async fn test_context_tx_can_subscribe() {
         let client = dummy_client();
         let (mgr, session_id) = temp_manager();
-        let builder = AgentLoopBuilder::new("Test".into(), mgr.clone())
-            .with_session_id(session_id);
-        
+        let builder = AgentLoopBuilder::new("Test".into(), mgr.clone()).with_session_id(session_id);
+
         let (_, _, context_tx) = builder.build(client).await;
-        
+
         let mut rx = context_tx.subscribe();
         context_tx.send(ContextEvent::Cancel).unwrap();
-        
+
         let received = rx.try_recv();
         assert!(received.is_ok(), "Should receive context event");
-        
+
         let _ = std::fs::remove_dir_all(&mgr.home_dir);
     }
 }

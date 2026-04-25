@@ -30,8 +30,16 @@ async fn test_rpc_roundtrip_agent_to_host() {
 
     match (&msg, &received) {
         (
-            AgentToHost::SpawnVM { task_id: t1, prompt: p1, subagent_type: s1 },
-            AgentToHost::SpawnVM { task_id: t2, prompt: p2, subagent_type: s2 },
+            AgentToHost::SpawnVM {
+                task_id: t1,
+                prompt: p1,
+                subagent_type: s1,
+            },
+            AgentToHost::SpawnVM {
+                task_id: t2,
+                prompt: p2,
+                subagent_type: s2,
+            },
         ) => {
             assert_eq!(t1, t2);
             assert_eq!(p1, p2);
@@ -67,8 +75,14 @@ async fn test_rpc_roundtrip_host_to_agent() {
 
     match (&msg, &received) {
         (
-            HostToAgent::UserMessage { text: t1, telegram_message_id: id1 },
-            HostToAgent::UserMessage { text: t2, telegram_message_id: id2 },
+            HostToAgent::UserMessage {
+                text: t1,
+                telegram_message_id: id1,
+            },
+            HostToAgent::UserMessage {
+                text: t2,
+                telegram_message_id: id2,
+            },
         ) => {
             assert_eq!(t1, t2);
             assert_eq!(id1, id2);

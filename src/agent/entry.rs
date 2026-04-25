@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::provider::moonshot::Message;
+use serde::{Deserialize, Serialize};
 
 /// A message with its lineage in the conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,7 +18,10 @@ pub struct EntryHistory {
 
 impl EntryHistory {
     pub fn new() -> Self {
-        Self { entries: Vec::new(), next_id: 0 }
+        Self {
+            entries: Vec::new(),
+            next_id: 0,
+        }
     }
 
     /// Restore from persisted entries.
@@ -36,10 +39,18 @@ impl EntryHistory {
                 let parent_id = match &message {
                     Message::System { .. } | Message::User { .. } => None,
                     Message::Assistant { .. } | Message::Tool { .. } => {
-                        if i > 0 { Some(i - 1) } else { None }
+                        if i > 0 {
+                            Some(i - 1)
+                        } else {
+                            None
+                        }
                     }
                 };
-                Entry { id: i, parent_id, message }
+                Entry {
+                    id: i,
+                    parent_id,
+                    message,
+                }
             })
             .collect();
         let next_id = entries.len();
@@ -48,7 +59,11 @@ impl EntryHistory {
 
     fn push(&mut self, parent_id: Option<usize>, message: Message) -> usize {
         let id = self.next_id;
-        self.entries.push(Entry { id, parent_id, message });
+        self.entries.push(Entry {
+            id,
+            parent_id,
+            message,
+        });
         self.next_id += 1;
         id
     }
@@ -166,7 +181,9 @@ mod tests {
         let entry_no_parent = Entry {
             id: 0,
             parent_id: None,
-            message: Message::System { content: "sys".into() },
+            message: Message::System {
+                content: "sys".into(),
+            },
         };
         let json = serde_json::to_string(&entry_no_parent).unwrap();
         assert!(!json.contains("parent_id")); // skip_serializing_if
@@ -177,8 +194,12 @@ mod tests {
     #[test]
     fn test_from_legacy_messages() {
         let messages = vec![
-            Message::System { content: "sys".into() },
-            Message::User { content: UserContent::Text("hi".into()) },
+            Message::System {
+                content: "sys".into(),
+            },
+            Message::User {
+                content: UserContent::Text("hi".into()),
+            },
             Message::Assistant {
                 content: Some("hello".into()),
                 reasoning_content: None,
@@ -214,19 +235,29 @@ mod tests {
     #[test]
     fn test_push_methods_assign_ids() {
         let mut h = EntryHistory::new();
-        let id0 = h.push_system(Message::System { content: "sys".into() });
-        let id1 = h.push_user(Message::User { content: UserContent::Text("hi".into()) });
-        let id2 = h.push_assistant(id1, Message::Assistant {
-            content: Some("hello".into()),
-            reasoning_content: None,
-            tool_calls: None,
-            partial: None,
+        let id0 = h.push_system(Message::System {
+            content: "sys".into(),
         });
-        let id3 = h.push_tool(id2, Message::Tool {
-            tool_call_id: "t1".into(),
-            name: None,
-            content: "result".into(),
+        let id1 = h.push_user(Message::User {
+            content: UserContent::Text("hi".into()),
         });
+        let id2 = h.push_assistant(
+            id1,
+            Message::Assistant {
+                content: Some("hello".into()),
+                reasoning_content: None,
+                tool_calls: None,
+                partial: None,
+            },
+        );
+        let id3 = h.push_tool(
+            id2,
+            Message::Tool {
+                tool_call_id: "t1".into(),
+                name: None,
+                content: "result".into(),
+            },
+        );
 
         assert_eq!(id0, 0);
         assert_eq!(id1, 1);
@@ -240,8 +271,12 @@ mod tests {
     #[test]
     fn test_messages_strips_tracking() {
         let mut h = EntryHistory::new();
-        h.push_system(Message::System { content: "sys".into() });
-        h.push_user(Message::User { content: UserContent::Text("hi".into()) });
+        h.push_system(Message::System {
+            content: "sys".into(),
+        });
+        h.push_user(Message::User {
+            content: UserContent::Text("hi".into()),
+        });
 
         let msgs = h.messages();
         assert_eq!(msgs.len(), 2);
@@ -254,19 +289,29 @@ mod tests {
     #[test]
     fn test_root_entry_id_walks_chain() {
         let mut h = EntryHistory::new();
-        let sys = h.push_system(Message::System { content: "sys".into() });
-        let user = h.push_user(Message::User { content: UserContent::Text("hi".into()) });
-        let asst = h.push_assistant(user, Message::Assistant {
-            content: Some("ok".into()),
-            reasoning_content: None,
-            tool_calls: None,
-            partial: None,
+        let sys = h.push_system(Message::System {
+            content: "sys".into(),
         });
-        let tool = h.push_tool(asst, Message::Tool {
-            tool_call_id: "t".into(),
-            name: None,
-            content: "r".into(),
+        let user = h.push_user(Message::User {
+            content: UserContent::Text("hi".into()),
         });
+        let asst = h.push_assistant(
+            user,
+            Message::Assistant {
+                content: Some("ok".into()),
+                reasoning_content: None,
+                tool_calls: None,
+                partial: None,
+            },
+        );
+        let tool = h.push_tool(
+            asst,
+            Message::Tool {
+                tool_call_id: "t".into(),
+                name: None,
+                content: "r".into(),
+            },
+        );
 
         // Root of user is itself
         assert_eq!(h.root_entry_id(user), Some(user));
@@ -279,12 +324,19 @@ mod tests {
     #[test]
     fn test_update_system_replaces_entry_zero() {
         let mut h = EntryHistory::new();
-        h.push_system(Message::System { content: "original".into() });
-        h.push_user(Message::User { content: UserContent::Text("hi".into()) });
+        h.push_system(Message::System {
+            content: "original".into(),
+        });
+        h.push_user(Message::User {
+            content: UserContent::Text("hi".into()),
+        });
 
         h.update_system("updated system prompt".into());
 
-        assert_eq!(h.entries()[0].message.content_text(), "updated system prompt");
+        assert_eq!(
+            h.entries()[0].message.content_text(),
+            "updated system prompt"
+        );
         assert_eq!(h.messages()[0].content_text(), "updated system prompt");
         // User message unchanged
         assert_eq!(h.entries()[1].message.content_text(), "hi");
@@ -293,8 +345,12 @@ mod tests {
     #[test]
     fn test_system_message_is_entry_zero() {
         let mut h = EntryHistory::new();
-        h.push_system(Message::System { content: "test prompt".into() });
-        h.push_user(Message::User { content: UserContent::Text("hi".into()) });
+        h.push_system(Message::System {
+            content: "test prompt".into(),
+        });
+        h.push_user(Message::User {
+            content: UserContent::Text("hi".into()),
+        });
 
         assert_eq!(h.entries()[0].id, 0);
         assert_eq!(h.entries()[0].parent_id, None);

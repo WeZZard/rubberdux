@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use md_testing::{lint, AssertionScope, TestResults};
+use md_testing::{AssertionScope, TestResults, lint};
 use tower_lsp::lsp_types::*;
 
 use crate::results::ResultsStore;
@@ -58,10 +58,7 @@ fn build_lint_diagnostics(content: &str) -> Vec<Diagnostic> {
     diagnostics
 }
 
-fn build_result_diagnostics(
-    _content: &str,
-    results: &TestResults,
-) -> Vec<Diagnostic> {
+fn build_result_diagnostics(_content: &str, results: &TestResults) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     for assertion in &results.assertions {
@@ -85,9 +82,7 @@ fn build_result_diagnostics(
 
         let code = match &assertion.scope {
             AssertionScope::Storyline => Some("storyline".to_string()),
-            AssertionScope::UserMessage { msg_index } => {
-                Some(format!("user-msg-{}", msg_index))
-            }
+            AssertionScope::UserMessage { msg_index } => Some(format!("user-msg-{}", msg_index)),
             AssertionScope::AssistantMessage { slot_index, .. } => {
                 Some(format!("assistant-msg-{}", slot_index))
             }

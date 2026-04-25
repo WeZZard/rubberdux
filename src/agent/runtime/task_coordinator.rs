@@ -68,10 +68,7 @@ impl TaskGroupSet {
     }
 
     /// Record a completed task. Returns the group if all tasks in the group are done.
-    pub fn complete(
-        &mut self,
-        result: BackgroundTaskResult,
-    ) -> Option<CompletedGroup> {
+    pub fn complete(&mut self, result: BackgroundTaskResult) -> Option<CompletedGroup> {
         let group_key = match self.task_to_group.remove(&result.task_id) {
             Some(k) => k,
             None => {
@@ -111,9 +108,7 @@ impl TaskGroupSet {
         self.groups.is_empty()
     }
 
-    pub fn get_mut(&mut self,
-        asst_entry_id: usize,
-    ) -> Option<&mut TaskGroup> {
+    pub fn get_mut(&mut self, asst_entry_id: usize) -> Option<&mut TaskGroup> {
         self.groups.get_mut(&asst_entry_id)
     }
 }

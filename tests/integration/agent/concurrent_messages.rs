@@ -3,14 +3,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serial_test::serial;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use rubberdux::agent::runtime::agent_loop::{AgentLoop, AgentLoopConfig};
-use rubberdux::agent::runtime::port::{LoopEvent, LoopOutput};
 use rubberdux::agent::runtime::compaction::EvictOldestTurns;
+use rubberdux::agent::runtime::port::{LoopEvent, LoopOutput};
 use rubberdux::provider::moonshot::{Message, MoonshotClient, UserContent};
 use rubberdux::tool::ToolRegistry;
 
@@ -19,17 +19,24 @@ use crate::support::log_capture;
 
 /// Helper: set up an AgentLoop pointing to an already-running mock server.
 /// Creates artifact directory, captures logs, and persists transcripts.
-async fn setup_agent_loop(mock_uri: &str, test_name: &str) -> (
+async fn setup_agent_loop(
+    mock_uri: &str,
+    test_name: &str,
+) -> (
     rubberdux::agent::runtime::port::InputPort,
     tokio::task::JoinHandle<()>,
-    PathBuf,  // session_path
+    PathBuf, // session_path
 ) {
     let artifact_dir = artifact::artifact_dir(test_name);
     let session_path = artifact_dir.join("transcript.jsonl");
     let log_path = artifact_dir.join("test.log");
-    
+
     log_capture::init(&log_path);
-    log::info!("Test {} starting. Artifacts in {:?}", test_name, artifact_dir);
+    log::info!(
+        "Test {} starting. Artifacts in {:?}",
+        test_name,
+        artifact_dir
+    );
 
     let client = Arc::new(MoonshotClient::new(
         reqwest::Client::new(),
@@ -45,6 +52,9 @@ async fn setup_agent_loop(mock_uri: &str, test_name: &str) -> (
         registry,
         system_prompt: "You are a test assistant.".into(),
         session_path: Some(session_path.clone()),
+        session_id: None,
+        agent_id: Some("main".into()),
+        recorder: None,
         tool_results_dir: Some(artifact_dir.join("tool-results")),
         token_budget: 100_000,
         cancel: CancellationToken::new(),
@@ -126,25 +136,23 @@ async fn test_agent_loop_handles_two_messages() {
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "cmpl-2",
-                "object": "chat.completion",
-                "created": 2,
-                "model": "test-model",
-                "choices": [{
-                    "index": 0,
-                    "message": { "role": "assistant", "content": "Response for message 2" },
-                    "finish_reason": "stop"
-                }],
-                "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-2",
+            "object": "chat.completion",
+            "created": 2,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Response for message 2" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        })))
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
 
-    let (input_port, agent_handle, session_path) = 
+    let (input_port, agent_handle, session_path) =
         setup_agent_loop(&mock_server.uri(), "test_agent_loop_handles_two_messages").await;
 
     // Send both messages in quick succession
@@ -157,16 +165,38 @@ async fn test_agent_loop_handles_two_messages() {
     artifact::write_narration(&session_path, &narration);
 
     // Verify responses
-    assert!(out1.text.contains("Response for message 1"), "msg1: {}", out1.text);
-    assert!(out2.text.contains("Response for message 2"), "msg2: {}", out2.text);
+    assert!(
+        out1.text.contains("Response for message 1"),
+        "msg1: {}",
+        out1.text
+    );
+    assert!(
+        out2.text.contains("Response for message 2"),
+        "msg2: {}",
+        out2.text
+    );
 
-    assert_eq!(out1.metadata.as_ref().and_then(|m| m.downcast_ref::<i32>().copied()), Some(1));
-    assert_eq!(out2.metadata.as_ref().and_then(|m| m.downcast_ref::<i32>().copied()), Some(2));
+    assert_eq!(
+        out1.metadata
+            .as_ref()
+            .and_then(|m| m.downcast_ref::<i32>().copied()),
+        Some(1)
+    );
+    assert_eq!(
+        out2.metadata
+            .as_ref()
+            .and_then(|m| m.downcast_ref::<i32>().copied()),
+        Some(2)
+    );
 
     // Verify transcript
     let entries = read_transcript(&session_path);
     log::info!("Transcript has {} entries", entries.len());
-    assert!(entries.len() >= 3, "Expected at least 3 entries (system + 2 user + 2 assistant), got {}", entries.len());
+    assert!(
+        entries.len() >= 3,
+        "Expected at least 3 entries (system + 2 user + 2 assistant), got {}",
+        entries.len()
+    );
 
     agent_handle.abort();
 }
@@ -226,25 +256,23 @@ async fn test_agent_loop_handles_three_messages() {
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "cmpl-3",
-                "object": "chat.completion",
-                "created": 3,
-                "model": "test-model",
-                "choices": [{
-                    "index": 0,
-                    "message": { "role": "assistant", "content": "Response for message 3" },
-                    "finish_reason": "stop"
-                }],
-                "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-3",
+            "object": "chat.completion",
+            "created": 3,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Response for message 3" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        })))
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
 
-    let (input_port, agent_handle, session_path) = 
+    let (input_port, agent_handle, session_path) =
         setup_agent_loop(&mock_server.uri(), "test_agent_loop_handles_three_messages").await;
 
     let out1 = send_and_collect(&input_port, "Message 1", 1).await;
@@ -256,17 +284,48 @@ async fn test_agent_loop_handles_three_messages() {
     let narration = artifact::narrate_session(&session_path);
     artifact::write_narration(&session_path, &narration);
 
-    assert!(out1.text.contains("Response for message 1"), "msg1: {}", out1.text);
-    assert!(out2.text.contains("Response for message 2"), "msg2: {}", out2.text);
-    assert!(out3.text.contains("Response for message 3"), "msg3: {}", out3.text);
+    assert!(
+        out1.text.contains("Response for message 1"),
+        "msg1: {}",
+        out1.text
+    );
+    assert!(
+        out2.text.contains("Response for message 2"),
+        "msg2: {}",
+        out2.text
+    );
+    assert!(
+        out3.text.contains("Response for message 3"),
+        "msg3: {}",
+        out3.text
+    );
 
-    assert_eq!(out1.metadata.as_ref().and_then(|m| m.downcast_ref::<i32>().copied()), Some(1));
-    assert_eq!(out2.metadata.as_ref().and_then(|m| m.downcast_ref::<i32>().copied()), Some(2));
-    assert_eq!(out3.metadata.as_ref().and_then(|m| m.downcast_ref::<i32>().copied()), Some(3));
+    assert_eq!(
+        out1.metadata
+            .as_ref()
+            .and_then(|m| m.downcast_ref::<i32>().copied()),
+        Some(1)
+    );
+    assert_eq!(
+        out2.metadata
+            .as_ref()
+            .and_then(|m| m.downcast_ref::<i32>().copied()),
+        Some(2)
+    );
+    assert_eq!(
+        out3.metadata
+            .as_ref()
+            .and_then(|m| m.downcast_ref::<i32>().copied()),
+        Some(3)
+    );
 
     let entries = read_transcript(&session_path);
     log::info!("Transcript has {} entries", entries.len());
-    assert!(entries.len() >= 4, "Expected at least 4 entries, got {}", entries.len());
+    assert!(
+        entries.len() >= 4,
+        "Expected at least 4 entries, got {}",
+        entries.len()
+    );
 
     agent_handle.abort();
 }
@@ -281,34 +340,36 @@ async fn test_agent_loop_handles_four_messages() {
     let mock_server = MockServer::start().await;
 
     for i in 1..=4 {
-        let delay = if i < 3 { Duration::from_millis(300) } else { Duration::from_millis(0) };
+        let delay = if i < 3 {
+            Duration::from_millis(300)
+        } else {
+            Duration::from_millis(0)
+        };
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_delay(delay)
-                    .set_body_json(serde_json::json!({
-                        "id": format!("cmpl-{}", i),
-                        "object": "chat.completion",
-                        "created": i,
-                        "model": "test-model",
-                        "choices": [{
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": format!("Response for message {}", i)
-                            },
-                            "finish_reason": "stop"
-                        }],
-                        "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
-                    })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_delay(delay).set_body_json(
+                serde_json::json!({
+                    "id": format!("cmpl-{}", i),
+                    "object": "chat.completion",
+                    "created": i,
+                    "model": "test-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": format!("Response for message {}", i)
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                }),
+            ))
             .up_to_n_times(1)
             .mount(&mock_server)
             .await;
     }
 
-    let (input_port, agent_handle, session_path) = 
+    let (input_port, agent_handle, session_path) =
         setup_agent_loop(&mock_server.uri(), "test_agent_loop_handles_four_messages").await;
 
     let out1 = send_and_collect(&input_port, "Message 1", 1).await;
@@ -322,19 +383,59 @@ async fn test_agent_loop_handles_four_messages() {
     let narration = artifact::narrate_session(&session_path);
     artifact::write_narration(&session_path, &narration);
 
-    assert!(out1.text.contains("Response for message 1"), "msg1: {}", out1.text);
-    assert!(out2.text.contains("Response for message 2"), "msg2: {}", out2.text);
-    assert!(out3.text.contains("Response for message 3"), "msg3: {}", out3.text);
-    assert!(out4.text.contains("Response for message 4"), "msg4: {}", out4.text);
+    assert!(
+        out1.text.contains("Response for message 1"),
+        "msg1: {}",
+        out1.text
+    );
+    assert!(
+        out2.text.contains("Response for message 2"),
+        "msg2: {}",
+        out2.text
+    );
+    assert!(
+        out3.text.contains("Response for message 3"),
+        "msg3: {}",
+        out3.text
+    );
+    assert!(
+        out4.text.contains("Response for message 4"),
+        "msg4: {}",
+        out4.text
+    );
 
-    assert_eq!(out1.metadata.as_ref().and_then(|m| m.downcast_ref::<i32>().copied()), Some(1));
-    assert_eq!(out2.metadata.as_ref().and_then(|m| m.downcast_ref::<i32>().copied()), Some(2));
-    assert_eq!(out3.metadata.as_ref().and_then(|m| m.downcast_ref::<i32>().copied()), Some(3));
-    assert_eq!(out4.metadata.as_ref().and_then(|m| m.downcast_ref::<i32>().copied()), Some(4));
+    assert_eq!(
+        out1.metadata
+            .as_ref()
+            .and_then(|m| m.downcast_ref::<i32>().copied()),
+        Some(1)
+    );
+    assert_eq!(
+        out2.metadata
+            .as_ref()
+            .and_then(|m| m.downcast_ref::<i32>().copied()),
+        Some(2)
+    );
+    assert_eq!(
+        out3.metadata
+            .as_ref()
+            .and_then(|m| m.downcast_ref::<i32>().copied()),
+        Some(3)
+    );
+    assert_eq!(
+        out4.metadata
+            .as_ref()
+            .and_then(|m| m.downcast_ref::<i32>().copied()),
+        Some(4)
+    );
 
     let entries = read_transcript(&session_path);
     log::info!("Transcript has {} entries", entries.len());
-    assert!(entries.len() >= 5, "Expected at least 5 entries, got {}", entries.len());
+    assert!(
+        entries.len() >= 5,
+        "Expected at least 5 entries, got {}",
+        entries.len()
+    );
 
     agent_handle.abort();
 }
@@ -388,23 +489,21 @@ async fn test_concurrent_messages_with_tool_call_preserve_reply_to() {
     // Second call: final response after tool execution
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "cmpl-final",
-                "object": "chat.completion",
-                "created": 2,
-                "model": "test-model",
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "Here are the latest Google news updates."
-                    },
-                    "finish_reason": "stop"
-                }],
-                "usage": { "prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25 }
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-final",
+            "object": "chat.completion",
+            "created": 2,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Here are the latest Google news updates."
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25 }
+        })))
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
@@ -412,29 +511,30 @@ async fn test_concurrent_messages_with_tool_call_preserve_reply_to() {
     // Third call: response for message 2
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "cmpl-msg2",
-                "object": "chat.completion",
-                "created": 3,
-                "model": "test-model",
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "I am running on Ubuntu 24.04."
-                    },
-                    "finish_reason": "stop"
-                }],
-                "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-msg2",
+            "object": "chat.completion",
+            "created": 3,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "I am running on Ubuntu 24.04."
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        })))
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
 
-    let (input_port, agent_handle, session_path) = 
-        setup_agent_loop(&mock_server.uri(), "test_concurrent_messages_with_tool_call_preserve_reply_to").await;
+    let (input_port, agent_handle, session_path) = setup_agent_loop(
+        &mock_server.uri(),
+        "test_concurrent_messages_with_tool_call_preserve_reply_to",
+    )
+    .await;
 
     // Send message 1 (will trigger tool call)
     let (reply_tx1, mut reply_rx1) = mpsc::channel::<LoopOutput>(8);
@@ -467,7 +567,9 @@ async fn test_concurrent_messages_with_tool_call_preserve_reply_to() {
             Ok(Some(output)) => {
                 let is_final = output.is_final;
                 msg1_outputs.push(output);
-                if is_final { break; }
+                if is_final {
+                    break;
+                }
             }
             Ok(None) => break,
             Err(_) => panic!("Timed out waiting for msg1 responses"),
@@ -475,7 +577,8 @@ async fn test_concurrent_messages_with_tool_call_preserve_reply_to() {
     }
 
     // Collect response for message 2
-    let msg2_output = tokio::time::timeout(timeout, reply_rx2.recv()).await
+    let msg2_output = tokio::time::timeout(timeout, reply_rx2.recv())
+        .await
         .expect("Timed out waiting for msg2 response")
         .expect("Msg2 channel closed");
 
@@ -491,7 +594,9 @@ async fn test_concurrent_messages_with_tool_call_preserve_reply_to() {
 
     // Verify all msg1 responses preserve metadata=100
     for (i, output) in msg1_outputs.iter().enumerate() {
-        let metadata = output.metadata.as_ref()
+        let metadata = output
+            .metadata
+            .as_ref()
             .and_then(|m| m.downcast_ref::<i32>().copied());
         assert_eq!(
             metadata,
@@ -504,7 +609,9 @@ async fn test_concurrent_messages_with_tool_call_preserve_reply_to() {
     }
 
     // Verify message 2 response preserves metadata=200
-    let msg2_metadata = msg2_output.metadata.as_ref()
+    let msg2_metadata = msg2_output
+        .metadata
+        .as_ref()
         .and_then(|m| m.downcast_ref::<i32>().copied());
     assert_eq!(
         msg2_metadata,
@@ -567,30 +674,30 @@ async fn test_concurrent_messages_do_not_swap_content() {
     // Second call: fast response for message 2
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({
-                    "id": "cmpl-2",
-                    "object": "chat.completion",
-                    "created": 2,
-                    "model": "test-model",
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": "Response for message 2: environment"
-                        },
-                        "finish_reason": "stop"
-                    }],
-                    "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
-                })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-2",
+            "object": "chat.completion",
+            "created": 2,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Response for message 2: environment"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        })))
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
 
-    let (input_port, agent_handle, session_path) = 
-        setup_agent_loop(&mock_server.uri(), "test_concurrent_messages_do_not_swap_content").await;
+    let (input_port, agent_handle, session_path) = setup_agent_loop(
+        &mock_server.uri(),
+        "test_concurrent_messages_do_not_swap_content",
+    )
+    .await;
 
     // Send message 1 (slow)
     let (reply_tx1, mut reply_rx1) = mpsc::channel::<LoopOutput>(8);
@@ -621,7 +728,7 @@ async fn test_concurrent_messages_do_not_swap_content() {
         .await
         .expect("Timed out waiting for msg1")
         .expect("Msg1 channel closed");
-    
+
     let msg2_output = tokio::time::timeout(timeout, reply_rx2.recv())
         .await
         .expect("Timed out waiting for msg2")
@@ -633,24 +740,34 @@ async fn test_concurrent_messages_do_not_swap_content() {
 
     // Verify message 1 got the correct content
     assert!(
-        msg1_output.text.contains("Response for message 1: spawn agent"),
+        msg1_output
+            .text
+            .contains("Response for message 1: spawn agent"),
         "Message 1 should receive response for message 1, got: {}",
         msg1_output.text
     );
     assert_eq!(
-        msg1_output.metadata.as_ref().and_then(|m| m.downcast_ref::<i32>().copied()),
+        msg1_output
+            .metadata
+            .as_ref()
+            .and_then(|m| m.downcast_ref::<i32>().copied()),
         Some(100),
         "Message 1 should have metadata=100"
     );
 
     // Verify message 2 got the correct content
     assert!(
-        msg2_output.text.contains("Response for message 2: environment"),
+        msg2_output
+            .text
+            .contains("Response for message 2: environment"),
         "Message 2 should receive response for message 2, got: {}",
         msg2_output.text
     );
     assert_eq!(
-        msg2_output.metadata.as_ref().and_then(|m| m.downcast_ref::<i32>().copied()),
+        msg2_output
+            .metadata
+            .as_ref()
+            .and_then(|m| m.downcast_ref::<i32>().copied()),
         Some(200),
         "Message 2 should have metadata=200"
     );
@@ -672,20 +789,21 @@ async fn test_error_response_preserves_reply_to_metadata() {
     // Mock returns HTTP 400 to simulate an LLM API error
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(400).set_body_json(serde_json::json!({
-                "error": {
-                    "message": "invalid temperature",
-                    "type": "invalid_request_error"
-                }
-            })),
-        )
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": {
+                "message": "invalid temperature",
+                "type": "invalid_request_error"
+            }
+        })))
         .expect(1)
         .mount(&mock_server)
         .await;
 
-    let (input_port, agent_handle, session_path) = 
-        setup_agent_loop(&mock_server.uri(), "test_error_response_preserves_reply_to_metadata").await;
+    let (input_port, agent_handle, session_path) = setup_agent_loop(
+        &mock_server.uri(),
+        "test_error_response_preserves_reply_to_metadata",
+    )
+    .await;
 
     // Send a message with metadata simulating telegram_message_id=42
     let (reply_tx, mut reply_rx) = mpsc::channel::<LoopOutput>(8);

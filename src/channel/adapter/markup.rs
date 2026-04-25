@@ -88,7 +88,9 @@ pub fn parse(input: &str) -> Document {
         }
 
         // <telegram-message ...>...</telegram-message>
-        if remaining.starts_with("<telegram-message ") || remaining.starts_with("<telegram-message>") {
+        if remaining.starts_with("<telegram-message ")
+            || remaining.starts_with("<telegram-message>")
+        {
             if let Some((el, consumed)) = parse_message_tag(remaining) {
                 flush_text(&mut text_buf, &mut nodes);
                 nodes.push(Node::Message(el));
@@ -197,9 +199,7 @@ fn parse_attributes(tag: &str) -> Vec<(String, String)> {
 
         // Read attribute name (alphanumeric + hyphen)
         let name_start = pos;
-        while pos < bytes.len()
-            && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'-')
-        {
+        while pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'-') {
             pos += 1;
         }
         if pos == name_start {
@@ -233,7 +233,10 @@ fn parse_attributes(tag: &str) -> Vec<(String, String)> {
 }
 
 fn attr_value(attrs: &[(String, String)], name: &str) -> Option<String> {
-    attrs.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+    attrs
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +318,9 @@ mod tests {
         let input = "<telegram-message from=\"user\" to=\"assistant\" id=\"5\" date=\"1234567890\">Hello</telegram-message>";
         let doc = parse(input);
         assert_eq!(doc.nodes.len(), 1);
-        let Node::Message(el) = &doc.nodes[0] else { panic!("expected Message") };
+        let Node::Message(el) = &doc.nodes[0] else {
+            panic!("expected Message")
+        };
         assert_eq!(el.from, "user");
         assert_eq!(el.to, "assistant");
         assert_eq!(el.id.as_deref(), Some("5"));
@@ -328,7 +333,9 @@ mod tests {
         let input = "<telegram-message from=\"assistant\" to=\"user\">Hello!</telegram-message>";
         let doc = parse(input);
         assert_eq!(doc.nodes.len(), 1);
-        let Node::Message(el) = &doc.nodes[0] else { panic!("expected Message") };
+        let Node::Message(el) = &doc.nodes[0] else {
+            panic!("expected Message")
+        };
         assert_eq!(el.id, None);
         assert_eq!(el.date, None);
         assert_eq!(el.content, "Hello!");
@@ -339,7 +346,9 @@ mod tests {
         let input = "<telegram-reaction from=\"assistant\" action=\"add\" emoji=\"👍\" message-id=\"42\" />";
         let doc = parse(input);
         assert_eq!(doc.nodes.len(), 1);
-        let Node::Reaction(el) = &doc.nodes[0] else { panic!("expected Reaction") };
+        let Node::Reaction(el) = &doc.nodes[0] else {
+            panic!("expected Reaction")
+        };
         assert_eq!(el.from, "assistant");
         assert_eq!(el.action, "add");
         assert_eq!(el.emoji, "👍");
@@ -363,7 +372,8 @@ mod tests {
 
     #[test]
     fn test_round_trip_message() {
-        let input = "<telegram-message from=\"assistant\" to=\"user\" id=\"73\">Hello!</telegram-message>";
+        let input =
+            "<telegram-message from=\"assistant\" to=\"user\" id=\"73\">Hello!</telegram-message>";
         let doc = parse(input);
         let output = serialize(&doc);
         let doc2 = parse(&output);
@@ -400,10 +410,13 @@ mod tests {
 
     #[test]
     fn test_user_tags_parsed() {
-        let input = "<telegram-message from=\"user\" to=\"assistant\" id=\"5\">Hello</telegram-message>";
+        let input =
+            "<telegram-message from=\"user\" to=\"assistant\" id=\"5\">Hello</telegram-message>";
         let doc = parse(input);
         assert_eq!(doc.nodes.len(), 1);
-        let Node::Message(el) = &doc.nodes[0] else { panic!("expected Message") };
+        let Node::Message(el) = &doc.nodes[0] else {
+            panic!("expected Message")
+        };
         assert_eq!(el.from, "user");
     }
 }

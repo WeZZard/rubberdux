@@ -23,10 +23,12 @@ impl super::Tool for GrepTool {
         Box::pin(async move {
             let args: serde_json::Value = match serde_json::from_str(arguments) {
                 Ok(v) => v,
-                Err(e) => return ToolOutcome::Immediate {
-                    content: format!("Failed to parse tool arguments: {}", e),
-                    is_error: true,
-                },
+                Err(e) => {
+                    return ToolOutcome::Immediate {
+                        content: format!("Failed to parse tool arguments: {}", e),
+                        is_error: true,
+                    };
+                }
             };
             execute(&args).await
         })
@@ -40,7 +42,7 @@ pub async fn execute(args: &serde_json::Value) -> ToolOutcome {
             return ToolOutcome::Immediate {
                 content: "Missing required parameter: pattern".into(),
                 is_error: true,
-            }
+            };
         }
     };
 

@@ -1,14 +1,14 @@
 use clap::{Parser, Subcommand};
 
-mod provision;
 mod launch;
-mod stop;
+mod provision;
 mod sessions;
+mod stop;
 
-use provision::provision_images;
 use launch::launch_rubberdux;
+use provision::provision_images;
+use sessions::{archive_session, clear_sessions, delete_session, list_sessions};
 use stop::stop_rubberdux;
-use sessions::{list_sessions, archive_session, delete_session, clear_sessions};
 
 #[derive(Parser)]
 #[command(name = "xtask")]
@@ -40,13 +40,9 @@ enum SessionCommands {
     /// List all sessions
     List,
     /// Archive a session
-    Archive {
-        session_id: String,
-    },
+    Archive { session_id: String },
     /// Delete a session
-    Delete {
-        session_id: String,
-    },
+    Delete { session_id: String },
     /// Clear all sessions except latest
     Clear,
 }
@@ -73,13 +69,11 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Sessions { action } => {
-            match action {
-                SessionCommands::List => list_sessions(),
-                SessionCommands::Archive { session_id } => archive_session(&session_id),
-                SessionCommands::Delete { session_id } => delete_session(&session_id),
-                SessionCommands::Clear => clear_sessions(),
-            }
-        }
+        Commands::Sessions { action } => match action {
+            SessionCommands::List => list_sessions(),
+            SessionCommands::Archive { session_id } => archive_session(&session_id),
+            SessionCommands::Delete { session_id } => delete_session(&session_id),
+            SessionCommands::Clear => clear_sessions(),
+        },
     }
 }

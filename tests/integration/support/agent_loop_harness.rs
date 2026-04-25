@@ -40,6 +40,9 @@ impl AgentLoopHarness {
             registry,
             system_prompt: system_prompt.to_string(),
             session_path: Some(session_path.clone()),
+            session_id: None,
+            agent_id: Some("main".into()),
+            recorder: None,
             tool_results_dir,
             token_budget: 100_000,
             cancel: CancellationToken::new(),
@@ -65,11 +68,7 @@ impl AgentLoopHarness {
 
     /// Send a user message and collect all `LoopOutput` responses
     /// until `is_final == true` or the timeout expires.
-    pub async fn send_message(
-        &self,
-        text: &str,
-        timeout: Duration,
-    ) -> Vec<LoopOutput> {
+    pub async fn send_message(&self, text: &str, timeout: Duration) -> Vec<LoopOutput> {
         let (reply_tx, mut reply_rx) = mpsc::channel::<LoopOutput>(32);
 
         let event = LoopEvent::UserMessage {
@@ -80,7 +79,10 @@ impl AgentLoopHarness {
             metadata: Some(Box::new(1i32)),
         };
 
-        self.input_port.send(event).await.expect("input port should be open");
+        self.input_port
+            .send(event)
+            .await
+            .expect("input port should be open");
 
         let mut responses = Vec::new();
         let deadline = tokio::time::Instant::now() + timeout;
@@ -111,36 +113,39 @@ impl AgentLoopHarness {
         messages: &[String],
         timeout: Duration,
     ) -> Vec<LoopOutput> {
-        assert!(!messages.is_empty(), "batch must contain at least one message");
+        assert!(
+            !messages.is_empty(),
+            "batch must contain at least one message"
+        );
 
         // Send all but the last as context updates.
         for text in &messages[..messages.len() - 1] {
             let event = LoopEvent::ContextUpdate(Message::User {
                 content: UserContent::Text(text.clone()),
             });
-            self.input_port.send(event).await.expect("input port should be open");
+            self.input_port
+                .send(event)
+                .await
+                .expect("input port should be open");
         }
 
         // Send the last message as a normal user message to trigger LLM.
-        self.send_message(&messages[messages.len() - 1], timeout).await
+        self.send_message(&messages[messages.len() - 1], timeout)
+            .await
     }
 }
 
 /// Build the full tool registry the same way production does.
 fn build_tool_registry(client: Arc<MoonshotClient>) -> ToolRegistry {
-    use std::sync::RwLock;
-
     use rubberdux::provider::moonshot::tool::bash::MoonshotBashTool;
     use rubberdux::provider::moonshot::tool::web_fetch::MoonshotWebFetchTool;
     use rubberdux::provider::moonshot::tool::web_search::WebSearchTool;
-    use rubberdux::tool::agent::{build_subagent_registries, AgentTool};
+    use rubberdux::tool::agent::{AgentTool, build_subagent_registries};
     use rubberdux::tool::edit::EditFileTool;
     use rubberdux::tool::glob::GlobTool;
     use rubberdux::tool::grep::GrepTool;
     use rubberdux::tool::read::ReadFileTool;
     use rubberdux::tool::write::WriteFileTool;
-
-    let last_user_query = Arc::new(RwLock::new(String::new()));
 
     let mut r = ToolRegistry::new();
     r.register(Box::new(MoonshotBashTool::new()));
@@ -150,20 +155,14 @@ fn build_tool_registry(client: Arc<MoonshotClient>) -> ToolRegistry {
     r.register(Box::new(EditFileTool));
     r.register(Box::new(GlobTool));
     r.register(Box::new(GrepTool));
-    r.register(Box::new(WebSearchTool::new(
-        client.clone(),
-        last_user_query.clone(),
-    )));
+    r.register(Box::new(WebSearchTool::new(client.clone())));
 
-    let subagent_registries = build_subagent_registries(&client, &last_user_query);
+    let subagent_registries = build_subagent_registries(&client);
     r.register(Box::new(AgentTool::new(
         client.clone(),
         subagent_registries,
         String::new(), // system_prompt — will be overridden by AgentLoopConfig
-        tokio::sync::broadcast::channel::<
-            rubberdux::agent::runtime::subagent::ContextEvent,
-        >(64)
-        .0,
+        tokio::sync::broadcast::channel::<rubberdux::agent::runtime::subagent::ContextEvent>(64).0,
         None,
         None,
     )));

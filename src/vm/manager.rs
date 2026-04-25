@@ -160,10 +160,14 @@ impl VMManager {
         let key_path = ssh_private_key();
         let output = Command::new("ssh")
             .args([
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "ConnectTimeout=10",
-                "-i", &key_path.to_string_lossy(),
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ConnectTimeout=10",
+                "-i",
+                &key_path.to_string_lossy(),
                 &format!("admin@{}", handle.ip),
                 command,
             ])
@@ -189,11 +193,16 @@ impl VMManager {
         for attempt in 0..60 {
             let result = Command::new("ssh")
                 .args([
-                    "-o", "StrictHostKeyChecking=no",
-                    "-o", "UserKnownHostsFile=/dev/null",
-                    "-o", "ConnectTimeout=5",
-                    "-o", "BatchMode=yes",
-                    "-i", &key_path.to_string_lossy(),
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "-o",
+                    "UserKnownHostsFile=/dev/null",
+                    "-o",
+                    "ConnectTimeout=5",
+                    "-o",
+                    "BatchMode=yes",
+                    "-i",
+                    &key_path.to_string_lossy(),
                     &format!("admin@{}", handle.ip),
                     "true",
                 ])
@@ -244,10 +253,14 @@ impl VMManager {
         let key_path = ssh_private_key();
         let scp_result = Command::new("scp")
             .args([
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "ConnectTimeout=10",
-                "-i", &key_path.to_string_lossy(),
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ConnectTimeout=10",
+                "-i",
+                &key_path.to_string_lossy(),
                 &binary_path.to_string_lossy(),
                 &format!("admin@{}:/tmp/rubberdux.new", handle.ip),
             ])
@@ -354,10 +367,8 @@ async fn wait_for_ip(vm_name: &str) -> Result<String, Error> {
                 );
                 return Ok(ip);
             }
-            Ok(ip) => {
-            }
-            Err(e) => {
-            }
+            Ok(ip) => {}
+            Err(e) => {}
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }

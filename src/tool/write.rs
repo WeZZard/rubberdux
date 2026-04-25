@@ -23,10 +23,12 @@ impl super::Tool for WriteFileTool {
         Box::pin(async move {
             let args: serde_json::Value = match serde_json::from_str(arguments) {
                 Ok(v) => v,
-                Err(e) => return ToolOutcome::Immediate {
-                    content: format!("Failed to parse tool arguments: {}", e),
-                    is_error: true,
-                },
+                Err(e) => {
+                    return ToolOutcome::Immediate {
+                        content: format!("Failed to parse tool arguments: {}", e),
+                        is_error: true,
+                    };
+                }
             };
             execute(&args).await
         })
@@ -40,7 +42,7 @@ pub async fn execute(args: &serde_json::Value) -> ToolOutcome {
             return ToolOutcome::Immediate {
                 content: "Missing required parameter: file_path".into(),
                 is_error: true,
-            }
+            };
         }
     };
 
@@ -50,7 +52,7 @@ pub async fn execute(args: &serde_json::Value) -> ToolOutcome {
             return ToolOutcome::Immediate {
                 content: "Missing required parameter: content".into(),
                 is_error: true,
-            }
+            };
         }
     };
 
@@ -61,7 +63,11 @@ pub async fn execute(args: &serde_json::Value) -> ToolOutcome {
 
     match std::fs::write(file_path, content) {
         Ok(()) => ToolOutcome::Immediate {
-            content: format!("Successfully wrote {} bytes to {}", content.len(), file_path),
+            content: format!(
+                "Successfully wrote {} bytes to {}",
+                content.len(),
+                file_path
+            ),
             is_error: false,
         },
         Err(e) => ToolOutcome::Immediate {

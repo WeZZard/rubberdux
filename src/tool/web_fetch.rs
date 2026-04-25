@@ -1,9 +1,9 @@
+use super::ToolOutcome;
+use crate::provider::moonshot::tool::ToolDefinition;
+use spider::features::chrome_common::RequestInterceptConfiguration;
+use spider::website::Website;
 use std::future::Future;
 use std::pin::Pin;
-use spider::website::Website;
-use spider::features::chrome_common::RequestInterceptConfiguration;
-use crate::provider::moonshot::tool::ToolDefinition;
-use super::ToolOutcome;
 use unicode_segmentation::UnicodeSegmentation;
 
 pub struct WebFetchTool;
@@ -84,8 +84,7 @@ pub async fn execute(args: &serde_json::Value) -> ToolOutcome {
 
 async fn fetch_with_spider(url: &str, chrome_path: &std::path::Path) -> Result<String, String> {
     unsafe {
-        std::env::set_var(
-            "CHROME_URL", format!("file://{}", chrome_path.display()));
+        std::env::set_var("CHROME_URL", format!("file://{}", chrome_path.display()));
     }
 
     let mut website = Website::new(url)
@@ -102,8 +101,7 @@ async fn fetch_with_spider(url: &str, chrome_path: &std::path::Path) -> Result<S
         .and_then(|pages| pages.first().map(|p| p.get_html()))
         .ok_or("No content returned from spider")?;
 
-    let markdown = htmd::convert(&html)
-        .unwrap_or_else(|_| html);
+    let markdown = htmd::convert(&html).unwrap_or_else(|_| html);
 
     Ok(truncate_content(markdown))
 }
@@ -190,7 +188,13 @@ mod tests {
         let content = "a".repeat(MAX_CONTENT_LENGTH + 1);
         let truncated = truncate_content(content);
         assert!(truncated.contains("[Content truncated at 100000 characters]"));
-        assert_eq!(truncated.graphemes(true).count(), MAX_CONTENT_LENGTH + "\n\n[Content truncated at 100000 characters]".graphemes(true).count());
+        assert_eq!(
+            truncated.graphemes(true).count(),
+            MAX_CONTENT_LENGTH
+                + "\n\n[Content truncated at 100000 characters]"
+                    .graphemes(true)
+                    .count()
+        );
     }
 
     #[test]
@@ -199,24 +203,39 @@ mod tests {
         let repeat_count = 50_000;
         let content = emoji.repeat(repeat_count);
         let truncated = truncate_content(content.clone());
-        
+
         // The family emoji is 7 chars but 1 grapheme cluster in unicode-segmentation
         // 50k * 1 = 50k graphemes which is under MAX_CONTENT_LENGTH, so no truncation occurs
         // Test with a larger count to ensure truncation
         let large_content = emoji.repeat(200_000);
         let truncated_large = truncate_content(large_content.clone());
-        
-        assert!(truncated_large.contains("[Content truncated"), "should contain truncation message");
-        assert!(std::str::from_utf8(truncated_large.as_bytes()).is_ok(), "must be valid UTF-8");
-        
+
+        assert!(
+            truncated_large.contains("[Content truncated"),
+            "should contain truncation message"
+        );
+        assert!(
+            std::str::from_utf8(truncated_large.as_bytes()).is_ok(),
+            "must be valid UTF-8"
+        );
+
         // Verify we don't split grapheme clusters
         let truncated_graphemes: Vec<&str> = truncated_large.graphemes(true).collect();
         let last_grapheme = truncated_graphemes.last().unwrap();
-        assert!(!last_grapheme.is_empty(), "last grapheme should not be empty");
-        
+        assert!(
+            !last_grapheme.is_empty(),
+            "last grapheme should not be empty"
+        );
+
         // Verify the truncated content has at most MAX_CONTENT_LENGTH + message suffix graphemes
-        assert!(truncated_large.graphemes(true).count() <= MAX_CONTENT_LENGTH + "\n\n[Content truncated at 100000 characters]".graphemes(true).count(),
-            "truncated should not exceed MAX_CONTENT_LENGTH + message suffix");
+        assert!(
+            truncated_large.graphemes(true).count()
+                <= MAX_CONTENT_LENGTH
+                    + "\n\n[Content truncated at 100000 characters]"
+                        .graphemes(true)
+                        .count(),
+            "truncated should not exceed MAX_CONTENT_LENGTH + message suffix"
+        );
     }
 
     #[test]
@@ -225,10 +244,10 @@ mod tests {
         let repeat_count = (MAX_CONTENT_LENGTH / 3) + 100;
         let content = cjk.repeat(repeat_count);
         let truncated = truncate_content(content.clone());
-        
+
         assert!(truncated.contains("[Content truncated"));
         assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
-        
+
         // Verify no partial CJK characters
         let truncated_graphemes: Vec<&str> = truncated.graphemes(true).collect();
         for g in &truncated_graphemes[..MAX_CONTENT_LENGTH] {
@@ -243,10 +262,10 @@ mod tests {
         let repeat_count = MAX_CONTENT_LENGTH + 100;
         let content = base.repeat(repeat_count);
         let truncated = truncate_content(content.clone());
-        
+
         assert!(truncated.contains("[Content truncated"));
         assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
-        
+
         // Verify combining marks stay with their base
         let truncated_graphemes: Vec<&str> = truncated.graphemes(true).collect();
         // The message suffix adds extra graphemes, so check first MAX_CONTENT_LENGTH
@@ -300,12 +319,18 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_with_reqwest_static_site() {
         let result = fetch_with_reqwest("https://httpbin.org/html").await;
-        assert!(result.is_ok(), "Should fetch static HTML: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should fetch static HTML: {:?}",
+            result.err()
+        );
         let content = result.unwrap();
         assert!(!content.is_empty(), "Content should not be empty");
         // httpbin.org/html returns a simple HTML page
-        assert!(content.contains("Herman Melville") || content.contains("Moby-Dick"),
-            "Should contain expected content from httpbin.org/html");
+        assert!(
+            content.contains("Herman Melville") || content.contains("Moby-Dick"),
+            "Should contain expected content from httpbin.org/html"
+        );
     }
 
     #[tokio::test]
@@ -313,8 +338,11 @@ mod tests {
         let result = fetch_with_reqwest("https://httpbin.org/status/404").await;
         assert!(result.is_err(), "Should return error for 404");
         let err = result.unwrap_err();
-        assert!(err.contains("404") || err.contains("Not Found"),
-            "Error should mention 404: {}", err);
+        assert!(
+            err.contains("404") || err.contains("Not Found"),
+            "Error should mention 404: {}",
+            err
+        );
     }
 
     #[tokio::test]
@@ -328,7 +356,11 @@ mod tests {
         // httpbin.org/html returns valid HTML, but we can test with a data URI or
         // a known endpoint. For malformed HTML, we'll use a text endpoint
         let result = fetch_with_reqwest("https://httpbin.org/get").await;
-        assert!(result.is_ok(), "Should handle JSON response: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should handle JSON response: {:?}",
+            result.err()
+        );
         let content = result.unwrap();
         assert!(!content.is_empty());
     }
@@ -343,14 +375,17 @@ mod tests {
         let start = std::time::Instant::now();
         let result = fetch_with_reqwest("https://httpbin.org/delay/35").await;
         let elapsed = start.elapsed();
-        
+
         // The request should either timeout or take a long time
         // On some networks it might succeed if delay is ignored
         if result.is_ok() {
             println!("Warning: timeout test endpoint did not delay as expected");
         }
-        assert!(elapsed < std::time::Duration::from_secs(40),
-            "Should not wait more than 40 seconds, took {:?}", elapsed);
+        assert!(
+            elapsed < std::time::Duration::from_secs(40),
+            "Should not wait more than 40 seconds, took {:?}",
+            elapsed
+        );
     }
 
     #[tokio::test]
@@ -358,8 +393,11 @@ mod tests {
         let result = fetch_with_reqwest("https://httpbin.org/status/500").await;
         assert!(result.is_err(), "Should return error for 500");
         let err = result.unwrap_err();
-        assert!(err.contains("500") || err.contains("Internal Server Error"),
-            "Error should mention 500: {}", err);
+        assert!(
+            err.contains("500") || err.contains("Internal Server Error"),
+            "Error should mention 500: {}",
+            err
+        );
     }
 
     // ------------------------------------------------------------------

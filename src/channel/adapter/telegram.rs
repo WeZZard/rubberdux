@@ -15,13 +15,79 @@ const TELEGRAM_PROMPT: &str = include_str!("TELEGRAM.md");
 /// Default reaction emojis from teloxide's ReactionType::Emoji documentation.
 /// Used as fallback when get_chat returns None for available_reactions.
 pub const DEFAULT_REACTIONS: &[&str] = &[
-    "👍", "👎", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "🤬", "😢",
-    "🎉", "🤩", "🤮", "💩", "🙏", "👌", "🕊", "🤡", "🥱", "🥴", "😍", "🐳",
-    "❤\u{200d}🔥", "🌚", "🌭", "💯", "🤣", "⚡", "🍌", "🏆", "💔", "🤨",
-    "😐", "🍓", "🍾", "💋", "🖕", "😈", "😴", "😭", "🤓", "👻", "👨\u{200d}💻",
-    "👀", "🎃", "🙈", "😇", "😨", "🤝", "✍", "🤗", "🫡", "🎅", "🎄", "☃",
-    "💅", "🤪", "🗿", "🆒", "💘", "🙉", "🦄", "😘", "💊", "🙊", "😎", "👾",
-    "🤷\u{200d}♂", "🤷", "🤷\u{200d}♀", "😡",
+    "👍",
+    "👎",
+    "❤",
+    "🔥",
+    "🥰",
+    "👏",
+    "😁",
+    "🤔",
+    "🤯",
+    "😱",
+    "🤬",
+    "😢",
+    "🎉",
+    "🤩",
+    "🤮",
+    "💩",
+    "🙏",
+    "👌",
+    "🕊",
+    "🤡",
+    "🥱",
+    "🥴",
+    "😍",
+    "🐳",
+    "❤\u{200d}🔥",
+    "🌚",
+    "🌭",
+    "💯",
+    "🤣",
+    "⚡",
+    "🍌",
+    "🏆",
+    "💔",
+    "🤨",
+    "😐",
+    "🍓",
+    "🍾",
+    "💋",
+    "🖕",
+    "😈",
+    "😴",
+    "😭",
+    "🤓",
+    "👻",
+    "👨\u{200d}💻",
+    "👀",
+    "🎃",
+    "🙈",
+    "😇",
+    "😨",
+    "🤝",
+    "✍",
+    "🤗",
+    "🫡",
+    "🎅",
+    "🎄",
+    "☃",
+    "💅",
+    "🤪",
+    "🗿",
+    "🆒",
+    "💘",
+    "🙉",
+    "🦄",
+    "😘",
+    "💊",
+    "🙊",
+    "😎",
+    "👾",
+    "🤷\u{200d}♂",
+    "🤷",
+    "🤷\u{200d}♀",
+    "😡",
 ];
 
 /// Returns the Telegram channel prompt WITHOUT reactions section.
@@ -65,7 +131,11 @@ async fn fetch_and_send_reactions(bot: &Bot, chat_id: ChatId, tx: &mpsc::Sender<
                 }
             };
             let section = format_reaction_section(&emojis);
-            log::info!("Fetched {} available reactions for chat {}", emojis.len(), chat_id);
+            log::info!(
+                "Fetched {} available reactions for chat {}",
+                emojis.len(),
+                chat_id
+            );
             let _ = tx
                 .send(ChannelEvent::InternalEvent(
                     InternalEvent::UpdateAvailableReactions {
@@ -168,7 +238,9 @@ async fn handle_message(
                             .send_message(chat_id, &formatted)
                             .parse_mode(teloxide::types::ParseMode::MarkdownV2);
                         if let Some(reply_id) = response.reply_to_message_id {
-                            req = req.reply_parameters(teloxide::types::ReplyParameters::new(teloxide::types::MessageId(reply_id)));
+                            req = req.reply_parameters(teloxide::types::ReplyParameters::new(
+                                teloxide::types::MessageId(reply_id),
+                            ));
                         }
                         let sent_msg = req.await;
 
@@ -181,7 +253,11 @@ async fn handle_message(
                                 );
                                 let mut fallback_req = bot.send_message(chat_id, content);
                                 if let Some(reply_id) = response.reply_to_message_id {
-                                    fallback_req = fallback_req.reply_parameters(teloxide::types::ReplyParameters::new(teloxide::types::MessageId(reply_id)));
+                                    fallback_req = fallback_req.reply_parameters(
+                                        teloxide::types::ReplyParameters::new(
+                                            teloxide::types::MessageId(reply_id),
+                                        ),
+                                    );
                                 }
                                 fallback_req.await.ok()
                             }
@@ -215,7 +291,9 @@ async fn handle_message(
                         .send_message(chat_id, &formatted)
                         .parse_mode(teloxide::types::ParseMode::MarkdownV2);
                     if let Some(reply_id) = response.reply_to_message_id {
-                        req = req.reply_parameters(teloxide::types::ReplyParameters::new(teloxide::types::MessageId(reply_id)));
+                        req = req.reply_parameters(teloxide::types::ReplyParameters::new(
+                            teloxide::types::MessageId(reply_id),
+                        ));
                     }
                     let sent_msg = req.await;
 
@@ -228,7 +306,11 @@ async fn handle_message(
                             );
                             let mut fallback_req = bot.send_message(chat_id, &response.text);
                             if let Some(reply_id) = response.reply_to_message_id {
-                                fallback_req = fallback_req.reply_parameters(teloxide::types::ReplyParameters::new(teloxide::types::MessageId(reply_id)));
+                                fallback_req = fallback_req.reply_parameters(
+                                    teloxide::types::ReplyParameters::new(
+                                        teloxide::types::MessageId(reply_id),
+                                    ),
+                                );
                             }
                             let _ = fallback_req.await;
                         }

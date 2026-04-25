@@ -60,11 +60,7 @@ pub fn load_session(path: &Path, system_prompt: &str) -> EntryHistory {
     }
 
     let mut history = if is_entry_format {
-        log::info!(
-            "Restored {} entries from session {:?}",
-            entries.len(),
-            path
-        );
+        log::info!("Restored {} entries from session {:?}", entries.len(), path);
         EntryHistory::from_entries(entries)
     } else if is_legacy_format {
         log::info!(
@@ -95,13 +91,15 @@ pub fn load_session(path: &Path, system_prompt: &str) -> EntryHistory {
                     new_history.push_user(entry.message.clone());
                 }
                 Message::Assistant { .. } => {
-                    let parent =
-                        entry.parent_id.unwrap_or(new_history.last_id().unwrap_or(0));
+                    let parent = entry
+                        .parent_id
+                        .unwrap_or(new_history.last_id().unwrap_or(0));
                     new_history.push_assistant(parent, entry.message.clone());
                 }
                 Message::Tool { .. } => {
-                    let parent =
-                        entry.parent_id.unwrap_or(new_history.last_id().unwrap_or(0));
+                    let parent = entry
+                        .parent_id
+                        .unwrap_or(new_history.last_id().unwrap_or(0));
                     new_history.push_tool(parent, entry.message.clone());
                 }
             }

@@ -1,11 +1,7 @@
-use crate::llm::{build_request_json, parse_response_text, ChatMessage, LlmClient};
+use crate::llm::{ChatMessage, LlmClient, build_request_json, parse_response_text};
 
 /// Render guidance comments into a natural user message using an LLM.
-pub async fn render_guidance<C: LlmClient>(
-    guidance: &[String],
-    client: &C,
-    model: &str,
-) -> String {
+pub async fn render_guidance<C: LlmClient>(guidance: &[String], client: &C, model: &str) -> String {
     if guidance.is_empty() {
         return String::new();
     }
@@ -31,12 +27,18 @@ pub async fn render_guidance<C: LlmClient>(
         Ok(raw) => match parse_response_text(&raw) {
             Ok(text) => text.trim().to_string(),
             Err(e) => {
-                eprintln!("Warning: Guidance rendering parse failed: {}. Using raw guidance.", e);
+                eprintln!(
+                    "Warning: Guidance rendering parse failed: {}. Using raw guidance.",
+                    e
+                );
                 guidance.first().cloned().unwrap_or_default()
             }
         },
         Err(e) => {
-            eprintln!("Warning: Guidance rendering failed: {}. Using raw guidance.", e);
+            eprintln!(
+                "Warning: Guidance rendering failed: {}. Using raw guidance.",
+                e
+            );
             guidance.first().cloned().unwrap_or_default()
         }
     }

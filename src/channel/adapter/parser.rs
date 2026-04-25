@@ -67,21 +67,35 @@ mod tests {
     #[test]
     fn test_plain_text_is_internal() {
         let segments = parse_model_output("Just thinking here.");
-        assert_eq!(segments, vec![Segment::Internal("Just thinking here.".into())]);
+        assert_eq!(
+            segments,
+            vec![Segment::Internal("Just thinking here.".into())]
+        );
     }
 
     #[test]
     fn test_telegram_message_extracted() {
         let input = "<telegram-message from=\"assistant\" to=\"user\">Hello!</telegram-message>";
         let segments = parse_model_output(input);
-        assert_eq!(segments, vec![Segment::TelegramMessage { content: "Hello!".into() }]);
+        assert_eq!(
+            segments,
+            vec![Segment::TelegramMessage {
+                content: "Hello!".into()
+            }]
+        );
     }
 
     #[test]
     fn test_telegram_message_with_id_attribute() {
-        let input = "<telegram-message from=\"assistant\" to=\"user\" id=\"73\">Hello!</telegram-message>";
+        let input =
+            "<telegram-message from=\"assistant\" to=\"user\" id=\"73\">Hello!</telegram-message>";
         let segments = parse_model_output(input);
-        assert_eq!(segments, vec![Segment::TelegramMessage { content: "Hello!".into() }]);
+        assert_eq!(
+            segments,
+            vec![Segment::TelegramMessage {
+                content: "Hello!".into()
+            }]
+        );
     }
 
     #[test]
@@ -90,7 +104,12 @@ mod tests {
         let segments = parse_model_output(input);
         assert_eq!(segments.len(), 3);
         assert_eq!(segments[0], Segment::Internal("Let me think.".into()));
-        assert_eq!(segments[1], Segment::TelegramMessage { content: "The answer is 42.".into() });
+        assert_eq!(
+            segments[1],
+            Segment::TelegramMessage {
+                content: "The answer is 42.".into()
+            }
+        );
         assert_eq!(segments[2], Segment::Internal("Done reasoning.".into()));
     }
 
@@ -98,7 +117,13 @@ mod tests {
     fn test_telegram_reaction_parsed() {
         let input = "<telegram-reaction from=\"assistant\" action=\"add\" emoji=\"👍\" message-id=\"42\" />";
         let segments = parse_model_output(input);
-        assert_eq!(segments, vec![Segment::TelegramReaction { emoji: "👍".into(), message_id: 42 }]);
+        assert_eq!(
+            segments,
+            vec![Segment::TelegramReaction {
+                emoji: "👍".into(),
+                message_id: 42
+            }]
+        );
     }
 
     #[test]
@@ -106,8 +131,19 @@ mod tests {
         let input = "<telegram-reaction from=\"assistant\" action=\"add\" emoji=\"❤️\" message-id=\"10\" />\n<telegram-message from=\"assistant\" to=\"user\">Great question!</telegram-message>";
         let segments = parse_model_output(input);
         assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0], Segment::TelegramReaction { emoji: "❤️".into(), message_id: 10 });
-        assert_eq!(segments[1], Segment::TelegramMessage { content: "Great question!".into() });
+        assert_eq!(
+            segments[0],
+            Segment::TelegramReaction {
+                emoji: "❤️".into(),
+                message_id: 10
+            }
+        );
+        assert_eq!(
+            segments[1],
+            Segment::TelegramMessage {
+                content: "Great question!".into()
+            }
+        );
     }
 
     #[test]
@@ -117,7 +153,10 @@ mod tests {
         assert_eq!(segments.len(), 1);
         assert!(matches!(&segments[0], Segment::Internal(_)));
         if let Segment::Internal(text) = &segments[0] {
-            assert!(text.contains("<telegram-message"), "Code block content should be preserved as-is");
+            assert!(
+                text.contains("<telegram-message"),
+                "Code block content should be preserved as-is"
+            );
         }
     }
 
@@ -134,17 +173,28 @@ mod tests {
         let input = "Here's an example:\n```\n<telegram-message from=\"assistant\" to=\"user\">fake</telegram-message>\n```\n<telegram-message from=\"assistant\" to=\"user\">Real reply here.</telegram-message>";
         let segments = parse_model_output(input);
 
-        let messages: Vec<&Segment> = segments.iter()
+        let messages: Vec<&Segment> = segments
+            .iter()
             .filter(|s| matches!(s, Segment::TelegramMessage { .. }))
             .collect();
 
-        assert_eq!(messages.len(), 1, "Only the real tag outside code block should be parsed");
-        assert_eq!(messages[0], &Segment::TelegramMessage { content: "Real reply here.".into() });
+        assert_eq!(
+            messages.len(),
+            1,
+            "Only the real tag outside code block should be parsed"
+        );
+        assert_eq!(
+            messages[0],
+            &Segment::TelegramMessage {
+                content: "Real reply here.".into()
+            }
+        );
     }
 
     #[test]
     fn test_user_tags_ignored() {
-        let input = "<telegram-message from=\"user\" to=\"assistant\" id=\"5\">Hello</telegram-message>";
+        let input =
+            "<telegram-message from=\"user\" to=\"assistant\" id=\"5\">Hello</telegram-message>";
         let segments = parse_model_output(input);
         assert_eq!(segments.len(), 1);
         assert!(matches!(&segments[0], Segment::Internal(_)));
@@ -154,9 +204,12 @@ mod tests {
     fn test_multiline_content_preserved() {
         let input = "<telegram-message from=\"assistant\" to=\"user\">Line 1\nLine 2\n**Bold**</telegram-message>";
         let segments = parse_model_output(input);
-        assert_eq!(segments, vec![Segment::TelegramMessage {
-            content: "Line 1\nLine 2\n**Bold**".into()
-        }]);
+        assert_eq!(
+            segments,
+            vec![Segment::TelegramMessage {
+                content: "Line 1\nLine 2\n**Bold**".into()
+            }]
+        );
     }
 
     #[test]
@@ -167,8 +220,13 @@ mod tests {
 
     #[test]
     fn test_reaction_without_assistant_ignored() {
-        let input = "<telegram-reaction from=\"user\" action=\"add\" emoji=\"👍\" message-id=\"1\" />";
+        let input =
+            "<telegram-reaction from=\"user\" action=\"add\" emoji=\"👍\" message-id=\"1\" />";
         let segments = parse_model_output(input);
-        assert!(segments.iter().all(|s| !matches!(s, Segment::TelegramReaction { .. })));
+        assert!(
+            segments
+                .iter()
+                .all(|s| !matches!(s, Segment::TelegramReaction { .. }))
+        );
     }
 }

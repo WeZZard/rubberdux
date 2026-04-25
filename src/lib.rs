@@ -2,12 +2,13 @@ pub mod agent;
 #[cfg(feature = "host")]
 pub mod channel;
 pub mod error;
+pub mod hardened_prompts;
 #[cfg(feature = "host")]
 pub mod host;
-pub mod hardened_prompts;
 pub mod protocol;
 pub mod provider;
 pub mod session;
 pub mod tool;
+pub mod trajectory;
 #[cfg(feature = "host")]
 pub mod vm;

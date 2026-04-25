@@ -44,15 +44,9 @@ pub enum UserContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
-    Text {
-        text: String,
-    },
-    ImageUrl {
-        image_url: MediaUrl,
-    },
-    VideoUrl {
-        video_url: MediaUrl,
-    },
+    Text { text: String },
+    ImageUrl { image_url: MediaUrl },
+    VideoUrl { video_url: MediaUrl },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,7 +83,9 @@ impl Message {
 
     pub fn reasoning_content(&self) -> Option<&str> {
         match self {
-            Message::Assistant { reasoning_content, .. } => reasoning_content.as_deref(),
+            Message::Assistant {
+                reasoning_content, ..
+            } => reasoning_content.as_deref(),
             _ => None,
         }
     }
@@ -143,12 +139,7 @@ pub struct MoonshotClient {
 }
 
 impl MoonshotClient {
-    pub fn new(
-        http: reqwest::Client,
-        base_url: String,
-        api_key: String,
-        model: String,
-    ) -> Self {
+    pub fn new(http: reqwest::Client, base_url: String, api_key: String, model: String) -> Self {
         Self {
             http,
             base_url,
@@ -319,9 +310,15 @@ mod tests {
         // With #[serde(default)], None serializes as null
         // Kimi needs it present (even as null or ""), not omitted
         let has_field = json.get("reasoning_content").is_some();
-        println!("reasoning_content when None: {:?}", json.get("reasoning_content"));
+        println!(
+            "reasoning_content when None: {:?}",
+            json.get("reasoning_content")
+        );
         // This test documents current behavior
-        assert!(has_field, "reasoning_content should be present (not omitted) since we removed skip_serializing_if");
+        assert!(
+            has_field,
+            "reasoning_content should be present (not omitted) since we removed skip_serializing_if"
+        );
     }
 
     #[test]
@@ -346,8 +343,13 @@ mod tests {
         let mut msg: Message = serde_json::from_str(api_response).unwrap();
 
         // Simulate the fix: ensure reasoning_content is present and non-empty
-        if let Message::Assistant { reasoning_content, .. } = &mut msg {
-            if reasoning_content.is_none() || reasoning_content.as_ref().is_some_and(|s| s.is_empty()) {
+        if let Message::Assistant {
+            reasoning_content, ..
+        } = &mut msg
+        {
+            if reasoning_content.is_none()
+                || reasoning_content.as_ref().is_some_and(|s| s.is_empty())
+            {
                 *reasoning_content = Some("(tool call)".to_owned());
             }
         }
@@ -357,9 +359,18 @@ mod tests {
 
         // reasoning_content MUST be present, a string, and NON-EMPTY
         // Kimi treats empty string as "missing" and rejects the request
-        assert!(json.get("reasoning_content").is_some(), "reasoning_content must be present");
-        assert!(json["reasoning_content"].is_string(), "reasoning_content must be a string, not null");
-        assert!(!json["reasoning_content"].as_str().unwrap().is_empty(), "reasoning_content must not be empty — Kimi rejects empty string");
+        assert!(
+            json.get("reasoning_content").is_some(),
+            "reasoning_content must be present"
+        );
+        assert!(
+            json["reasoning_content"].is_string(),
+            "reasoning_content must be a string, not null"
+        );
+        assert!(
+            !json["reasoning_content"].as_str().unwrap().is_empty(),
+            "reasoning_content must not be empty — Kimi rejects empty string"
+        );
 
         // tool_calls must also be present
         assert!(json.get("tool_calls").is_some());
@@ -367,10 +378,7 @@ mod tests {
 
     /// Shared harness: builds history with a given tool result message,
     /// calls real Moonshot API, and returns whether the model tried to poll.
-    async fn run_background_tool_result_trial(
-        label: &str,
-        tool_result_content: &str,
-    ) -> bool {
+    async fn run_background_tool_result_trial(label: &str, tool_result_content: &str) -> bool {
         let client = MoonshotClient::from_env();
         let mut registry = crate::tool::ToolRegistry::new();
         registry.register(Box::new(crate::tool::bash::BashTool));
@@ -417,13 +425,18 @@ mod tests {
         let mut polled = false;
         let max_iterations = 3;
         for iteration in 1..=max_iterations {
-            let mut messages = vec![Message::System { content: system_prompt.to_owned() }];
+            let mut messages = vec![Message::System {
+                content: system_prompt.to_owned(),
+            }];
             messages.extend_from_slice(&history);
 
             let response = client.chat(messages, Some(tools.clone())).await.unwrap();
             let choice = &response.choices[0];
 
-            eprintln!("\n  [Call #{}] finish_reason={}", iteration, choice.finish_reason);
+            eprintln!(
+                "\n  [Call #{}] finish_reason={}",
+                iteration, choice.finish_reason
+            );
             if let Some(rc) = choice.message.reasoning_content() {
                 eprintln!("  reasoning: {}", rc);
             }
@@ -439,7 +452,10 @@ mod tests {
 
             if let Some(tool_calls) = choice.message.tool_calls() {
                 for call in tool_calls {
-                    eprintln!("  TOOL CALL: {}({})", call.function.name, call.function.arguments);
+                    eprintln!(
+                        "  TOOL CALL: {}({})",
+                        call.function.name, call.function.arguments
+                    );
                     polled = true;
 
                     // Don't actually execute — return a generic error to prevent infinite loops
@@ -467,24 +483,24 @@ mod tests {
 
         // Use the default format_tool_outcome to generate the tool result message
         let (_tx, _rx) = tokio::sync::oneshot::channel();
-        let default_bg_message = crate::tool::format_tool_outcome(
-            &crate::tool::ToolOutcome::Background {
+        let default_bg_message =
+            crate::tool::format_tool_outcome(&crate::tool::ToolOutcome::Background {
                 task_id: "fetch_abc123".into(),
                 output_path: std::path::PathBuf::from("./sessions/tasks/fetch_abc123.output"),
                 receiver: _rx,
-            },
-        );
+            });
 
-        let trials = vec![
-            (
-                "Default format_tool_outcome (no file path)",
-                default_bg_message.as_str(),
-            ),
-        ];
+        let trials = vec![(
+            "Default format_tool_outcome (no file path)",
+            default_bg_message.as_str(),
+        )];
 
         eprintln!("\n{}\n", "=".repeat(80));
         eprintln!("BACKGROUND TOOL RESULT — MODEL BEHAVIOR TRIALS");
-        eprintln!("Testing {} variants against real Moonshot API", trials.len());
+        eprintln!(
+            "Testing {} variants against real Moonshot API",
+            trials.len()
+        );
         eprintln!("\n{}", "=".repeat(80));
 
         let mut results = Vec::new();
@@ -497,7 +513,11 @@ mod tests {
         eprintln!("SUMMARY");
         eprintln!("{}", "=".repeat(80));
         for (label, polled) in &results {
-            let status = if *polled { "POLLED (bad)" } else { "CLEAN (good)" };
+            let status = if *polled {
+                "POLLED (bad)"
+            } else {
+                "CLEAN (good)"
+            };
             eprintln!("  {} => {}", label, status);
         }
         eprintln!("{}\n", "=".repeat(80));
@@ -527,13 +547,11 @@ mod tests {
 
         let system_prompt = "You are a helpful assistant.";
 
-        let mut history: Vec<Message> = vec![
-            Message::User {
-                content: UserContent::Text(
-                    "Compare the latest news about Google and Apple. Search for both.".into(),
-                ),
-            },
-        ];
+        let mut history: Vec<Message> = vec![Message::User {
+            content: UserContent::Text(
+                "Compare the latest news about Google and Apple. Search for both.".into(),
+            ),
+        }];
 
         eprintln!("\n{}", "=".repeat(80));
         eprintln!("TOOL CALL RECURSION SHAPE EXPERIMENT");
@@ -670,25 +688,45 @@ mod tests {
         // Step 2: Provide ALL tool results at once
         let tool_calls = tc.unwrap();
         for (i, call) in tool_calls.iter().enumerate() {
-            eprintln!("  tool[{}]: {}({})", i, call.function.name, &call.function.arguments[..call.function.arguments.len().min(60)]);
-            let result_content = format!("Content from tool call {}: This is fake content for {}.", i, call.function.name);
+            eprintln!(
+                "  tool[{}]: {}({})",
+                i,
+                call.function.name,
+                &call.function.arguments[..call.function.arguments.len().min(60)]
+            );
+            let result_content = format!(
+                "Content from tool call {}: This is fake content for {}.",
+                i, call.function.name
+            );
             history.push(Message::Tool {
                 tool_call_id: call.id.clone(),
-                name: if call.function.name.starts_with('$') { Some(call.function.name.clone()) } else { None },
+                name: if call.function.name.starts_with('$') {
+                    Some(call.function.name.clone())
+                } else {
+                    None
+                },
                 content: result_content,
             });
         }
 
-        eprintln!("\nStep 2: Provided {} tool results in one batch", tool_calls.len());
+        eprintln!(
+            "\nStep 2: Provided {} tool results in one batch",
+            tool_calls.len()
+        );
 
         // Step 3: Call the model again — does it see ALL results?
-        let mut messages = vec![Message::System { content: "You are a helpful assistant.".to_owned() }];
+        let mut messages = vec![Message::System {
+            content: "You are a helpful assistant.".to_owned(),
+        }];
         messages.extend_from_slice(&history);
 
         let response = client.chat(messages, Some(tools.clone())).await.unwrap();
         let choice = &response.choices[0];
 
-        eprintln!("\nStep 3: Model response (finish_reason={})", choice.finish_reason);
+        eprintln!(
+            "\nStep 3: Model response (finish_reason={})",
+            choice.finish_reason
+        );
         if let Some(rc) = choice.message.reasoning_content() {
             let rc_preview: String = rc.graphemes(true).take(300).collect();
             eprintln!("  reasoning: {}", rc_preview);
@@ -700,8 +738,13 @@ mod tests {
         let new_tc = choice.message.tool_calls().map(|t| t.len()).unwrap_or(0);
         eprintln!("  new tool_calls: {}", new_tc);
 
-        eprintln!("\nCONCLUSION: API {} batch tool results",
-            if choice.finish_reason == "stop" || new_tc > 0 { "ACCEPTS" } else { "REJECTS" }
+        eprintln!(
+            "\nCONCLUSION: API {} batch tool results",
+            if choice.finish_reason == "stop" || new_tc > 0 {
+                "ACCEPTS"
+            } else {
+                "REJECTS"
+            }
         );
         eprintln!("{}\n", "=".repeat(80));
     }

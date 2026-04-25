@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use tokio::sync::broadcast;
 use wiremock::matchers::{method, path};
@@ -7,7 +7,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use rubberdux::agent::runtime::subagent::spawn_subagent;
 use rubberdux::hardened_prompts::subagent_preamble;
 use rubberdux::provider::moonshot::MoonshotClient;
-use rubberdux::tool::agent::{build_subagent_registries, AgentTool};
+use rubberdux::tool::agent::{AgentTool, build_subagent_registries};
 use rubberdux::tool::{SubagentType, ToolRegistry};
 
 // ---------------------------------------------------------------------------
@@ -22,8 +22,7 @@ fn setup() -> (Arc<MoonshotClient>, ToolRegistry) {
         "test-model".into(),
     ));
 
-    let last_query = Arc::new(RwLock::new(String::new()));
-    let registries = build_subagent_registries(&client, &last_query);
+    let registries = build_subagent_registries(&client);
     let (context_tx, _) = broadcast::channel(4);
 
     let agent_tool = AgentTool::new(
@@ -149,8 +148,7 @@ async fn test_explore_subagent_happy_path() {
         "test-model".into(),
     ));
 
-    let last_query = Arc::new(RwLock::new(String::new()));
-    let registries = build_subagent_registries(&client, &last_query);
+    let registries = build_subagent_registries(&client);
     let registry = registries.get(&SubagentType::Explore).unwrap().clone();
 
     let preamble = subagent_preamble(SubagentType::Explore);
@@ -194,7 +192,11 @@ async fn test_explore_subagent_happy_path() {
 
     let tools = tool_names_from_request(&turn1);
     for expected in ["glob", "grep", "read_file", "web_fetch", "web_search"] {
-        assert!(tools.contains(&expected.to_owned()), "Explore tools should include {}", expected);
+        assert!(
+            tools.contains(&expected.to_owned()),
+            "Explore tools should include {}",
+            expected
+        );
     }
     for absent in ["bash", "write_file", "edit_file", "agent"] {
         assert!(
@@ -210,7 +212,10 @@ async fn test_explore_subagent_happy_path() {
     let has_tool_result = messages
         .iter()
         .any(|m| m["role"] == "tool" && m["tool_call_id"] == "call_001");
-    assert!(has_tool_result, "turn 2 should include tool result for glob");
+    assert!(
+        has_tool_result,
+        "turn 2 should include tool result for glob"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -232,8 +237,7 @@ async fn test_plan_subagent_happy_path() {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(stop_response("Analyzed project structure")),
+            ResponseTemplate::new(200).set_body_json(stop_response("Analyzed project structure")),
         )
         .mount(&mock_server)
         .await;
@@ -245,8 +249,7 @@ async fn test_plan_subagent_happy_path() {
         "test-model".into(),
     ));
 
-    let last_query = Arc::new(RwLock::new(String::new()));
-    let registries = build_subagent_registries(&client, &last_query);
+    let registries = build_subagent_registries(&client);
     let registry = registries.get(&SubagentType::Plan).unwrap().clone();
 
     let preamble = subagent_preamble(SubagentType::Plan);
@@ -289,10 +292,18 @@ async fn test_plan_subagent_happy_path() {
 
     let tools = tool_names_from_request(&turn1);
     for expected in ["glob", "grep", "read_file", "web_fetch", "web_search"] {
-        assert!(tools.contains(&expected.to_owned()), "Plan tools should include {}", expected);
+        assert!(
+            tools.contains(&expected.to_owned()),
+            "Plan tools should include {}",
+            expected
+        );
     }
     for absent in ["bash", "write_file", "edit_file"] {
-        assert!(!tools.contains(&absent.to_owned()), "Plan tools should NOT include {}", absent);
+        assert!(
+            !tools.contains(&absent.to_owned()),
+            "Plan tools should NOT include {}",
+            absent
+        );
     }
 
     // Turn 2: verify tool result message
@@ -301,7 +312,10 @@ async fn test_plan_subagent_happy_path() {
     let tool_msg = messages
         .iter()
         .find(|m| m["role"] == "tool" && m["tool_call_id"] == "call_001");
-    assert!(tool_msg.is_some(), "turn 2 should include tool result for read_file");
+    assert!(
+        tool_msg.is_some(),
+        "turn 2 should include tool result for read_file"
+    );
 
     // The tool result should contain actual Cargo.toml content
     let tool_content = tool_msg.unwrap()["content"].as_str().unwrap();
@@ -319,10 +333,10 @@ async fn test_gp_subagent_happy_path() {
     // Turn 1: LLM asks to run a bash command (GP-only tool)
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(tool_call_response(
-            "bash",
-            r#"{"command":"echo hello"}"#,
-        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(tool_call_response("bash", r#"{"command":"echo hello"}"#)),
+        )
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
@@ -330,9 +344,7 @@ async fn test_gp_subagent_happy_path() {
     // Turn 2: stop
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(stop_response("Command executed")),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(stop_response("Command executed")))
         .mount(&mock_server)
         .await;
 
@@ -343,9 +355,11 @@ async fn test_gp_subagent_happy_path() {
         "test-model".into(),
     ));
 
-    let last_query = Arc::new(RwLock::new(String::new()));
-    let registries = build_subagent_registries(&client, &last_query);
-    let registry = registries.get(&SubagentType::GeneralPurpose).unwrap().clone();
+    let registries = build_subagent_registries(&client);
+    let registry = registries
+        .get(&SubagentType::GeneralPurpose)
+        .unwrap()
+        .clone();
 
     let preamble = subagent_preamble(SubagentType::GeneralPurpose);
     let system_prompt = format!("{}\n\nBase system prompt.", preamble);
@@ -404,7 +418,10 @@ async fn test_gp_subagent_happy_path() {
     let tool_msg = messages
         .iter()
         .find(|m| m["role"] == "tool" && m["tool_call_id"] == "call_001");
-    assert!(tool_msg.is_some(), "turn 2 should include tool result for bash");
+    assert!(
+        tool_msg.is_some(),
+        "turn 2 should include tool result for bash"
+    );
 
     let tool_content = tool_msg.unwrap()["content"].as_str().unwrap();
     assert!(
@@ -421,10 +438,10 @@ async fn test_computer_use_subagent_happy_path() {
     // Turn 1: LLM asks to run a bash command (ComputerUse has bash)
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(tool_call_response(
-            "bash",
-            r#"{"command":"echo hello"}"#,
-        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(tool_call_response("bash", r#"{"command":"echo hello"}"#)),
+        )
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
@@ -432,9 +449,7 @@ async fn test_computer_use_subagent_happy_path() {
     // Turn 2: stop
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(stop_response("Command executed")),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(stop_response("Command executed")))
         .mount(&mock_server)
         .await;
 
@@ -445,8 +460,7 @@ async fn test_computer_use_subagent_happy_path() {
         "test-model".into(),
     ));
 
-    let last_query = Arc::new(RwLock::new(String::new()));
-    let registries = build_subagent_registries(&client, &last_query);
+    let registries = build_subagent_registries(&client);
     let registry = registries.get(&SubagentType::ComputerUse).unwrap().clone();
 
     let preamble = subagent_preamble(SubagentType::ComputerUse);
@@ -506,7 +520,10 @@ async fn test_computer_use_subagent_happy_path() {
     let tool_msg = messages
         .iter()
         .find(|m| m["role"] == "tool" && m["tool_call_id"] == "call_001");
-    assert!(tool_msg.is_some(), "turn 2 should include tool result for bash");
+    assert!(
+        tool_msg.is_some(),
+        "turn 2 should include tool result for bash"
+    );
 
     let tool_content = tool_msg.unwrap()["content"].as_str().unwrap();
     assert!(

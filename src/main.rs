@@ -2,13 +2,14 @@ mod agent;
 #[cfg(feature = "host")]
 mod channel;
 mod error;
+mod hardened_prompts;
 #[cfg(feature = "host")]
 mod host;
-mod hardened_prompts;
 mod protocol;
 mod provider;
 mod session;
 mod tool;
+mod trajectory;
 mod vm;
 
 use unicode_segmentation::UnicodeSegmentation;

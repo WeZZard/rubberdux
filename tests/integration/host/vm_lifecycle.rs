@@ -2,16 +2,53 @@ use std::path::PathBuf;
 
 use rubberdux::host::HostConfig;
 use rubberdux::vm::manager::VMManager;
+use serial_test::serial;
+
+struct EnvVarGuard {
+    key: &'static str,
+    value: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, new_value: &str) -> Self {
+        let value = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, new_value);
+        }
+        Self { key, value }
+    }
+
+    fn unset(key: &'static str) -> Self {
+        let value = std::env::var(key).ok();
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self { key, value }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(value) = &self.value {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+}
 
 /// Test that HostConfig::from_env parses correctly.
 #[test]
+#[serial(host_config_env)]
 fn test_host_config_from_env() {
-    unsafe {
-        std::env::set_var("RUBBERDUX_VM_IMAGE", "test-image");
-        std::env::set_var("RUBBERDUX_VM_SHARES", "/tmp/test-shares");
-        std::env::set_var("RUBBERDUX_RPC_PORT", "12345");
-        std::env::set_var("RUBBERDUX_HOST_IP", "192.168.1.1");
-    }
+    let _guards = [
+        EnvVarGuard::set("RUBBERDUX_VM_IMAGE", "test-image"),
+        EnvVarGuard::set("RUBBERDUX_VM_SHARES", "/tmp/test-shares"),
+        EnvVarGuard::set("RUBBERDUX_RPC_PORT", "12345"),
+        EnvVarGuard::set("RUBBERDUX_HOST_IP", "192.168.1.1"),
+    ];
 
     let config = HostConfig::from_env();
 
@@ -19,26 +56,18 @@ fn test_host_config_from_env() {
     assert_eq!(config.share_root, PathBuf::from("/tmp/test-shares"));
     assert_eq!(config.rpc_port, 12345);
     assert_eq!(config.host_ip, "192.168.1.1");
-
-    // Clean up
-    unsafe {
-        std::env::remove_var("RUBBERDUX_VM_IMAGE");
-        std::env::remove_var("RUBBERDUX_VM_SHARES");
-        std::env::remove_var("RUBBERDUX_RPC_PORT");
-        std::env::remove_var("RUBBERDUX_HOST_IP");
-    }
 }
 
 /// Test that HostConfig uses defaults when env vars are missing.
 #[test]
+#[serial(host_config_env)]
 fn test_host_config_defaults() {
-    // Remove env vars to test defaults
-    unsafe {
-        std::env::remove_var("RUBBERDUX_VM_IMAGE");
-        std::env::remove_var("RUBBERDUX_VM_SHARES");
-        std::env::remove_var("RUBBERDUX_RPC_PORT");
-        std::env::remove_var("RUBBERDUX_HOST_IP");
-    }
+    let _guards = [
+        EnvVarGuard::unset("RUBBERDUX_VM_IMAGE"),
+        EnvVarGuard::unset("RUBBERDUX_VM_SHARES"),
+        EnvVarGuard::unset("RUBBERDUX_RPC_PORT"),
+        EnvVarGuard::unset("RUBBERDUX_HOST_IP"),
+    ];
 
     let config = HostConfig::from_env();
 

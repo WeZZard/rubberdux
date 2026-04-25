@@ -155,10 +155,7 @@ pub fn lint_test_case(test_case: &TestCase) -> Result<(), Vec<LintError>> {
                         errors.push(LintError {
                             line: 1,
                             rule: "R4",
-                            message: format!(
-                                "User message {} guidance must not be empty",
-                                i + 1
-                            ),
+                            message: format!("User message {} guidance must not be empty", i + 1),
                         });
                     }
                 }
@@ -227,10 +224,7 @@ fn find_plain_text_in_storyline(content: &str) -> Option<usize> {
             if trimmed.starts_with("## ") {
                 break;
             }
-            if !trimmed.is_empty()
-                && !trimmed.starts_with("<!--")
-                && !trimmed.starts_with("<!--")
-            {
+            if !trimmed.is_empty() && !trimmed.starts_with("<!--") && !trimmed.starts_with("<!--") {
                 return Some(i + 1);
             }
         }

@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 
 /// Unique identifier for a session, formatted as YYYY-MM-DD-hh-mm-ss-UTC.
 #[derive(Debug, Clone)]
@@ -17,7 +17,10 @@ impl SessionId {
 
     pub fn from_string(s: &str) -> Option<Self> {
         let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d-%H-%M-%S-UTC").ok()?;
-        Some(Self(chrono::DateTime::from_naive_utc_and_offset(naive, chrono::Utc)))
+        Some(Self(chrono::DateTime::from_naive_utc_and_offset(
+            naive,
+            chrono::Utc,
+        )))
     }
 }
 
@@ -84,14 +87,18 @@ impl SessionManager {
     fn resolve_home() -> PathBuf {
         std::env::var("RUBBERDUX_HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".rubberdux"))
+            .unwrap_or_else(|_| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".rubberdux")
+            })
     }
 
     /// Create a new session directory and return its ID and path.
     pub fn create_session(&self, model: String) -> Result<(SessionId, PathBuf), String> {
         let session_id = SessionId::now();
         let session_dir = self.sessions_dir.join(session_id.to_string());
-        
+
         fs::create_dir_all(&session_dir)
             .map_err(|e| format!("Failed to create session dir: {}", e))?;
 
@@ -122,7 +129,7 @@ impl SessionManager {
     ) -> Result<PathBuf, String> {
         let session_dir = self.sessions_dir.join(session_id.to_string());
         let agent_dir = session_dir.join(format!("agent_{}", agent_id));
-        
+
         fs::create_dir_all(&agent_dir)
             .map_err(|e| format!("Failed to create subagent dir: {}", e))?;
 
@@ -134,8 +141,7 @@ impl SessionManager {
         Self::write_json(&metadata_path, metadata)?;
 
         let prompt_path = agent_dir.join("prompt.md");
-        fs::write(&prompt_path, prompt)
-            .map_err(|e| format!("Failed to write prompt.md: {}", e))?;
+        fs::write(&prompt_path, prompt).map_err(|e| format!("Failed to write prompt.md: {}", e))?;
 
         Ok(agent_dir)
     }
@@ -147,7 +153,8 @@ impl SessionManager {
 
     /// Get the path to an agent directory.
     pub fn agent_dir(&self, session_id: &SessionId, agent_id: &str) -> PathBuf {
-        self.session_dir(session_id).join(format!("agent_{}", agent_id))
+        self.session_dir(session_id)
+            .join(format!("agent_{}", agent_id))
     }
 
     /// Get the path to the main agent directory.
@@ -171,11 +178,9 @@ impl SessionManager {
     }
 
     /// Update the `$RUBBERDUX_HOME/latest` symlink to point to the given session.
-    pub fn update_latest_symlink(&self,
-        session_id: &SessionId,
-    ) -> Result<(), String> {
+    pub fn update_latest_symlink(&self, session_id: &SessionId) -> Result<(), String> {
         let target = self.session_dir(session_id);
-        
+
         // Remove existing symlink if present
         if self.latest_link.exists() {
             fs::remove_file(&self.latest_link)
@@ -200,7 +205,7 @@ impl SessionManager {
     /// Create the `sessions` symlink in the project root pointing to `$RUBBERDUX_HOME/sessions`.
     pub fn create_project_symlink(project_root: &Path) -> Result<(), String> {
         let symlink_path = project_root.join("sessions");
-        
+
         // Remove existing symlink or directory
         if symlink_path.exists() {
             if symlink_path.is_symlink() {
@@ -234,8 +239,7 @@ impl SessionManager {
     fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
         let json = serde_json::to_string_pretty(value)
             .map_err(|e| format!("Failed to serialize JSON: {}", e))?;
-        fs::write(path, json)
-            .map_err(|e| format!("Failed to write JSON file: {}", e))?;
+        fs::write(path, json).map_err(|e| format!("Failed to write JSON file: {}", e))?;
         Ok(())
     }
 }
@@ -286,12 +290,20 @@ mod tests {
         let home = temp_home();
         let mgr = manager_with_home(&home);
         let (session_id, session_dir) = mgr.create_session("kimi-for-coding".into()).unwrap();
-        
+
         assert!(session_dir.exists());
         assert!(mgr.main_agent_dir(&session_id).exists());
-        assert!(mgr.main_agent_dir(&session_id).join("tool_results").exists());
-        assert!(mgr.main_agent_dir(&session_id).join("metadata.json").exists());
-        
+        assert!(
+            mgr.main_agent_dir(&session_id)
+                .join("tool_results")
+                .exists()
+        );
+        assert!(
+            mgr.main_agent_dir(&session_id)
+                .join("metadata.json")
+                .exists()
+        );
+
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -300,29 +312,26 @@ mod tests {
         let home = temp_home();
         let mgr = manager_with_home(&home);
         let (session_id, _) = mgr.create_session("kimi-for-coding".into()).unwrap();
-        
+
         let metadata = AgentMetadata::for_subagent(
             "kimi-for-coding".into(),
             "web-search-agent".into(),
             session_id.to_string(),
             "GeneralPurpose".into(),
         );
-        
-        let agent_dir = mgr.create_subagent_dir(
-            &session_id,
-            "task-123",
-            &metadata,
-            "Search for latest news",
-        ).unwrap();
-        
+
+        let agent_dir = mgr
+            .create_subagent_dir(&session_id, "task-123", &metadata, "Search for latest news")
+            .unwrap();
+
         assert!(agent_dir.exists());
         assert!(agent_dir.join("metadata.json").exists());
         assert!(agent_dir.join("prompt.md").exists());
         assert!(agent_dir.join("tool_results").exists());
-        
+
         let prompt_content = fs::read_to_string(agent_dir.join("prompt.md")).unwrap();
         assert_eq!(prompt_content, "Search for latest news");
-        
+
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -333,7 +342,7 @@ mod tests {
         assert!(json.contains("start_time"));
         assert!(json.contains("model"));
         assert!(!json.contains("subagent_name")); // Should be skipped
-        
+
         let subagent = AgentMetadata::for_subagent(
             "kimi-for-coding".into(),
             "test-agent".into(),
@@ -351,11 +360,11 @@ mod tests {
         let home = temp_home();
         let mgr = manager_with_home(&home);
         let (session_id, _) = mgr.create_session("kimi-for-coding".into()).unwrap();
-        
+
         assert!(mgr.latest_link().exists());
         let target = fs::read_link(mgr.latest_link()).unwrap();
         assert_eq!(target, mgr.session_dir(&session_id));
-        
+
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -363,31 +372,41 @@ mod tests {
     fn test_rubberdux_home_default() {
         // Save and clear env
         let old = env::var("RUBBERDUX_HOME").ok();
-        unsafe { env::remove_var("RUBBERDUX_HOME"); }
-        
+        unsafe {
+            env::remove_var("RUBBERDUX_HOME");
+        }
+
         let mgr = SessionManager::new();
         let expected = dirs::home_dir().unwrap().join(".rubberdux");
         assert_eq!(mgr.home_dir, expected);
-        
+
         // Restore env
         if let Some(v) = old {
-            unsafe { env::set_var("RUBBERDUX_HOME", v); }
+            unsafe {
+                env::set_var("RUBBERDUX_HOME", v);
+            }
         }
     }
 
     #[test]
     fn test_rubberdux_home_env_override() {
         let old = env::var("RUBBERDUX_HOME").ok();
-        unsafe { env::set_var("RUBBERDUX_HOME", "/tmp/custom-rubberdux"); }
-        
+        unsafe {
+            env::set_var("RUBBERDUX_HOME", "/tmp/custom-rubberdux");
+        }
+
         let mgr = SessionManager::new();
         assert_eq!(mgr.home_dir, PathBuf::from("/tmp/custom-rubberdux"));
-        
+
         // Restore env
         if let Some(v) = old {
-            unsafe { env::set_var("RUBBERDUX_HOME", v); }
+            unsafe {
+                env::set_var("RUBBERDUX_HOME", v);
+            }
         } else {
-            unsafe { env::remove_var("RUBBERDUX_HOME"); }
+            unsafe {
+                env::remove_var("RUBBERDUX_HOME");
+            }
         }
     }
 
@@ -396,10 +415,10 @@ mod tests {
         let home = temp_home();
         let mgr = manager_with_home(&home);
         let (session_id, _) = mgr.create_session("kimi-for-coding".into()).unwrap();
-        
+
         let log_path = mgr.session_log_path(&session_id);
         assert!(log_path.to_string_lossy().contains("rubberdux.log"));
-        
+
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -431,11 +450,11 @@ mod tests {
         let home = temp_home();
         let mgr = manager_with_home(&home);
         let (session_id, _) = mgr.create_session("kimi".into()).unwrap();
-        
+
         let main_dir = mgr.main_agent_dir(&session_id);
         assert!(main_dir.to_string_lossy().contains("agent_main"));
         assert!(main_dir.exists());
-        
+
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -443,23 +462,23 @@ mod tests {
     fn test_create_session_idempotent() {
         let home = temp_home();
         let mgr = manager_with_home(&home);
-        
+
         // Create session
         let (id1, dir1) = mgr.create_session("kimi".into()).unwrap();
-        
+
         // Verify latest symlink
         let latest = fs::read_link(mgr.latest_link()).unwrap();
         assert_eq!(latest, dir1);
-        
+
         // Create another session
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let (id2, dir2) = mgr.create_session("kimi".into()).unwrap();
-        
+
         // Verify latest updated
         let latest = fs::read_link(mgr.latest_link()).unwrap();
         assert_eq!(latest, dir2);
         assert_ne!(id1.to_string(), id2.to_string());
-        
+
         let _ = fs::remove_dir_all(&home);
     }
 }

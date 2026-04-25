@@ -69,37 +69,34 @@ async fn test_tool_call_loop() {
     // First call: model requests a tool call
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({
-                    "id": "cmpl-1",
-                    "object": "chat.completion",
-                    "created": 1234567890,
-                    "model": "test-model",
-                    "choices": [{
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-1",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Let me check that for you.",
+                    "tool_calls": [{
                         "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": "Let me check that for you.",
-                            "tool_calls": [{
-                                "index": 0,
-                                "id": "tool_abc123",
-                                "type": "function",
-                                "function": {
-                                    "name": "read_file",
-                                    "arguments": "{\"file_path\": \"/etc/hostname\"}"
-                                }
-                            }]
-                        },
-                        "finish_reason": "tool_calls"
-                    }],
-                    "usage": {
-                        "prompt_tokens": 20,
-                        "completion_tokens": 15,
-                        "total_tokens": 35
-                    }
-                }))
-        )
+                        "id": "tool_abc123",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"file_path\": \"/etc/hostname\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": 20,
+                "completion_tokens": 15,
+                "total_tokens": 35
+            }
+        })))
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
@@ -107,28 +104,25 @@ async fn test_tool_call_loop() {
     // Second call: after tool result, model gives final response
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({
-                    "id": "cmpl-2",
-                    "object": "chat.completion",
-                    "created": 1234567891,
-                    "model": "test-model",
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": "The hostname is: test-machine"
-                        },
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {
-                        "prompt_tokens": 40,
-                        "completion_tokens": 10,
-                        "total_tokens": 50
-                    }
-                }))
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-2",
+            "object": "chat.completion",
+            "created": 1234567891,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "The hostname is: test-machine"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 40,
+                "completion_tokens": 10,
+                "total_tokens": 50
+            }
+        })))
         .mount(&mock_server)
         .await;
 
@@ -151,11 +145,9 @@ async fn test_tool_call_loop() {
     };
     let tools = registry.definitions();
 
-    let mut history: Vec<Message> = vec![
-        Message::User {
-            content: UserContent::Text("Read /etc/hostname".into()),
-        },
-    ];
+    let mut history: Vec<Message> = vec![Message::User {
+        content: UserContent::Text("Read /etc/hostname".into()),
+    }];
 
     // Simulate the tool use loop
     let mut final_text = String::new();
@@ -183,8 +175,9 @@ async fn test_tool_call_loop() {
         // Execute tool calls
         if let Some(tool_calls) = choice.message.tool_calls() {
             for call in tool_calls {
-                let outcome =
-                    registry.execute(&call.function.name, &call.function.arguments).await;
+                let outcome = registry
+                    .execute(&call.function.name, &call.function.arguments)
+                    .await;
                 let content = tool::format_tool_outcome(&outcome);
 
                 history.push(Message::Tool {
@@ -222,7 +215,9 @@ async fn test_read_file_tool_execution() {
         r
     };
 
-    let outcome = registry.execute("read_file", &serde_json::to_string(&args).unwrap()).await;
+    let outcome = registry
+        .execute("read_file", &serde_json::to_string(&args).unwrap())
+        .await;
 
     match outcome {
         tool::ToolOutcome::Immediate { content, is_error } => {
@@ -248,7 +243,9 @@ async fn test_bash_tool_sync() {
         r
     };
 
-    let outcome = registry.execute("bash", &serde_json::to_string(&args).unwrap()).await;
+    let outcome = registry
+        .execute("bash", &serde_json::to_string(&args).unwrap())
+        .await;
 
     match outcome {
         tool::ToolOutcome::Immediate { content, is_error } => {
@@ -274,10 +271,16 @@ async fn test_bash_tool_background() {
         r
     };
 
-    let outcome = registry.execute("bash", &serde_json::to_string(&args).unwrap()).await;
+    let outcome = registry
+        .execute("bash", &serde_json::to_string(&args).unwrap())
+        .await;
 
     match outcome {
-        tool::ToolOutcome::Background { task_id, output_path, receiver } => {
+        tool::ToolOutcome::Background {
+            task_id,
+            output_path,
+            receiver,
+        } => {
             assert!(!task_id.is_empty());
 
             // Wait for background task to complete (generous timeout for CI/parallel tests)
@@ -292,7 +295,11 @@ async fn test_bash_tool_background() {
                 }
             }
 
-            assert!(output.contains("bg_test"), "Output file should contain bg_test, got: {}", output);
+            assert!(
+                output.contains("bg_test"),
+                "Output file should contain bg_test, got: {}",
+                output
+            );
 
             // Verify the receiver also delivers the result
             let _receiver = receiver;
@@ -322,7 +329,9 @@ async fn test_edit_file_tool() {
         r
     };
 
-    let outcome = registry.execute("edit_file", &serde_json::to_string(&args).unwrap()).await;
+    let outcome = registry
+        .execute("edit_file", &serde_json::to_string(&args).unwrap())
+        .await;
 
     match &outcome {
         tool::ToolOutcome::Immediate { is_error, .. } => assert!(!is_error),
@@ -501,8 +510,9 @@ async fn test_background_tool_call_loop() {
 
         if let Some(tool_calls) = choice.message.tool_calls() {
             for call in tool_calls {
-                let outcome =
-                    registry.execute(&call.function.name, &call.function.arguments).await;
+                let outcome = registry
+                    .execute(&call.function.name, &call.function.arguments)
+                    .await;
 
                 // Background tool should return Background variant
                 if call.function.arguments.contains("run_in_background") {
@@ -536,7 +546,11 @@ async fn test_background_tool_call_loop() {
 
     // Verify the tool result in history contains the background task info
     if let Message::Tool { content, .. } = &history[2] {
-        assert!(content.contains("Background task"), "Expected background task info, got: {}", content);
+        assert!(
+            content.contains("Background task"),
+            "Expected background task info, got: {}",
+            content
+        );
     } else {
         panic!("Expected Tool message at index 2");
     }
@@ -597,23 +611,21 @@ async fn test_mixed_sync_background_tool_calls() {
     // Second call: model sees both results and produces final response
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "cmpl-mix-2",
-                "object": "chat.completion",
-                "created": 1234567891,
-                "model": "test-model",
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "The date is 2026-03-28 and the build is running in the background."
-                    },
-                    "finish_reason": "stop"
-                }],
-                "usage": { "prompt_tokens": 60, "completion_tokens": 15, "total_tokens": 75 }
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-mix-2",
+            "object": "chat.completion",
+            "created": 1234567891,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "The date is 2026-03-28 and the build is running in the background."
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 60, "completion_tokens": 15, "total_tokens": 75 }
+        })))
         .mount(&mock_server)
         .await;
 
@@ -666,8 +678,9 @@ async fn test_mixed_sync_background_tool_calls() {
 
         if let Some(tool_calls) = choice.message.tool_calls() {
             for call in tool_calls {
-                let outcome =
-                    registry.execute(&call.function.name, &call.function.arguments).await;
+                let outcome = registry
+                    .execute(&call.function.name, &call.function.arguments)
+                    .await;
 
                 if call.function.arguments.contains("run_in_background") {
                     bg_was_background = matches!(&outcome, tool::ToolOutcome::Background { .. });
@@ -725,8 +738,9 @@ async fn test_background_task_output_readable() {
         r
     };
 
-    let bg_outcome =
-        registry.execute("bash", &serde_json::to_string(&bg_args).unwrap()).await;
+    let bg_outcome = registry
+        .execute("bash", &serde_json::to_string(&bg_args).unwrap())
+        .await;
 
     let output_path = match bg_outcome {
         tool::ToolOutcome::Background { output_path, .. } => output_path,
@@ -741,8 +755,9 @@ async fn test_background_task_output_readable() {
         let read_args = serde_json::json!({
             "file_path": output_path.to_str().unwrap()
         });
-        let read_outcome =
-            registry.execute("read_file", &serde_json::to_string(&read_args).unwrap()).await;
+        let read_outcome = registry
+            .execute("read_file", &serde_json::to_string(&read_args).unwrap())
+            .await;
         if let tool::ToolOutcome::Immediate { content, is_error } = read_outcome {
             if !is_error && content.contains("lifecycle_test_output") {
                 read_content = content;
@@ -752,7 +767,11 @@ async fn test_background_task_output_readable() {
         }
     }
 
-    assert!(read_ok, "read_file should eventually succeed with output content, got: {}", read_content);
+    assert!(
+        read_ok,
+        "read_file should eventually succeed with output content, got: {}",
+        read_content
+    );
     assert!(
         read_content.contains("lifecycle_test_output"),
         "Output file should contain the command output, got: {}",
@@ -772,32 +791,30 @@ async fn test_multi_step_tool_chain() {
     // Step 1: model calls list_directory (conceptually, using bash)
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "cmpl-chain-1",
-                "object": "chat.completion",
-                "created": 1234567890,
-                "model": "test-model",
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "Let me list the files first.",
-                        "tool_calls": [{
-                            "index": 0,
-                            "id": "tool_step1",
-                            "type": "function",
-                            "function": {
-                                "name": "bash",
-                                "arguments": "{\"command\": \"echo file1.txt file2.txt\"}"
-                            }
-                        }]
-                    },
-                    "finish_reason": "tool_calls"
-                }],
-                "usage": { "prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30 }
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-chain-1",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Let me list the files first.",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "tool_step1",
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": "{\"command\": \"echo file1.txt file2.txt\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30 }
+        })))
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
@@ -805,32 +822,30 @@ async fn test_multi_step_tool_chain() {
     // Step 2: model reads a specific file
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "cmpl-chain-2",
-                "object": "chat.completion",
-                "created": 1234567891,
-                "model": "test-model",
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "Now let me read the first file.",
-                        "tool_calls": [{
-                            "index": 0,
-                            "id": "tool_step2",
-                            "type": "function",
-                            "function": {
-                                "name": "bash",
-                                "arguments": "{\"command\": \"echo content_of_file1\"}"
-                            }
-                        }]
-                    },
-                    "finish_reason": "tool_calls"
-                }],
-                "usage": { "prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50 }
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-chain-2",
+            "object": "chat.completion",
+            "created": 1234567891,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Now let me read the first file.",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "tool_step2",
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": "{\"command\": \"echo content_of_file1\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50 }
+        })))
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
@@ -886,7 +901,10 @@ async fn test_multi_step_tool_chain() {
 
     loop {
         loop_count += 1;
-        assert!(loop_count <= 10, "Tool loop should not exceed 10 iterations");
+        assert!(
+            loop_count <= 10,
+            "Tool loop should not exceed 10 iterations"
+        );
 
         let mut messages = vec![Message::System {
             content: "You are helpful.".into(),
@@ -909,8 +927,9 @@ async fn test_multi_step_tool_chain() {
 
         if let Some(tool_calls) = choice.message.tool_calls() {
             for call in tool_calls {
-                let outcome =
-                    registry.execute(&call.function.name, &call.function.arguments).await;
+                let outcome = registry
+                    .execute(&call.function.name, &call.function.arguments)
+                    .await;
                 let content = tool::format_tool_outcome(&outcome);
                 history.push(Message::Tool {
                     tool_call_id: call.id.clone(),
@@ -974,39 +993,37 @@ fn test_extract_reactions_from_model_output() {
 /// $web_search pattern → result delivered via oneshot channel.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_web_search_tool_via_registry() {
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
 
     let mock_server = MockServer::start().await;
 
     // First API call: model triggers $web_search builtin
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "cmpl-ws-1",
-                "object": "chat.completion",
-                "created": 1234567890,
-                "model": "test-model",
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "index": 0,
-                            "id": "tool_ws_001",
-                            "type": "builtin_function",
-                            "function": {
-                                "name": "$web_search",
-                                "arguments": "{\"search_result\":{\"id\":\"mock_search\"}}"
-                            }
-                        }]
-                    },
-                    "finish_reason": "tool_calls"
-                }],
-                "usage": { "prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60 }
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-ws-1",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "tool_ws_001",
+                        "type": "builtin_function",
+                        "function": {
+                            "name": "$web_search",
+                            "arguments": "{\"search_result\":{\"id\":\"mock_search\"}}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60 }
+        })))
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
@@ -1014,23 +1031,21 @@ async fn test_web_search_tool_via_registry() {
     // Second API call: after echoing tool result, model returns final answer
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "cmpl-ws-2",
-                "object": "chat.completion",
-                "created": 1234567891,
-                "model": "test-model",
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "Here are the latest search results for your query."
-                    },
-                    "finish_reason": "stop"
-                }],
-                "usage": { "prompt_tokens": 100, "completion_tokens": 15, "total_tokens": 115 }
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-ws-2",
+            "object": "chat.completion",
+            "created": 1234567891,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Here are the latest search results for your query."
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 100, "completion_tokens": 15, "total_tokens": 115 }
+        })))
         .mount(&mock_server)
         .await;
 
@@ -1041,13 +1056,11 @@ async fn test_web_search_tool_via_registry() {
         "test-model".into(),
     ));
 
-    let last_user_query = Arc::new(RwLock::new("latest AI news".to_owned()));
-
     let registry = {
         use rubberdux::provider::moonshot::tool::web_search::WebSearchTool;
 
         let mut r = rubberdux::tool::ToolRegistry::new();
-        r.register(Box::new(WebSearchTool::new(client.clone(), last_user_query)));
+        r.register(Box::new(WebSearchTool::new(client.clone())));
         r
     };
 
@@ -1065,8 +1078,13 @@ async fn test_web_search_tool_via_registry() {
 
     // Should return Background variant (spawns async task)
     let receiver = match outcome {
-        tool::ToolOutcome::Background { task_id, receiver, .. } => {
-            assert!(task_id.starts_with("search_"), "task_id should start with search_");
+        tool::ToolOutcome::Background {
+            task_id, receiver, ..
+        } => {
+            assert!(
+                task_id.starts_with("search_"),
+                "task_id should start with search_"
+            );
             receiver
         }
         tool::ToolOutcome::Immediate { content, is_error } => {
@@ -1090,5 +1108,22 @@ async fn test_web_search_tool_via_registry() {
         result.content.contains("latest search results"),
         "Expected search result content, got: {}",
         result.content
+    );
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "expected two web_search API calls");
+
+    let first_request: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        first_request["messages"][1]["content"].as_str(),
+        Some("latest AI news")
+    );
+    assert_eq!(
+        first_request["tools"][0]["function"]["name"].as_str(),
+        Some("$web_search")
+    );
+    assert_eq!(
+        first_request["thinking"]["type"].as_str(),
+        Some("disabled")
     );
 }

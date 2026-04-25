@@ -5,15 +5,9 @@ use crate::parser::OrderingDirective;
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchError {
     /// The agent produced fewer assistant messages than the test case expected.
-    TooFewMessages {
-        expected: usize,
-        actual: usize,
-    },
+    TooFewMessages { expected: usize, actual: usize },
     /// The agent produced more assistant messages than the test case expected.
-    TooManyMessages {
-        expected: usize,
-        actual: usize,
-    },
+    TooManyMessages { expected: usize, actual: usize },
 }
 
 impl std::fmt::Display for MatchError {

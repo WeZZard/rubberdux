@@ -13,7 +13,8 @@ fn get_whisper_context() -> Option<&'static WhisperContext> {
         .get_or_init(|| {
             let model_path = resolve_model_path();
             log::info!("Loading whisper model from: {}", model_path);
-            match WhisperContext::new_with_params(&model_path, WhisperContextParameters::default()) {
+            match WhisperContext::new_with_params(&model_path, WhisperContextParameters::default())
+            {
                 Ok(ctx) => {
                     log::info!("Whisper model loaded successfully");
                     Some(ctx)
@@ -77,9 +78,7 @@ async fn download_to_temp(
 
 /// Converts audio to WAV format (16kHz mono) for whisper.
 /// Telegram voice messages use OGG Opus which whisper.cpp cannot decode directly.
-async fn convert_to_wav(
-    input_path: &std::path::Path,
-) -> Result<tempfile::NamedTempFile, String> {
+async fn convert_to_wav(input_path: &std::path::Path) -> Result<tempfile::NamedTempFile, String> {
     let wav_temp = tempfile::Builder::new()
         .suffix(".wav")
         .tempfile()
@@ -116,7 +115,10 @@ fn load_wav_samples(path: &std::path::Path) -> Result<Vec<f32>, String> {
 
     let spec = reader.spec();
     if spec.channels != 1 {
-        return Err(format!("Expected mono audio, got {} channels", spec.channels));
+        return Err(format!(
+            "Expected mono audio, got {} channels",
+            spec.channels
+        ));
     }
 
     let samples: Vec<f32> = match spec.sample_format {

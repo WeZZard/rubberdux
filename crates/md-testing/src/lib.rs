@@ -1,21 +1,24 @@
-pub mod parser;
-pub mod linter;
-pub mod format;
 pub mod discovery;
-pub mod narration;
-pub mod llm;
 pub mod evaluator;
+pub mod format;
 pub mod guidance;
-pub mod ordering;
-pub mod results;
 pub mod lines;
+pub mod linter;
+pub mod llm;
+pub mod narration;
+pub mod ordering;
+pub mod parser;
+pub mod results;
 
-pub use parser::{TestCase, FrontMatter, Message, UserContent, OrderingDirective};
-pub use linter::{lint, LintError};
-pub use format::render_agent_input;
 pub use discovery::discover_cases;
-pub use evaluator::{Evaluatable, EvaluationResult, AssertionEvaluator};
-pub use llm::{LlmClient, LlmError, ChatMessage};
-pub use ordering::{match_assistant_slots, MatchError};
-pub use results::{TestResults, AssertionResult, AssertionScope};
-pub use lines::{AssertionLine, map_assertion_lines, find_heading_line, find_assistant_heading_lines, find_user_heading_lines};
+pub use evaluator::{AssertionEvaluator, Evaluatable, EvaluationResult};
+pub use format::render_agent_input;
+pub use lines::{
+    AssertionLine, find_assistant_heading_lines, find_heading_line, find_user_heading_lines,
+    map_assertion_lines,
+};
+pub use linter::{LintError, lint};
+pub use llm::{ChatMessage, LlmClient, LlmError};
+pub use ordering::{MatchError, match_assistant_slots};
+pub use parser::{FrontMatter, Message, OrderingDirective, TestCase, UserContent};
+pub use results::{AssertionResult, AssertionScope, TestResults};

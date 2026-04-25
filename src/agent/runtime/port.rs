@@ -85,10 +85,7 @@ impl InputPort {
         .await
     }
 
-    pub async fn send_context_update(
-        &self,
-        message: Message,
-    ) -> Result<(), crate::error::Error> {
+    pub async fn send_context_update(&self, message: Message) -> Result<(), crate::error::Error> {
         self.send(LoopEvent::ContextUpdate(message)).await
     }
 }

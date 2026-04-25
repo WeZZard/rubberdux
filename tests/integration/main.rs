@@ -1,6 +1,6 @@
 mod agent;
 mod host;
-mod tool;
 mod testcase_runner;
+mod tool;
 
 pub mod support;

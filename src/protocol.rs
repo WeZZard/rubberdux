@@ -29,15 +29,9 @@ pub enum HostToAgent {
         telegram_message_id: Option<i32>,
     },
     /// A child VM completed its task.
-    VMCompleted {
-        task_id: String,
-        result: String,
-    },
+    VMCompleted { task_id: String, result: String },
     /// A child VM failed.
-    VMFailed {
-        task_id: String,
-        error: String,
-    },
+    VMFailed { task_id: String, error: String },
     /// Shutdown signal.
     Shutdown,
 }
@@ -113,8 +107,16 @@ mod tests {
 
         match (&msg, &received) {
             (
-                AgentToHost::SpawnVM { task_id: t1, prompt: p1, subagent_type: s1 },
-                AgentToHost::SpawnVM { task_id: t2, prompt: p2, subagent_type: s2 },
+                AgentToHost::SpawnVM {
+                    task_id: t1,
+                    prompt: p1,
+                    subagent_type: s1,
+                },
+                AgentToHost::SpawnVM {
+                    task_id: t2,
+                    prompt: p2,
+                    subagent_type: s2,
+                },
             ) => {
                 assert_eq!(t1, t2);
                 assert_eq!(p1, p2);
@@ -149,8 +151,14 @@ mod tests {
 
         match (&msg, &received) {
             (
-                HostToAgent::UserMessage { text: t1, telegram_message_id: id1 },
-                HostToAgent::UserMessage { text: t2, telegram_message_id: id2 },
+                HostToAgent::UserMessage {
+                    text: t1,
+                    telegram_message_id: id1,
+                },
+                HostToAgent::UserMessage {
+                    text: t2,
+                    telegram_message_id: id2,
+                },
             ) => {
                 assert_eq!(t1, t2);
                 assert_eq!(id1, id2);

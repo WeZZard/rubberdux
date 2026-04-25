@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rubberdux::channel::{AgentResponse, ChannelEvent};
 use rubberdux::channel::interpreter::InterpretedMessage;
-use rubberdux::host::{HostConfig, self};
+use rubberdux::channel::{AgentResponse, ChannelEvent};
+use rubberdux::host::{self, HostConfig};
 use rubberdux::vm::setup::ssh_private_key;
 use tokio::sync::mpsc;
-use wiremock::{Mock, MockServer, ResponseTemplate};
 use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::setup::{cleanup_stale_vms, linux_agent_binary_path};
 
@@ -64,7 +64,9 @@ impl VmSystemTestHarness {
         // is visible inside the VM at /Volumes/My Shared Files/share/rubberdux.
         let main_share = share_root.join("main");
         tokio::fs::create_dir_all(&main_share).await.unwrap();
-        tokio::fs::copy(binary_path, main_share.join("rubberdux")).await.unwrap();
+        tokio::fs::copy(binary_path, main_share.join("rubberdux"))
+            .await
+            .unwrap();
 
         // 6. Start wiremock for Moonshot API mock (bind to 0.0.0.0 so the VM can reach it)
         let wiremock_listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
@@ -84,9 +86,15 @@ impl VmSystemTestHarness {
             host_ip: "192.168.64.1".into(),
             agent_binary_path: Some("/mnt/shared/share/rubberdux".into()),
             agent_env: [
-                ("RUBBERDUX_LLM_BASE_URL".into(), format!("http://192.168.64.1:{}", wiremock_port)),
+                (
+                    "RUBBERDUX_LLM_BASE_URL".into(),
+                    format!("http://192.168.64.1:{}", wiremock_port),
+                ),
                 ("RUBBERDUX_LLM_API_KEY".into(), "test-key".into()),
-                ("RUBBERDUX_LLM_BEST_PERFORMANCE_TOKENS".into(), "4000".into()),
+                (
+                    "RUBBERDUX_LLM_BEST_PERFORMANCE_TOKENS".into(),
+                    "4000".into(),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -119,10 +127,7 @@ impl VmSystemTestHarness {
     }
 
     /// Mount a wiremock response for the Moonshot chat completions endpoint.
-    pub async fn mock_llm(&self,
-        response: serde_json::Value,
-        expected_calls: Option<u64>,
-    ) {
+    pub async fn mock_llm(&self, response: serde_json::Value, expected_calls: Option<u64>) {
         let mut mock = Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(response));
@@ -139,12 +144,7 @@ impl VmSystemTestHarness {
         let mut out = String::new();
         if let Some(reqs) = self.mock_server.received_requests().await {
             for (i, req) in reqs.iter().enumerate() {
-                out.push_str(&format!(
-                    "[req {}] {} {}\n",
-                    i,
-                    req.method,
-                    req.url.path()
-                ));
+                out.push_str(&format!("[req {}] {} {}\n", i, req.method, req.url.path()));
                 if let Ok(body) = std::str::from_utf8(&req.body) {
                     // Truncate very large bodies
                     let preview = &body[..body.len().min(2000)];
@@ -257,17 +257,23 @@ impl VmSystemTestHarness {
             .await;
 
         let ip = match ip_output {
-            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            Ok(out) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            }
             _ => return format!("Failed to get IP for VM {}", vm_name),
         };
 
         let key_path = ssh_private_key();
         let ssh_output = tokio::process::Command::new("ssh")
             .args([
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "ConnectTimeout=5",
-                "-i", &key_path.to_string_lossy(),
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ConnectTimeout=5",
+                "-i",
+                &key_path.to_string_lossy(),
                 &format!("admin@{}", ip),
                 "cat /tmp/rubberdux-agent.log 2>/dev/null || echo '(no log file)'",
             ])
@@ -284,11 +290,7 @@ impl VmSystemTestHarness {
     /// Send a user message into the host and collect all AgentResponses from the
     /// host's output channel. Returns when the timeout expires or when no new
     /// responses arrive for a short grace period after an `is_final` response.
-    pub async fn send_user_input(
-        &self,
-        text: &str,
-        timeout: Duration,
-    ) -> Vec<AgentResponse> {
+    pub async fn send_user_input(&self, text: &str, timeout: Duration) -> Vec<AgentResponse> {
         self.send_user_input_with_id(text, 1, timeout).await
     }
 
@@ -314,14 +316,14 @@ impl VmSystemTestHarness {
             telegram_message_id: Some(msg_id),
         };
 
-        self.telegram_tx.send(event).await.expect("telegram channel should be open");
+        self.telegram_tx
+            .send(event)
+            .await
+            .expect("telegram channel should be open");
     }
 
     /// Collect all responses that arrive within the timeout.
-    pub async fn collect_all_responses(
-        &self,
-        timeout: Duration,
-    ) -> Vec<AgentResponse> {
+    pub async fn collect_all_responses(&self, timeout: Duration) -> Vec<AgentResponse> {
         let mut responses = Vec::new();
         let deadline = tokio::time::Instant::now() + timeout;
         let mut rx = self.telegram_response_rx.lock().await;
@@ -362,7 +364,8 @@ impl VmSystemTestHarness {
         timeout: Duration,
     ) -> Vec<AgentResponse> {
         let all_responses = self.collect_all_responses(timeout).await;
-        all_responses.into_iter()
+        all_responses
+            .into_iter()
             .filter(|r| r.reply_to_message_id == Some(msg_id))
             .collect()
     }

@@ -42,9 +42,7 @@ impl HistoryStore for FilesystemStore {
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
         Box::pin(async move {
             if let Some(parent) = self.path.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(Error::Io)?;
+                tokio::fs::create_dir_all(parent).await.map_err(Error::Io)?;
             }
 
             let mut file = tokio::fs::OpenOptions::new()
@@ -149,13 +147,15 @@ impl HistoryStore for FilesystemStore {
                             new_history.push_user(entry.message.clone());
                         }
                         Message::Assistant { .. } => {
-                            let parent =
-                                entry.parent_id.unwrap_or(new_history.last_id().unwrap_or(0));
+                            let parent = entry
+                                .parent_id
+                                .unwrap_or(new_history.last_id().unwrap_or(0));
                             new_history.push_assistant(parent, entry.message.clone());
                         }
                         Message::Tool { .. } => {
-                            let parent =
-                                entry.parent_id.unwrap_or(new_history.last_id().unwrap_or(0));
+                            let parent = entry
+                                .parent_id
+                                .unwrap_or(new_history.last_id().unwrap_or(0));
                             new_history.push_tool(parent, entry.message.clone());
                         }
                     }

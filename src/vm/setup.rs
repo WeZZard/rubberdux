@@ -63,12 +63,24 @@ pub async fn check_prerequisites() -> Vec<PrereqCheck> {
         "Install Homebrew: /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"").await);
 
     // 4. Tart
-    checks.push(check_command("tart", "Tart VM manager",
-        "Install Tart: brew install cirruslabs/cli/tart").await);
+    checks.push(
+        check_command(
+            "tart",
+            "Tart VM manager",
+            "Install Tart: brew install cirruslabs/cli/tart",
+        )
+        .await,
+    );
 
     // 5. sshpass (for initial VM provisioning)
-    checks.push(check_command("sshpass", "sshpass",
-        "Install sshpass: brew install sshpass").await);
+    checks.push(
+        check_command(
+            "sshpass",
+            "sshpass",
+            "Install sshpass: brew install sshpass",
+        )
+        .await,
+    );
 
     // 6. Base images
     checks.extend(check_base_images().await);
@@ -246,7 +258,10 @@ pub async fn run_setup(image_name: Option<&str>, if_needed: bool) -> Result<(), 
     // Step 2: Ensure Homebrew
     if !command_exists("brew").await {
         println!("[1/6] Installing Homebrew...");
-        run_shell("curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh | bash").await?;
+        run_shell(
+            "curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh | bash",
+        )
+        .await?;
     } else {
         println!("[1/6] Homebrew — already installed");
     }
@@ -302,7 +317,9 @@ pub async fn run_setup(image_name: Option<&str>, if_needed: bool) -> Result<(), 
                         let stored_hash = read_stored_hash(image.base_vm_name);
                         if stored_hash.as_ref() == Some(&current_hash) {
                             println!(
-                                "{} {} — up to date (hash matches)", step, image.base_vm_name);
+                                "{} {} — up to date (hash matches)",
+                                step, image.base_vm_name
+                            );
                             continue;
                         }
                     }
@@ -460,10 +477,13 @@ async fn provision_base_vm(image: &VMImage) -> Result<(), Error> {
     };
     let install_result = Command::new("sshpass")
         .args([
-            "-p", "admin",
+            "-p",
+            "admin",
             "ssh",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
             &format!("admin@{}", ip),
             &remote_cmd,
         ])
@@ -514,7 +534,9 @@ fn provision_hash_path(base_vm_name: &str) -> PathBuf {
 
 fn read_stored_hash(base_vm_name: &str) -> Option<String> {
     let path = provision_hash_path(base_vm_name);
-    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 fn write_stored_hash(base_vm_name: &str, hash: &str) -> Result<(), Error> {
@@ -550,11 +572,21 @@ fn compute_provision_hash(image: &VMImage) -> Result<String, Error> {
             .map_err(|e| Error::Vm(format!("failed to get current exe: {}", e)))?
     };
 
-    let mut file = std::fs::File::open(&binary_path)
-        .map_err(|e| Error::Vm(format!("failed to open binary {}: {}", binary_path.display(), e)))?;
+    let mut file = std::fs::File::open(&binary_path).map_err(|e| {
+        Error::Vm(format!(
+            "failed to open binary {}: {}",
+            binary_path.display(),
+            e
+        ))
+    })?;
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf)
-        .map_err(|e| Error::Vm(format!("failed to read binary {}: {}", binary_path.display(), e)))?;
+    file.read_to_end(&mut buf).map_err(|e| {
+        Error::Vm(format!(
+            "failed to read binary {}: {}",
+            binary_path.display(),
+            e
+        ))
+    })?;
     hasher.update(&buf);
 
     Ok(hex::encode(hasher.finalize()))
@@ -603,9 +635,7 @@ fn dirs_home() -> PathBuf {
 }
 
 fn provision_dir() -> PathBuf {
-    dirs_home()
-        .join(".rubberdux")
-        .join("vm-provision")
+    dirs_home().join(".rubberdux").join("vm-provision")
 }
 
 fn ensure_ssh_key() -> Result<(), Error> {
@@ -616,11 +646,15 @@ fn ensure_ssh_key() -> Result<(), Error> {
 
     let status = std::process::Command::new("ssh-keygen")
         .args([
-            "-t", "ed25519",
-            "-f", &key_path.to_string_lossy(),
-            "-N", "",
+            "-t",
+            "ed25519",
+            "-f",
+            &key_path.to_string_lossy(),
+            "-N",
+            "",
             "-q",
-            "-C", "rubberdux-vm",
+            "-C",
+            "rubberdux-vm",
         ])
         .status()
         .map_err(|e| Error::Vm(format!("ssh-keygen failed: {}", e)))?;
@@ -657,10 +691,7 @@ fn total_memory_mb() -> usize {
 
 async fn wait_for_ip(vm_name: &str) -> Result<String, Error> {
     for _ in 0..30 {
-        let output = Command::new("tart")
-            .args(["ip", vm_name])
-            .output()
-            .await;
+        let output = Command::new("tart").args(["ip", vm_name]).output().await;
         if let Ok(o) = output {
             let ip = String::from_utf8_lossy(&o.stdout).trim().to_string();
             if !ip.is_empty() && o.status.success() {
@@ -680,11 +711,15 @@ async fn wait_for_ssh(ip: &str) -> Result<(), Error> {
     for _ in 0..60 {
         let result = Command::new("sshpass")
             .args([
-                "-p", "admin",
+                "-p",
+                "admin",
                 "ssh",
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "ConnectTimeout=5",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ConnectTimeout=5",
                 &format!("admin@{}", ip),
                 "true",
             ])

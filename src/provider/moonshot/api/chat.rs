@@ -117,7 +117,9 @@ impl MoonshotClient {
                 reasoning_content, ..
             } = &mut choice.message
             {
-                if reasoning_content.is_none() || reasoning_content.as_ref().is_some_and(|s| s.is_empty()) {
+                if reasoning_content.is_none()
+                    || reasoning_content.as_ref().is_some_and(|s| s.is_empty())
+                {
                     *reasoning_content = Some("(tool call)".to_owned());
                 }
             }
@@ -228,7 +230,8 @@ mod tests {
         // The critical assertion: with thinking disabled, the model should call
         // the tool (finish_reason = tool_calls), not refuse (finish_reason = stop).
         assert_eq!(
-            choice.finish_reason, "tool_calls",
+            choice.finish_reason,
+            "tool_calls",
             "Model refused to use web_search. Thinking may not have been disabled. \
              finish_reason={}, content={:?}",
             choice.finish_reason,
@@ -242,9 +245,14 @@ mod tests {
 
         let tool_calls = choice.message.tool_calls().unwrap();
         assert!(
-            tool_calls.iter().any(|tc| tc.function.name == "$web_search"),
+            tool_calls
+                .iter()
+                .any(|tc| tc.function.name == "$web_search"),
             "Expected $web_search in tool calls, got: {:?}",
-            tool_calls.iter().map(|tc| &tc.function.name).collect::<Vec<_>>()
+            tool_calls
+                .iter()
+                .map(|tc| &tc.function.name)
+                .collect::<Vec<_>>()
         );
     }
 }

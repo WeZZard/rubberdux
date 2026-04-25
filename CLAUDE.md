@@ -207,6 +207,10 @@ Comments explain the purpose of the item they're attached to, not how other part
 - Use comments to document how other parts of the system work — that belongs in those parts' own comments.
 - Write comments that create implicit coupling between unrelated modules.
 
+## Testing
+
+- You **MUST** not set timeout when execute testing.
+
 ## User Experience Rules
 
 - The chat handler must never block. Any work that takes more than a trivial amount of time must be dispatched as a background task.

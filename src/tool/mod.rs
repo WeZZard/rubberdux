@@ -215,10 +215,9 @@ mod tests {
         assert!(registry.unregister("dummy"));
         assert!(registry.definitions().is_empty());
         // Execute after unregister returns error
-        let outcome =
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(registry.execute("dummy", "{}"));
+        let outcome = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(registry.execute("dummy", "{}"));
         match outcome {
             ToolOutcome::Immediate { is_error, .. } => assert!(is_error),
             _ => panic!("Expected Immediate outcome"),
@@ -298,7 +297,13 @@ mod tests {
         };
         let formatted = format_tool_outcome(&outcome);
         assert!(formatted.contains("bg_abc123"), "should contain task_id");
-        assert!(!formatted.contains("sessions/tasks"), "should NOT contain file path");
-        assert!(formatted.contains("delivered"), "should tell model result will be delivered");
+        assert!(
+            !formatted.contains("sessions/tasks"),
+            "should NOT contain file path"
+        );
+        assert!(
+            formatted.contains("delivered"),
+            "should tell model result will be delivered"
+        );
     }
 }

@@ -130,8 +130,7 @@ fn summarize_tool_result(content: &str) -> String {
     let mut result = String::new();
     result.push_str(&format!(
         "*(Tool output truncated: {} lines, {} chars total)*\n\n",
-        line_count,
-        char_count
+        line_count, char_count
     ));
 
     result.push_str("**Preview (first 40 lines):**\n\n");
@@ -216,11 +215,7 @@ fn summarize_xml(content: &str) -> String {
 }
 
 /// Write narration files for each subagent session found next to `session_path`.
-pub fn write_subagent_narrations(
-    session_path: &Path,
-    case_name: &str,
-    test_time: &str,
-) {
+pub fn write_subagent_narrations(session_path: &Path, case_name: &str, test_time: &str) {
     let subagents_dir = session_path.parent().unwrap().join("subagents");
     if !subagents_dir.is_dir() {
         return;
@@ -232,12 +227,7 @@ pub fn write_subagent_narrations(
 
     let mut jsonl_files: Vec<_> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|x| x == "jsonl")
-                .unwrap_or(false)
-        })
+        .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
         .collect();
     jsonl_files.sort_by_key(|e| e.path());
 

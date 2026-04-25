@@ -21,9 +21,7 @@ struct MdTestingLsp {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for MdTestingLsp {
-    async fn initialize(&self,
-        _: InitializeParams,
-    ) -> Result<InitializeResult> {
+    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
@@ -75,7 +73,10 @@ impl LanguageServer for MdTestingLsp {
         let uri = params.text_document.uri;
         let content = params.text_document.text;
 
-        self.documents.write().await.insert(uri.clone(), content.clone());
+        self.documents
+            .write()
+            .await
+            .insert(uri.clone(), content.clone());
 
         if is_testcase_file(&uri) {
             self.publish_diagnostics(&uri, &content).await;
@@ -86,7 +87,10 @@ impl LanguageServer for MdTestingLsp {
         let uri = params.text_document.uri;
         if let Some(change) = params.content_changes.into_iter().next() {
             let content = change.text;
-            self.documents.write().await.insert(uri.clone(), content.clone());
+            self.documents
+                .write()
+                .await
+                .insert(uri.clone(), content.clone());
 
             if is_testcase_file(&uri) {
                 self.publish_diagnostics(&uri, &content).await;
@@ -105,20 +109,16 @@ impl LanguageServer for MdTestingLsp {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.documents.write().await.remove(&params.text_document.uri);
+        self.documents
+            .write()
+            .await
+            .remove(&params.text_document.uri);
     }
 }
 
 impl MdTestingLsp {
-    async fn publish_diagnostics(&self,
-        uri: &Url,
-        content: &str,
-    ) {
-        let diagnostics = build_diagnostics(
-            content,
-            uri,
-            &self.results_store,
-        ).await;
+    async fn publish_diagnostics(&self, uri: &Url, content: &str) {
+        let diagnostics = build_diagnostics(content, uri, &self.results_store).await;
 
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, None)
@@ -127,8 +127,7 @@ impl MdTestingLsp {
 }
 
 fn is_testcase_file(uri: &Url) -> bool {
-    uri.path()
-        .ends_with(".testcase.md")
+    uri.path().ends_with(".testcase.md")
 }
 
 #[tokio::main]

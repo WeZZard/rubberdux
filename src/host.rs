@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::channel::{AgentResponse, ChannelEvent};
 use crate::error::Error;
-use crate::vm::manager::VMManager;
 use crate::protocol::{self, AgentToHost, HostToAgent};
+use crate::vm::manager::VMManager;
 
 const DEFAULT_RPC_PORT: u16 = 19384;
 
@@ -46,8 +46,8 @@ impl HostConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_RPC_PORT);
 
-        let host_ip = std::env::var("RUBBERDUX_HOST_IP")
-            .unwrap_or_else(|_| "192.168.64.1".to_string());
+        let host_ip =
+            std::env::var("RUBBERDUX_HOST_IP").unwrap_or_else(|_| "192.168.64.1".to_string());
 
         let agent_data_dir = std::env::var("RUBBERDUX_AGENT_DATA_DIR")
             .map(PathBuf::from)
@@ -160,15 +160,20 @@ pub async fn run(
     // Initialize session manager and create new session
     let session_manager = Arc::new(crate::session::SessionManager::new());
     let model = std::env::var("RUBBERDUX_LLM_MODEL").unwrap_or_else(|_| "kimi-for-coding".into());
-    let (session_id, session_dir) = session_manager.create_session(model)
+    let (session_id, session_dir) = session_manager
+        .create_session(model)
         .expect("Failed to create session");
-    
-    log::info!("Created session: {} at {}", session_id.to_string(), session_dir.display());
+
+    log::info!(
+        "Created session: {} at {}",
+        session_id.to_string(),
+        session_dir.display()
+    );
 
     // Set up logging to session directory
     let log_path = session_manager.session_log_path(&session_id);
     // Note: env_logger already initialized in main(), but we can redirect if needed
-    
+
     // Create project root symlink if missing
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     if !project_root.join("sessions").exists() {
@@ -183,8 +188,7 @@ pub async fn run(
 
     let client = Arc::new(crate::provider::moonshot::MoonshotClient::from_env());
 
-    let builder = AgentLoopBuilder::new(system_prompt, session_manager)
-        .with_session_id(session_id);
+    let builder = AgentLoopBuilder::new(system_prompt, session_manager).with_session_id(session_id);
     let (agent_loop, input_port, _context_tx) = builder.build(client).await;
 
     // Spawn AgentLoop
@@ -220,7 +224,8 @@ pub async fn run(
                         interpreted.text.len()
                     );
 
-                    let (loop_reply_tx, mut loop_reply_rx) = mpsc::channel::<crate::agent::runtime::port::LoopOutput>(8);
+                    let (loop_reply_tx, mut loop_reply_rx) =
+                        mpsc::channel::<crate::agent::runtime::port::LoopOutput>(8);
 
                     // Spawn response handler → Telegram
                     let reply_senders_clone = reply_senders_for_telegram.clone();
@@ -234,7 +239,9 @@ pub async fn run(
                                 is_final: output.is_final,
                                 reply_to_message_id: telegram_message_id,
                             };
-                            if let Some(tx) = reply_senders_clone.lock().await.get(&telegram_message_id) {
+                            if let Some(tx) =
+                                reply_senders_clone.lock().await.get(&telegram_message_id)
+                            {
                                 let _ = tx.send(response.clone()).await;
                             }
                             if telegram_response_tx.send(response).await.is_err() {
@@ -260,10 +267,7 @@ pub async fn run(
                     }
                 }
                 ChannelEvent::ContextUpdate { text } => {
-                    log::info!(
-                        "ContextUpdate received on host: text_len={}",
-                        text.len()
-                    );
+                    log::info!("ContextUpdate received on host: text_len={}", text.len());
                     // Optionally inject as context update
                 }
                 ChannelEvent::InternalEvent(_) => {
@@ -290,7 +294,6 @@ pub async fn run_child_vm(
     config: &HostConfig,
     listener: Arc<TcpListener>,
 ) -> Result<String, Error> {
-
     // Helper to write status updates to the child share for debugging
     async fn write_status(share_dir: &std::path::Path, msg: &str) {
         let _ = tokio::fs::write(share_dir.join("status.txt"), msg).await;
@@ -300,7 +303,8 @@ pub async fn run_child_vm(
     {
         let mut mgr = manager.lock().await;
         write_status(&mgr.share_dir(task_id), "run_child_vm: creating VM").await;
-        mgr.create_and_start(task_id, None, config.agent_data_dir.as_deref()).await?;
+        mgr.create_and_start(task_id, None, config.agent_data_dir.as_deref())
+            .await?;
     }
 
     // Run the child VM lifecycle with guaranteed cleanup
@@ -316,7 +320,11 @@ pub async fn run_child_vm(
         // so the child can execute it.
         {
             let mgr = manager.lock().await;
-            write_status(&mgr.share_dir(task_id), "run_child_vm: copying binary and prompt").await;
+            write_status(
+                &mgr.share_dir(task_id),
+                "run_child_vm: copying binary and prompt",
+            )
+            .await;
             let main_binary = config.share_root.join("main").join("rubberdux");
             let child_binary = mgr.share_dir(task_id).join("rubberdux");
             if main_binary.exists() {
@@ -354,7 +362,11 @@ pub async fn run_child_vm(
             let early_log = log_result.map(|r| r.stdout).unwrap_or_default();
             let log_path = mgr.share_dir(task_id).join("agent.log");
             let _ = tokio::fs::write(&log_path, &early_log).await;
-            write_status(&mgr.share_dir(task_id), "run_child_vm: waiting for RPC connection").await;
+            write_status(
+                &mgr.share_dir(task_id),
+                "run_child_vm: waiting for RPC connection",
+            )
+            .await;
         }
 
         // Accept the child's RPC connection
@@ -369,9 +381,7 @@ pub async fn run_child_vm(
         loop {
             let msg: Option<AgentToHost> = protocol::read_message(&mut reader).await?;
             match msg {
-                Some(AgentToHost::Response {
-                    text, is_final, ..
-                }) => {
+                Some(AgentToHost::Response { text, is_final, .. }) => {
                     final_text = text;
                     if is_final {
                         break;
@@ -399,12 +409,14 @@ pub async fn run_child_vm(
             let log_path = mgr.share_dir(task_id).join("agent.log");
             let _ = tokio::fs::write(&log_path, &log_content).await;
             // Also persist on the host filesystem so it survives share cleanup
-            let host_log_path = std::path::PathBuf::from(format!("/tmp/rubberdux-child-{}.log", task_id));
+            let host_log_path =
+                std::path::PathBuf::from(format!("/tmp/rubberdux-child-{}.log", task_id));
             let _ = tokio::fs::write(&host_log_path, &log_content).await;
         }
 
         Ok(final_text)
-    }.await;
+    }
+    .await;
 
     // Destroy the child VM regardless of success or failure
     {
@@ -420,6 +432,42 @@ pub async fn run_child_vm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        value: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &'static str) -> Self {
+            let value = std::env::var(key).ok();
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, value }
+        }
+
+        fn set(key: &'static str, new_value: &str) -> Self {
+            let value = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, new_value);
+            }
+            Self { key, value }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(value) = &self.value {
+                    std::env::set_var(self.key, value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_shell_quote_simple() {
@@ -432,7 +480,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(host_config_env)]
     fn test_host_config_from_env_defaults() {
+        let _guard = EnvVarGuard::unset("RUBBERDUX_RPC_PORT");
         // Test that HostConfig::from_env() doesn't panic when env vars are missing
         // by setting required vars if not present
         let config = HostConfig::from_env();
@@ -440,13 +490,11 @@ mod tests {
     }
 
     #[test]
+    #[serial(host_config_env)]
     fn test_host_config_custom_rpc_port() {
-        unsafe {
-            std::env::set_var("RUBBERDUX_RPC_PORT", "12345");
-            let config = HostConfig::from_env();
-            assert_eq!(config.rpc_port, 12345);
-            std::env::remove_var("RUBBERDUX_RPC_PORT");
-        }
+        let _guard = EnvVarGuard::set("RUBBERDUX_RPC_PORT", "12345");
+        let config = HostConfig::from_env();
+        assert_eq!(config.rpc_port, 12345);
     }
 
     #[test]
@@ -492,7 +540,7 @@ mod tests {
     fn test_build_agent_command_with_env() {
         let mut env = HashMap::new();
         env.insert("TEST_KEY".to_string(), "test_value".to_string());
-        
+
         let config = HostConfig {
             vm_image: "test".into(),
             share_root: PathBuf::from("./test-shares"),

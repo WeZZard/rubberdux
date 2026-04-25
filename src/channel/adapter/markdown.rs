@@ -12,7 +12,9 @@ pub fn format(input: &str) -> String {
 }
 
 fn escape_fallback(input: &str) -> String {
-    let special = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
+    let special = [
+        '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!',
+    ];
     let mut out = String::with_capacity(input.len() * 2);
     for ch in input.chars() {
         if special.contains(&ch) {
@@ -40,8 +42,7 @@ fn preprocess_tables(input: &str) -> String {
                 // Append any content before this table
                 result.push_str(&input[last_end..range.start]);
 
-                let (table_text, new_i, table_range_end) =
-                    collect_table(&events, i);
+                let (table_text, new_i, table_range_end) = collect_table(&events, i);
                 result.push_str(&table_text);
 
                 last_end = table_range_end;
@@ -201,16 +202,26 @@ mod tests {
         let input = "```json\n{\n  \"name\": \"test\",\n  \"value\": 42\n}\n```\n";
         let result = format(input);
         println!("CODE BLOCK RESULT (repr):\n{:?}", result);
-        assert!(result.contains("  \"name\""), "Indentation should be preserved in code blocks");
+        assert!(
+            result.contains("  \"name\""),
+            "Indentation should be preserved in code blocks"
+        );
     }
 
     #[test]
     fn test_python_code_block_indentation() {
-        let input = "```python\ndef hello():\n    print(\"world\")\n    if True:\n        return 1\n```\n";
+        let input =
+            "```python\ndef hello():\n    print(\"world\")\n    if True:\n        return 1\n```\n";
         let result = format(input);
         println!("PYTHON BLOCK RESULT (repr):\n{:?}", result);
-        assert!(result.contains("    print"), "4-space indentation should be preserved");
-        assert!(result.contains("        return"), "8-space indentation should be preserved");
+        assert!(
+            result.contains("    print"),
+            "4-space indentation should be preserved"
+        );
+        assert!(
+            result.contains("        return"),
+            "8-space indentation should be preserved"
+        );
     }
 
     #[test]

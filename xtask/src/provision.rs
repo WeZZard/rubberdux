@@ -1,11 +1,23 @@
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::process::Command;
-use sha2::{Digest, Sha256};
 
 const IMAGES: &[(&str, &str, &str)] = &[
-    ("ubuntu24", "ghcr.io/cirruslabs/ubuntu:24.04", "rubberdux-base-ubuntu24-release"),
-    ("macos15", "ghcr.io/cirruslabs/macos-sequoia-xcode:latest", "rubberdux-base-macos15-release"),
-    ("macos26", "ghcr.io/cirruslabs/macos-tahoe-xcode:latest", "rubberdux-base-macos26-release"),
+    (
+        "ubuntu24",
+        "ghcr.io/cirruslabs/ubuntu:24.04",
+        "rubberdux-base-ubuntu24-release",
+    ),
+    (
+        "macos15",
+        "ghcr.io/cirruslabs/macos-sequoia-xcode:latest",
+        "rubberdux-base-macos15-release",
+    ),
+    (
+        "macos26",
+        "ghcr.io/cirruslabs/macos-tahoe-xcode:latest",
+        "rubberdux-base-macos26-release",
+    ),
 ];
 
 pub async fn provision_images(image: Option<String>) -> Result<(), String> {
@@ -15,12 +27,10 @@ pub async fn provision_images(image: Option<String>) -> Result<(), String> {
     }
 
     if !command_exists("tart") {
-        return Err(
-            "Tart VM manager not installed.\n\
+        return Err("Tart VM manager not installed.\n\
              Install with:\n\
              brew install cirruslabs/cli/tart"
-                .into(),
-        );
+            .into());
     }
 
     let images: Vec<&(&str, &str, &str)> = match image {
@@ -46,14 +56,23 @@ pub async fn provision_images(image: Option<String>) -> Result<(), String> {
             continue;
         }
 
-        println!("VM image {} is stale or missing. Reprovisioning...", base_vm_name);
+        println!(
+            "VM image {} is stale or missing. Reprovisioning...",
+            base_vm_name
+        );
 
         // Check if base VM exists - if so, we can clone from it instead of re-downloading OCI image
         let source = if base_vm_exists(base_vm_name) {
-            println!("Base VM {} exists - cloning from it (no download needed)", base_vm_name);
+            println!(
+                "Base VM {} exists - cloning from it (no download needed)",
+                base_vm_name
+            );
             base_vm_name.to_string()
         } else {
-            println!("Base VM {} not found - pulling OCI image {}...", base_vm_name, oci_image);
+            println!(
+                "Base VM {} not found - pulling OCI image {}...",
+                base_vm_name, oci_image
+            );
             pull_oci_image(oci_image)?;
             oci_image.to_string()
         };
@@ -102,7 +121,9 @@ fn compute_provision_hash(_base_vm_name: &str) -> Result<String, String> {
 
 fn read_stored_hash(base_vm_name: &str) -> Option<String> {
     let hash_path = provision_hash_path(base_vm_name);
-    std::fs::read_to_string(hash_path).ok().map(|s| s.trim().to_string())
+    std::fs::read_to_string(hash_path)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 fn write_stored_hash(base_vm_name: &str, hash: &str) -> Result<(), String> {
@@ -111,8 +132,7 @@ fn write_stored_hash(base_vm_name: &str, hash: &str) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create provision dir: {}", e))?;
     }
-    std::fs::write(&hash_path, hash)
-        .map_err(|e| format!("Failed to write hash file: {}", e))?;
+    std::fs::write(&hash_path, hash).map_err(|e| format!("Failed to write hash file: {}", e))?;
     Ok(())
 }
 
@@ -148,7 +168,10 @@ fn base_vm_exists(base_vm_name: &str) -> bool {
 }
 
 fn pull_oci_image(oci_image: &str) -> Result<(), String> {
-    println!("Pulling OCI image {} (this may take 20-40 minutes on first run)...", oci_image);
+    println!(
+        "Pulling OCI image {} (this may take 20-40 minutes on first run)...",
+        oci_image
+    );
     let status = Command::new("tart")
         .args(["pull", oci_image])
         .status()
@@ -247,10 +270,13 @@ fn provision_base_vm(image_name: &str, source: &str, base_vm_name: &str) -> Resu
 
     let install_result = Command::new("sshpass")
         .args([
-            "-p", "admin",
+            "-p",
+            "admin",
             "ssh",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
             &format!("admin@{}", ip),
             remote_cmd,
         ])
@@ -268,9 +294,7 @@ fn provision_base_vm(image_name: &str, source: &str, base_vm_name: &str) -> Resu
 
     println!("Install script completed.");
 
-    let _ = Command::new("tart")
-        .args(["stop", &tmp_name])
-        .status();
+    let _ = Command::new("tart").args(["stop", &tmp_name]).status();
 
     let _ = vm_proc.wait();
 
@@ -288,9 +312,7 @@ fn provision_base_vm(image_name: &str, source: &str, base_vm_name: &str) -> Resu
 
 fn wait_for_ip(vm_name: &str) -> Result<String, String> {
     for _ in 0..90 {
-        let output = Command::new("tart")
-            .args(["ip", vm_name])
-            .output();
+        let output = Command::new("tart").args(["ip", vm_name]).output();
         if let Ok(o) = output {
             let ip = String::from_utf8_lossy(&o.stdout).trim().to_string();
             if !ip.is_empty() && o.status.success() {
@@ -299,18 +321,25 @@ fn wait_for_ip(vm_name: &str) -> Result<String, String> {
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    Err(format!("VM {} did not get an IP after 180 seconds", vm_name))
+    Err(format!(
+        "VM {} did not get an IP after 180 seconds",
+        vm_name
+    ))
 }
 
 fn wait_for_ssh(ip: &str) -> Result<(), String> {
     for _ in 0..60 {
         let result = Command::new("sshpass")
             .args([
-                "-p", "admin",
+                "-p",
+                "admin",
                 "ssh",
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "ConnectTimeout=5",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ConnectTimeout=5",
                 &format!("admin@{}", ip),
                 "true",
             ])
@@ -328,16 +357,19 @@ fn wait_for_ssh(ip: &str) -> Result<(), String> {
 fn generate_ssh_key() -> Result<(), String> {
     let key_path = dirs_home().join(".ssh").join("rubberdux_ed25519");
     let ssh_dir = key_path.parent().unwrap();
-    std::fs::create_dir_all(ssh_dir)
-        .map_err(|e| format!("Failed to create ~/.ssh: {}", e))?;
+    std::fs::create_dir_all(ssh_dir).map_err(|e| format!("Failed to create ~/.ssh: {}", e))?;
 
     let status = Command::new("ssh-keygen")
         .args([
-            "-t", "ed25519",
-            "-f", &key_path.to_string_lossy(),
-            "-N", "",
+            "-t",
+            "ed25519",
+            "-f",
+            &key_path.to_string_lossy(),
+            "-N",
+            "",
             "-q",
-            "-C", "rubberdux-vm",
+            "-C",
+            "rubberdux-vm",
         ])
         .status()
         .map_err(|e| format!("ssh-keygen failed: {}", e))?;

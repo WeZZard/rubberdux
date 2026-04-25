@@ -27,9 +27,7 @@ pub fn interpret_contact(contact: &Contact) -> InterpretedMessage {
 }
 
 pub fn interpret_venue(venue: &Venue) -> InterpretedMessage {
-    let address = venue
-        .address
-        .replace('"', "&quot;");
+    let address = venue.address.replace('"', "&quot;");
     InterpretedMessage {
         text: format!(
             "<venue name=\"{}\" address=\"{}\" latitude=\"{}\" longitude=\"{}\" />",

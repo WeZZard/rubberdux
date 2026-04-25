@@ -57,7 +57,7 @@ pub async fn execute(args: &serde_json::Value) -> ToolOutcome {
             return ToolOutcome::Immediate {
                 content: "Missing required parameter: command".into(),
                 is_error: true,
-            }
+            };
         }
     };
 
@@ -169,7 +169,11 @@ async fn execute_background(command: &str) -> ToolOutcome {
         });
     });
 
-    ToolOutcome::Background { task_id, output_path, receiver: rx }
+    ToolOutcome::Background {
+        task_id,
+        output_path,
+        receiver: rx,
+    }
 }
 
 fn generate_task_id() -> String {

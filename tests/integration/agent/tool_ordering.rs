@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rubberdux::provider::moonshot::tool::{ToolCall, FunctionCall};
+use rubberdux::provider::moonshot::tool::{FunctionCall, ToolCall};
 use rubberdux::tool::ToolRegistry;
 
 use crate::support::mock_tools::MockTool;
@@ -56,17 +56,34 @@ async fn test_dependent_tools_execute_in_order() {
     ];
 
     let start = std::time::Instant::now();
+    let recorder = rubberdux::trajectory::noop_recorder();
     let results = rubberdux::agent::runtime::turn_driver::execute_tool_calls(
-        &calls, &registry
-    ).await;
+        &calls,
+        &registry,
+        &recorder,
+        None,
+        "main",
+        "turn_test",
+        "task_test",
+    )
+    .await;
     let elapsed = start.elapsed();
 
     assert_eq!(results.len(), 3);
 
     // Verify execution order: A before B before C
-    let order_a = results.iter().position(|(call, _)| call.id == "call_a").unwrap();
-    let order_b = results.iter().position(|(call, _)| call.id == "call_b").unwrap();
-    let order_c = results.iter().position(|(call, _)| call.id == "call_c").unwrap();
+    let order_a = results
+        .iter()
+        .position(|(call, _)| call.id == "call_a")
+        .unwrap();
+    let order_b = results
+        .iter()
+        .position(|(call, _)| call.id == "call_b")
+        .unwrap();
+    let order_c = results
+        .iter()
+        .position(|(call, _)| call.id == "call_c")
+        .unwrap();
 
     assert!(order_a < order_b, "A should execute before B");
     assert!(order_b < order_c, "B should execute before C");
@@ -114,9 +131,17 @@ async fn test_independent_tools_execute_concurrently() {
     ];
 
     let start = std::time::Instant::now();
+    let recorder = rubberdux::trajectory::noop_recorder();
     let results = rubberdux::agent::runtime::turn_driver::execute_tool_calls(
-        &calls, &registry
-    ).await;
+        &calls,
+        &registry,
+        &recorder,
+        None,
+        "main",
+        "turn_test",
+        "task_test",
+    )
+    .await;
     let elapsed = start.elapsed();
 
     assert_eq!(results.len(), 2);
@@ -171,9 +196,17 @@ async fn test_cyclic_dependency_returns_error() {
         },
     ];
 
+    let recorder = rubberdux::trajectory::noop_recorder();
     let results = rubberdux::agent::runtime::turn_driver::execute_tool_calls(
-        &calls, &registry
-    ).await;
+        &calls,
+        &registry,
+        &recorder,
+        None,
+        "main",
+        "turn_test",
+        "task_test",
+    )
+    .await;
 
     assert_eq!(results.len(), 3);
 

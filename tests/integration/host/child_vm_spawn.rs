@@ -1,9 +1,10 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use rubberdux::provider::moonshot::MoonshotClient;
-use rubberdux::tool::agent::{build_subagent_registries, AgentTool};
+use rubberdux::tool::agent::{AgentTool, build_subagent_registries};
 use rubberdux::tool::{SubagentType, ToolRegistry};
 use tokio::net::TcpListener;
+use tokio::net::tcp::OwnedWriteHalf;
 
 fn dummy_client() -> Arc<MoonshotClient> {
     Arc::new(MoonshotClient::new(
@@ -14,11 +15,15 @@ fn dummy_client() -> Arc<MoonshotClient> {
     ))
 }
 
-fn make_registry_with_agent(
+fn make_registry_with_agent(client: Arc<MoonshotClient>) -> ToolRegistry {
+    make_registry_with_agent_with_rpc(client, None)
+}
+
+fn make_registry_with_agent_with_rpc(
     client: Arc<MoonshotClient>,
+    rpc_writer: Option<Arc<tokio::sync::Mutex<OwnedWriteHalf>>>,
 ) -> ToolRegistry {
-    let last_query = Arc::new(RwLock::new(String::new()));
-    let registries = build_subagent_registries(&client, &last_query);
+    let registries = build_subagent_registries(&client);
     let (context_tx, _) = tokio::sync::broadcast::channel(4);
 
     let agent_tool = AgentTool::new(
@@ -28,7 +33,8 @@ fn make_registry_with_agent(
         context_tx,
         None,
         None,
-    );
+    )
+    .with_rpc_writer(rpc_writer);
 
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(agent_tool));
@@ -45,13 +51,10 @@ async fn test_computer_use_with_rpc_sends_spawn_vm() {
     let acceptor = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let (mut r, _) = stream.into_split();
-        let msg = rubberdux::protocol::read_message::<
-            rubberdux::protocol::AgentToHost,
-        >(&mut r
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let msg = rubberdux::protocol::read_message::<rubberdux::protocol::AgentToHost>(&mut r)
+            .await
+            .unwrap()
+            .unwrap();
 
         match msg {
             rubberdux::protocol::AgentToHost::SpawnVM {
@@ -72,7 +75,7 @@ async fn test_computer_use_with_rpc_sends_spawn_vm() {
     let (_r, w) = stream.into_split();
     let rpc_writer = Some(Arc::new(tokio::sync::Mutex::new(w)));
 
-    let registry = make_registry_with_agent(client);
+    let registry = make_registry_with_agent_with_rpc(client, rpc_writer);
 
     let outcome = registry
         .execute(
@@ -90,7 +93,10 @@ async fn test_computer_use_with_rpc_sends_spawn_vm() {
                 content
             );
         }
-        other => panic!("Expected Immediate, got {:?}", std::mem::discriminant(&other)),
+        other => panic!(
+            "Expected Immediate, got {:?}",
+            std::mem::discriminant(&other)
+        ),
     }
 
     acceptor.await.unwrap();
@@ -113,7 +119,10 @@ async fn test_computer_use_without_rpc_returns_subagent() {
         rubberdux::tool::ToolOutcome::Subagent { handle } => {
             handle.cancel.cancel();
         }
-        other => panic!("Expected Subagent, got {:?}", std::mem::discriminant(&other)),
+        other => panic!(
+            "Expected Subagent, got {:?}",
+            std::mem::discriminant(&other)
+        ),
     }
 }
 
@@ -132,7 +141,10 @@ async fn test_explore_returns_subagent() {
             assert!(!handle.task_id.is_empty());
             handle.cancel.cancel();
         }
-        other => panic!("Expected Subagent, got {:?}", std::mem::discriminant(&other)),
+        other => panic!(
+            "Expected Subagent, got {:?}",
+            std::mem::discriminant(&other)
+        ),
     }
 }
 
@@ -150,7 +162,10 @@ async fn test_plan_returns_subagent() {
         rubberdux::tool::ToolOutcome::Subagent { handle } => {
             handle.cancel.cancel();
         }
-        other => panic!("Expected Subagent, got {:?}", std::mem::discriminant(&other)),
+        other => panic!(
+            "Expected Subagent, got {:?}",
+            std::mem::discriminant(&other)
+        ),
     }
 }
 
@@ -171,6 +186,9 @@ async fn test_general_purpose_returns_subagent() {
         rubberdux::tool::ToolOutcome::Subagent { handle } => {
             handle.cancel.cancel();
         }
-        other => panic!("Expected Subagent, got {:?}", std::mem::discriminant(&other)),
+        other => panic!(
+            "Expected Subagent, got {:?}",
+            std::mem::discriminant(&other)
+        ),
     }
 }

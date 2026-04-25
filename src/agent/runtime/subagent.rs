@@ -61,6 +61,9 @@ pub fn spawn_subagent(
             registry,
             system_prompt,
             session_path,
+            session_id: None,
+            agent_id: Some(task_id_clone.clone()),
+            recorder: None,
             tool_results_dir,
             token_budget: 128_000,
             cancel: cancel_clone.clone(),
@@ -91,11 +94,7 @@ pub fn spawn_subagent(
 
         // Adapter: forward ContextEvent stream into the AgentLoop's InputPort.
         let adapter_cancel = cancel_clone.clone();
-        tokio::spawn(adapt_context_events(
-            context_rx,
-            input_port,
-            adapter_cancel,
-        ));
+        tokio::spawn(adapt_context_events(context_rx, input_port, adapter_cancel));
 
         // Drive the loop to completion.
         let summary = agent_loop.run_to_completion().await;
@@ -153,7 +152,9 @@ mod tests {
         let mut rx1 = tx.subscribe();
         let mut rx2 = tx.subscribe();
 
-        let msg = Message::System { content: "tz changed".into() };
+        let msg = Message::System {
+            content: "tz changed".into(),
+        };
         tx.send(ContextEvent::EnvironmentChange(msg)).unwrap();
 
         let e1 = rx1.recv().await.unwrap();

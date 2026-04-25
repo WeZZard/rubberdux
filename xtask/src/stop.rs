@@ -1,13 +1,14 @@
 use std::process::Command;
 
 pub async fn stop_rubberdux() -> Result<(), String> {
-    let project_dir = std::env::current_dir()
-        .map_err(|e| format!("Failed to get current directory: {}", e))?;
+    let project_dir =
+        std::env::current_dir().map_err(|e| format!("Failed to get current directory: {}", e))?;
 
     // Read PID file
     let pid_file = project_dir.join("rubberdux.pid");
     if pid_file.exists() {
-        let pid_str = tokio::fs::read_to_string(&pid_file).await
+        let pid_str = tokio::fs::read_to_string(&pid_file)
+            .await
             .map_err(|e| format!("Failed to read PID file: {}", e))?;
         let pid = pid_str.trim();
         if !pid.is_empty() {
@@ -35,14 +36,13 @@ pub async fn stop_rubberdux() -> Result<(), String> {
 
 async fn stop_leaked_vms() -> usize {
     let mut count = 0;
-    let output = Command::new("tart")
-        .args(["list"])
-        .output();
-    
+    let output = Command::new("tart").args(["list"]).output();
+
     if let Ok(output) = output {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
-            if line.starts_with("local") && line.contains("rubberdux-") && line.contains("running") {
+            if line.starts_with("local") && line.contains("rubberdux-") && line.contains("running")
+            {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 2 {
                     let vm_name = parts[1];
@@ -55,6 +55,6 @@ async fn stop_leaked_vms() -> usize {
             }
         }
     }
-    
+
     count
 }

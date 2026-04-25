@@ -5,12 +5,7 @@ use crate::provider::moonshot::Message;
 pub trait CompactionStrategy: Send + Sync {
     /// Compact the history to fit within the token budget.
     /// `current_tokens` is the actual prompt token count from the last LLM response.
-    fn compact(
-        &self,
-        history: &mut EntryHistory,
-        token_budget: usize,
-        current_tokens: usize,
-    );
+    fn compact(&self, history: &mut EntryHistory, token_budget: usize, current_tokens: usize);
 }
 
 /// Default: evict oldest complete conversation turns, preserving the system message.
@@ -20,12 +15,7 @@ pub trait CompactionStrategy: Send + Sync {
 pub struct EvictOldestTurns;
 
 impl CompactionStrategy for EvictOldestTurns {
-    fn compact(
-        &self,
-        history: &mut EntryHistory,
-        token_budget: usize,
-        current_tokens: usize,
-    ) {
+    fn compact(&self, history: &mut EntryHistory, token_budget: usize, current_tokens: usize) {
         if current_tokens <= token_budget {
             return;
         }
@@ -65,8 +55,7 @@ impl CompactionStrategy for EvictOldestTurns {
                 break;
             }
 
-            let estimated_turn_tokens =
-                turn.len() * current_tokens / total_entries;
+            let estimated_turn_tokens = turn.len() * current_tokens / total_entries;
 
             log::info!(
                 "compaction: evicting turn with {} entries (est. {} tokens), ids: {:?}",
@@ -84,39 +73,59 @@ impl CompactionStrategy for EvictOldestTurns {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::moonshot::tool::{FunctionCall, ToolCall};
     use crate::provider::moonshot::{Message, UserContent};
-    use crate::provider::moonshot::tool::{ToolCall, FunctionCall};
 
     /// Helper to build test history.
     fn build_test_history() -> EntryHistory {
         let mut h = EntryHistory::new();
         // Entry 0: System
-        h.push_system(Message::System { content: "system".into() });
+        h.push_system(Message::System {
+            content: "system".into(),
+        });
         // Turn 1: User -> Assistant -> Tool
-        let u1 = h.push_user(Message::User { content: UserContent::Text("q1".into()) });
-        let a1 = h.push_assistant(u1, Message::Assistant {
-            content: Some("answer1".into()),
-            reasoning_content: None,
-            tool_calls: Some(vec![ToolCall {
-                index: None,
-                id: "t1".into(),
-                r#type: "function".into(),
-                function: FunctionCall { name: "bash".into(), arguments: "{}".into() },
-                depends_on: None,
-            }]),
-            partial: None,
+        let u1 = h.push_user(Message::User {
+            content: UserContent::Text("q1".into()),
         });
-        h.push_tool(a1, Message::Tool {
-            tool_call_id: "t1".into(), name: None, content: "result1".into(),
-        });
+        let a1 = h.push_assistant(
+            u1,
+            Message::Assistant {
+                content: Some("answer1".into()),
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCall {
+                    index: None,
+                    id: "t1".into(),
+                    r#type: "function".into(),
+                    function: FunctionCall {
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                    },
+                    depends_on: None,
+                }]),
+                partial: None,
+            },
+        );
+        h.push_tool(
+            a1,
+            Message::Tool {
+                tool_call_id: "t1".into(),
+                name: None,
+                content: "result1".into(),
+            },
+        );
         // Turn 2: User -> Assistant (no tools)
-        let u2 = h.push_user(Message::User { content: UserContent::Text("q2".into()) });
-        h.push_assistant(u2, Message::Assistant {
-            content: Some("answer2".into()),
-            reasoning_content: None,
-            tool_calls: None,
-            partial: None,
+        let u2 = h.push_user(Message::User {
+            content: UserContent::Text("q2".into()),
         });
+        h.push_assistant(
+            u2,
+            Message::Assistant {
+                content: Some("answer2".into()),
+                reasoning_content: None,
+                tool_calls: None,
+                partial: None,
+            },
+        );
         h // 6 entries total
     }
 
@@ -162,7 +171,11 @@ mod tests {
             if let Message::Tool { .. } = &entry.message {
                 let parent_id = entry.parent_id.unwrap();
                 let parent = h.entries().iter().find(|e| e.id == parent_id);
-                assert!(parent.is_some(), "Tool result at id {} has no parent", entry.id);
+                assert!(
+                    parent.is_some(),
+                    "Tool result at id {} has no parent",
+                    entry.id
+                );
                 assert!(
                     matches!(&parent.unwrap().message, Message::Assistant { .. }),
                     "Tool result parent is not an Assistant"

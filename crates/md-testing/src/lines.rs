@@ -110,8 +110,7 @@ pub fn find_heading_line(content: &str, heading: &str) -> Option<usize> {
         .enumerate()
         .find(|(_, line)| {
             let trimmed = line.trim();
-            trimmed == format!("## {}", heading)
-                || trimmed == format!("## CHECK: {}", heading)
+            trimmed == format!("## {}", heading) || trimmed == format!("## CHECK: {}", heading)
         })
         .map(|(i, _)| i + 1)
 }
@@ -163,7 +162,10 @@ Hello!
         assert_eq!(lines[0].line, 2);
         assert_eq!(lines[0].assertion, "The agent should greet politely");
         assert_eq!(lines[1].line, 8);
-        assert_eq!(lines[1].assertion, "The assistant should respond with a greeting");
+        assert_eq!(
+            lines[1].assertion,
+            "The assistant should respond with a greeting"
+        );
     }
 
     #[test]

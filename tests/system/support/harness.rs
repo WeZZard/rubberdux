@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rubberdux::channel::{AgentResponse, ChannelEvent};
 use rubberdux::channel::interpreter::InterpretedMessage;
+use rubberdux::channel::{AgentResponse, ChannelEvent};
 use rubberdux::hardened_prompts;
 use rubberdux::provider::moonshot::MoonshotClient;
 use tokio::sync::mpsc;
@@ -87,10 +87,7 @@ impl ChannelHarness {
         let sp = session_path.clone();
 
         let join = tokio::spawn(async move {
-            rubberdux::agent::runtime::chat::run_with_session(
-                rx, client, system_prompt, sp,
-            )
-            .await;
+            rubberdux::agent::runtime::chat::run_with_session(rx, client, system_prompt, sp).await;
         });
 
         Self {
@@ -106,11 +103,7 @@ impl ChannelHarness {
 
     /// Send a user message and collect all `AgentResponse` messages
     /// until `is_final == true` or the timeout expires.
-    pub async fn send_message(
-        &self,
-        text: &str,
-        timeout: Duration,
-    ) -> Vec<AgentResponse> {
+    pub async fn send_message(&self, text: &str, timeout: Duration) -> Vec<AgentResponse> {
         let (reply_tx, mut reply_rx) = mpsc::channel::<AgentResponse>(32);
 
         let interpreted = InterpretedMessage {
@@ -155,18 +148,20 @@ impl ChannelHarness {
         messages: &[String],
         timeout: Duration,
     ) -> Vec<AgentResponse> {
-        assert!(!messages.is_empty(), "batch must contain at least one message");
+        assert!(
+            !messages.is_empty(),
+            "batch must contain at least one message"
+        );
 
         // Send all but the last as context updates.
         for text in &messages[..messages.len() - 1] {
-            let event = ChannelEvent::ContextUpdate {
-                text: text.clone(),
-            };
+            let event = ChannelEvent::ContextUpdate { text: text.clone() };
             self.tx.send(event).await.expect("channel should be open");
         }
 
         // Send the last message as a normal user input to trigger LLM.
-        self.send_message(&messages[messages.len() - 1], timeout).await
+        self.send_message(&messages[messages.len() - 1], timeout)
+            .await
     }
 }
 

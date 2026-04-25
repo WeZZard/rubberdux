@@ -110,35 +110,34 @@ pub async fn interpret_document(
         .map(|m| m.to_string())
         .unwrap_or_default();
 
-    let filename = document
-        .file_name
-        .as_deref()
-        .unwrap_or("unknown");
+    let filename = document.file_name.as_deref().unwrap_or("unknown");
 
     // For image/video documents, treat as media
     if mime.starts_with("image/")
-        && let Some(data) = download_file(bot, &document.file.id).await {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-            return InterpretedMessage {
-                text: caption.unwrap_or("").to_owned(),
-                attachments: vec![Attachment::Image {
-                    base64: b64,
-                    mime_type: mime,
-                }],
-            };
-        }
+        && let Some(data) = download_file(bot, &document.file.id).await
+    {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        return InterpretedMessage {
+            text: caption.unwrap_or("").to_owned(),
+            attachments: vec![Attachment::Image {
+                base64: b64,
+                mime_type: mime,
+            }],
+        };
+    }
 
     if mime.starts_with("video/")
-        && let Some(data) = download_file(bot, &document.file.id).await {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-            return InterpretedMessage {
-                text: caption.unwrap_or("").to_owned(),
-                attachments: vec![Attachment::Video {
-                    base64: b64,
-                    mime_type: mime,
-                }],
-            };
-        }
+        && let Some(data) = download_file(bot, &document.file.id).await
+    {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        return InterpretedMessage {
+            text: caption.unwrap_or("").to_owned(),
+            attachments: vec![Attachment::Video {
+                base64: b64,
+                mime_type: mime,
+            }],
+        };
+    }
 
     // For other documents, note the filename
     let caption_text = caption.unwrap_or("");

@@ -1,4 +1,6 @@
-use crate::llm::{build_request_json, parse_response_text, sanitize_for_json, ChatMessage, LlmClient};
+use crate::llm::{
+    ChatMessage, LlmClient, build_request_json, parse_response_text, sanitize_for_json,
+};
 
 /// Something that can be formatted as markdown for LLM evaluation.
 pub trait Evaluatable {
@@ -114,9 +116,7 @@ impl<C: LlmClient> AssertionEvaluator<C> {
     }
 
     /// Internal: evaluate with a given prompt using self-consistency voting.
-    async fn evaluate_with_prompt(&self,
-        prompt: &str,
-    ) -> EvaluationResult {
+    async fn evaluate_with_prompt(&self, prompt: &str) -> EvaluationResult {
         let messages = vec![
             ChatMessage {
                 role: "system".into(),
@@ -145,7 +145,10 @@ impl<C: LlmClient> AssertionEvaluator<C> {
             let text = match parse_response_text(&raw) {
                 Ok(t) => t,
                 Err(e) => {
-                    last_error = Some(format!("Failed to parse evaluator response: {}. Raw: {}", e, raw));
+                    last_error = Some(format!(
+                        "Failed to parse evaluator response: {}. Raw: {}",
+                        e, raw
+                    ));
                     continue;
                 }
             };
@@ -364,7 +367,12 @@ impl<C: LlmClient> AssertionEvaluator<C> {
             if passed {
                 votes_passed += 1;
             }
-            all_reasonings.push(format!("[Vote {}] {}: {}", attempt + 1, if passed { "PASS" } else { "FAIL" }, reasoning));
+            all_reasonings.push(format!(
+                "[Vote {}] {}: {}",
+                attempt + 1,
+                if passed { "PASS" } else { "FAIL" },
+                reasoning
+            ));
         }
 
         let total_votes = all_reasonings.len();
