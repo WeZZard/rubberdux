@@ -18,11 +18,17 @@ For all tests that exercise the AgentLoop (integration, system, e2e), transcript
 ### Where to store
 ```
 tests/results/
-└── YYYYMMDD_HHMMSS-integration/
-    └── <test_name>/
-        ├── transcript.jsonl     # Raw conversation (Entry objects)
-        ├── transcript.md        # Markdown narration
-        └── test.log             # Captured logs
+└── YYYYMMDD_HHMMSS/
+    ├── integration/
+    │   └── <test_name>/
+    │       ├── transcript.jsonl     # Raw conversation (Entry objects)
+    │       ├── transcript.md        # Markdown narration
+    │       └── test.log             # Captured logs
+    └── system/
+        └── <test_name>/
+            ├── execution.json
+            ├── evaluation.md
+            └── results.json
 ```
 
 ### Artifact verification

@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use crate::llm::{
     ChatMessage, LlmClient, build_request_json, parse_response_text, sanitize_for_json,
 };
@@ -12,6 +14,8 @@ pub trait Evaluatable {
 pub struct EvaluationResult {
     pub passed: bool,
     pub reasoning: String,
+    pub duration_ms: u64,
+    pub llm_calls: usize,
 }
 
 /// Uses an LLM to judge whether a trajectory satisfies a natural-language assertion.
@@ -117,6 +121,7 @@ impl<C: LlmClient> AssertionEvaluator<C> {
 
     /// Internal: evaluate with a given prompt using self-consistency voting.
     async fn evaluate_with_prompt(&self, prompt: &str) -> EvaluationResult {
+        let evaluation_start = Instant::now();
         let messages = vec![
             ChatMessage {
                 role: "system".into(),
@@ -131,23 +136,34 @@ impl<C: LlmClient> AssertionEvaluator<C> {
         let mut votes_passed = 0usize;
         let mut all_reasonings = Vec::new();
         let mut last_error = None;
+        let mut llm_calls = 0usize;
 
         for attempt in 0..self.consistency_votes {
             let body = build_request_json(&self.model, &messages, 0.0);
+            let call_start = Instant::now();
             let raw = match self.client.chat_raw(body).await {
-                Ok(r) => r,
+                Ok(r) => {
+                    llm_calls += 1;
+                    r
+                }
                 Err(e) => {
-                    last_error = Some(format!("Evaluator LLM call failed: {}", e));
+                    llm_calls += 1;
+                    let call_ms = duration_ms(call_start.elapsed());
+                    last_error = Some(format!(
+                        "Evaluator LLM call failed after {} ms: {}",
+                        call_ms, e
+                    ));
                     continue;
                 }
             };
+            let call_ms = duration_ms(call_start.elapsed());
 
             let text = match parse_response_text(&raw) {
                 Ok(t) => t,
                 Err(e) => {
                     last_error = Some(format!(
-                        "Failed to parse evaluator response: {}. Raw: {}",
-                        e, raw
+                        "Failed to parse evaluator response after {} ms: {}. Raw: {}",
+                        call_ms, e, raw
                     ));
                     continue;
                 }
@@ -357,8 +373,8 @@ impl<C: LlmClient> AssertionEvaluator<C> {
                 Some(result) => result,
                 None => {
                     last_error = Some(format!(
-                        "Failed to parse evaluator response as JSON. Raw: {}",
-                        text
+                        "Failed to parse evaluator response as JSON after {} ms. Raw: {}",
+                        call_ms, text
                     ));
                     continue;
                 }
@@ -368,8 +384,9 @@ impl<C: LlmClient> AssertionEvaluator<C> {
                 votes_passed += 1;
             }
             all_reasonings.push(format!(
-                "[Vote {}] {}: {}",
+                "[Vote {} in {} ms] {}: {}",
                 attempt + 1,
+                call_ms,
                 if passed { "PASS" } else { "FAIL" },
                 reasoning
             ));
@@ -381,6 +398,8 @@ impl<C: LlmClient> AssertionEvaluator<C> {
             return EvaluationResult {
                 passed: false,
                 reasoning: last_error.unwrap_or_else(|| "All evaluator attempts failed".into()),
+                duration_ms: duration_ms(evaluation_start.elapsed()),
+                llm_calls,
             };
         }
 
@@ -389,8 +408,14 @@ impl<C: LlmClient> AssertionEvaluator<C> {
         EvaluationResult {
             passed,
             reasoning: all_reasonings.join("\n"),
+            duration_ms: duration_ms(evaluation_start.elapsed()),
+            llm_calls,
         }
     }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
 }
 
 /// Parse an evaluator response, trying JSON first, then falling back to
@@ -401,9 +426,9 @@ impl<C: LlmClient> AssertionEvaluator<C> {
 fn parse_evaluator_response(text: &str) -> Option<(bool, String)> {
     // Try strict JSON first
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-        let passed = value["passed"].as_bool()?;
-        let reasoning = value["reasoning"].as_str()?.to_string();
-        return Some((passed, reasoning));
+        if let Some(result) = parse_evaluator_json_value(&value) {
+            return Some(result);
+        }
     }
 
     // Fallback: extract passed field with regex
@@ -412,6 +437,23 @@ fn parse_evaluator_response(text: &str) -> Option<(bool, String)> {
     // Fallback: extract reasoning field by finding the key and grabbing
     // the string value, handling nested quotes.
     let reasoning = extract_json_string(text, "reasoning")?;
+
+    Some((passed, reasoning))
+}
+
+fn parse_evaluator_json_value(value: &serde_json::Value) -> Option<(bool, String)> {
+    let object = value.as_object()?;
+    let passed = object
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("passed"))?
+        .1
+        .as_bool()?;
+    let reasoning = object
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("reasoning"))?
+        .1
+        .as_str()?
+        .to_string();
 
     Some((passed, reasoning))
 }
@@ -471,4 +513,29 @@ fn extract_json_string(text: &str, key: &str) -> Option<String> {
     // If we get here, the string was not properly closed, but we still
     // have something — return it as a best-effort.
     Some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_evaluator_response;
+
+    #[test]
+    fn parses_evaluator_response_with_capitalized_reasoning_key() {
+        let response = r#"{"passed": true, "Reasoning": "Explains the correct behavior."}"#;
+
+        let (passed, reasoning) = parse_evaluator_response(response).unwrap();
+
+        assert!(passed);
+        assert_eq!(reasoning, "Explains the correct behavior.");
+    }
+
+    #[test]
+    fn parses_evaluator_response_with_capitalized_passed_key() {
+        let response = r#"{"Passed": false, "reasoning": "Missing required output."}"#;
+
+        let (passed, reasoning) = parse_evaluator_response(response).unwrap();
+
+        assert!(!passed);
+        assert_eq!(reasoning, "Missing required output.");
+    }
 }

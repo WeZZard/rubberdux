@@ -20,6 +20,10 @@ pub struct AssertionResult {
     pub assertion: String,
     pub passed: bool,
     pub reasoning: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluator_call_count: Option<usize>,
 }
 
 /// The scope of an evaluation assertion.

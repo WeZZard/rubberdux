@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use md_testing::evaluator::{AssertionEvaluator, Evaluatable};
 use md_testing::guidance::render_guidance;
@@ -30,8 +30,10 @@ pub async fn run() {
     let cases = md_testing::discovery::discover_cases(&cases_dir);
     assert!(!cases.is_empty(), "No test cases found in {:?}", cases_dir);
 
-    let (run_dir, run_timestamp) = artifact_run_dir();
-    let dir_name = run_dir.file_name().unwrap().to_string_lossy().to_string();
+    let run = super::artifacts::integration_run();
+    let run_dir = run.dir;
+    let run_timestamp = run.timestamp;
+    let dir_name = run.run_id;
     let system_prompt = build_system_prompt();
 
     let execution_paths = execute_cases(
@@ -277,9 +279,11 @@ async fn evaluate_execution_artifacts(
             let result = evaluator.evaluate_storyline(&trajectory, assertion).await;
             eval_results.push_str(&format!("## Storyline: {}\n", assertion));
             eval_results.push_str(&format!("- Passed: {}\n", result.passed));
+            append_evaluation_timing(&mut eval_results, &result);
             eval_results.push_str(&format!("- Reasoning: {}\n\n", result.reasoning));
             println!("  Storyline: {}", assertion);
             println!("    Passed: {}", result.passed);
+            println!("    Duration: {} ms", result.duration_ms);
             if !result.passed {
                 all_passed = false;
             }
@@ -298,6 +302,8 @@ async fn evaluate_execution_artifacts(
                         passed: false,
                         reasoning: "Could not match assistant message — ordering match failed"
                             .to_string(),
+                        duration_ms: 0,
+                        llm_calls: 0,
                     }
                 };
                 eval_results.push_str(&format!(
@@ -314,6 +320,7 @@ async fn evaluate_execution_artifacts(
                 ));
                 eval_results.push_str(&format!("Assertion: {}\n", assertion));
                 eval_results.push_str(&format!("- Passed: {}\n", result.passed));
+                append_evaluation_timing(&mut eval_results, &result);
                 eval_results.push_str(&format!("- Reasoning: {}\n\n", result.reasoning));
                 println!(
                     "  Assistant Message {} (slot {}): {}",
@@ -324,6 +331,7 @@ async fn evaluate_execution_artifacts(
                     assertion
                 );
                 println!("    Passed: {}", result.passed);
+                println!("    Duration: {} ms", result.duration_ms);
                 if !result.passed {
                     all_passed = false;
                 }
@@ -353,6 +361,8 @@ async fn evaluate_execution_artifacts(
                 assertion: "Message exchange completed with a final assistant response".to_string(),
                 passed: false,
                 reasoning: failure.reason.clone(),
+                evaluation_duration_ms: None,
+                evaluator_call_count: None,
             });
         }
 
@@ -370,6 +380,8 @@ async fn evaluate_execution_artifacts(
                 assertion: assertion.clone(),
                 passed: result.passed,
                 reasoning: result.reasoning.clone(),
+                evaluation_duration_ms: evaluation_duration_ms(result),
+                evaluator_call_count: evaluator_call_count(result),
             });
         }
 
@@ -385,6 +397,8 @@ async fn evaluate_execution_artifacts(
                 assertion: "Ordering match".to_string(),
                 passed: false,
                 reasoning: e.to_string(),
+                evaluation_duration_ms: None,
+                evaluator_call_count: None,
             });
         }
 
@@ -406,6 +420,8 @@ async fn evaluate_execution_artifacts(
                 assertion: assertion.clone(),
                 passed: result.passed,
                 reasoning: result.reasoning.clone(),
+                evaluation_duration_ms: evaluation_duration_ms(result),
+                evaluator_call_count: evaluator_call_count(result),
             });
         }
 
@@ -427,6 +443,24 @@ async fn evaluate_execution_artifacts(
     }
 
     failed_cases
+}
+
+fn append_evaluation_timing(output: &mut String, result: &md_testing::EvaluationResult) {
+    if result.llm_calls > 0 {
+        output.push_str(&format!(
+            "- Evaluation Duration: {} ms\n",
+            result.duration_ms
+        ));
+        output.push_str(&format!("- Evaluator Calls: {}\n", result.llm_calls));
+    }
+}
+
+fn evaluation_duration_ms(result: &md_testing::EvaluationResult) -> Option<u64> {
+    (result.llm_calls > 0).then_some(result.duration_ms)
+}
+
+fn evaluator_call_count(result: &md_testing::EvaluationResult) -> Option<usize> {
+    (result.llm_calls > 0).then_some(result.llm_calls)
 }
 
 struct ExecutionTrajectory<'a> {
@@ -539,34 +573,6 @@ fn build_system_prompt() -> String {
     rubberdux::hardened_prompts::compose_system_prompt(&parts, None)
 }
 
-/// Create the artifact directory for this test run.
-fn artifact_run_dir() -> (PathBuf, String) {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-    let days = secs / 86400;
-    let (year, month, day) = days_to_ymd(days);
-    let timestamp = format!(
-        "{:04}-{:02}-{:02}-{:02}-{:02}-{:02}-UTC",
-        year, month, day, hours, minutes, seconds
-    );
-    let dir_name = format!(
-        "{:04}{:02}{:02}_{:02}{:02}{:02}-integration-testcases",
-        year, month, day, hours, minutes, seconds
-    );
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("results")
-        .join(dir_name);
-    std::fs::create_dir_all(&dir).expect("failed to create results dir");
-    (dir, timestamp)
-}
-
 /// Check if MLX server is running, start it if not.
 async fn ensure_mlx_server() {
     let base_url =
@@ -651,45 +657,4 @@ fn count_assistant_messages(session_path: &std::path::Path) -> usize {
         }
     }
     count
-}
-
-fn days_to_ymd(days_since_epoch: u64) -> (u64, u64, u64) {
-    let mut days = days_since_epoch;
-    let mut year = 1970;
-    loop {
-        let days_in_year = if is_leap(year) { 366 } else { 365 };
-        if days < days_in_year {
-            break;
-        }
-        days -= days_in_year;
-        year += 1;
-    }
-    let leap = is_leap(year);
-    let month_days = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    let mut month = 1u64;
-    for &md in &month_days {
-        if days < md {
-            break;
-        }
-        days -= md;
-        month += 1;
-    }
-    (year, month, days + 1)
-}
-
-fn is_leap(y: u64) -> bool {
-    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
 }
