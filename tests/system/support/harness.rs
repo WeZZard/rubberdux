@@ -79,6 +79,11 @@ pub struct ChannelHarness {
     _join: tokio::task::JoinHandle<()>,
 }
 
+pub struct MessageExchange {
+    pub responses: Vec<AgentResponse>,
+    pub failure_reason: Option<String>,
+}
+
 impl ChannelHarness {
     pub async fn new(system_prompt: &str, session_path: PathBuf) -> Self {
         let client = Arc::new(MoonshotClient::from_env());
@@ -103,7 +108,7 @@ impl ChannelHarness {
 
     /// Send a user message and collect all `AgentResponse` messages
     /// until `is_final == true` or the timeout expires.
-    pub async fn send_message(&self, text: &str, timeout: Duration) -> Vec<AgentResponse> {
+    pub async fn send_message(&self, text: &str, timeout: Duration) -> MessageExchange {
         let (reply_tx, mut reply_rx) = mpsc::channel::<AgentResponse>(32);
 
         let interpreted = InterpretedMessage {
@@ -121,6 +126,7 @@ impl ChannelHarness {
 
         let mut responses = Vec::new();
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut failure_reason = None;
 
         loop {
             match tokio::time::timeout_at(deadline, reply_rx.recv()).await {
@@ -131,12 +137,25 @@ impl ChannelHarness {
                         break;
                     }
                 }
-                Ok(None) => break,
-                Err(_) => break,
+                Ok(None) => {
+                    failure_reason =
+                        Some("Reply channel closed before a final assistant response".to_string());
+                    break;
+                }
+                Err(_) => {
+                    failure_reason = Some(format!(
+                        "Timed out after {} second(s) waiting for a final assistant response",
+                        timeout.as_secs()
+                    ));
+                    break;
+                }
             }
         }
 
-        responses
+        MessageExchange {
+            responses,
+            failure_reason,
+        }
     }
 
     /// Send multiple user messages as a batch.  All but the last message are
@@ -147,7 +166,7 @@ impl ChannelHarness {
         &self,
         messages: &[String],
         timeout: Duration,
-    ) -> Vec<AgentResponse> {
+    ) -> MessageExchange {
         assert!(
             !messages.is_empty(),
             "batch must contain at least one message"

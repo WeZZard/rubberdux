@@ -1,4 +1,5 @@
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+use serde::{Deserialize, Serialize};
 
 /// A parsed test case from a `.testcase.md` file.
 #[derive(Debug, Clone, PartialEq)]
@@ -22,7 +23,7 @@ pub struct FrontMatter {
 
 /// Ordering directive for an assistant message, controlling how it is matched
 /// against the actual assistant messages produced by the agent.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OrderingDirective {
     /// Match this assistant message somewhere after the previous match.
     /// Intervening unmatched assistant messages are allowed.

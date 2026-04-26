@@ -1,11 +1,11 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use md_testing::evaluator::{AssertionEvaluator, Evaluatable};
 use md_testing::guidance::render_guidance;
 use md_testing::llm::{LlmClient, LlmError};
-use md_testing::narration;
-use md_testing::ordering::{MatchError, match_assistant_slots};
+use md_testing::ordering::match_assistant_slots;
+use md_testing::{AssistantSlotArtifact, ExchangeFailure, ExecutionArtifact};
 use md_testing::{Message, OrderingDirective, UserContent};
 
 use super::harness::{ChannelHarness, Trajectory, build_system_prompt};
@@ -19,10 +19,6 @@ pub async fn run() {
     let llm = MlxLlmClient::from_env();
     let model = std::env::var("MD_TESTING_LLM_MODEL").expect("MD_TESTING_LLM_MODEL must be set");
 
-    let evaluator = AssertionEvaluator::new(llm.clone())
-        .with_model(&model)
-        .with_consistency_votes(3);
-
     let cases_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("system")
@@ -33,6 +29,48 @@ pub async fn run() {
     let (run_dir, run_timestamp) = artifact_run_dir();
     let dir_name = run_dir.file_name().unwrap().to_string_lossy().to_string();
     let system_prompt = build_system_prompt();
+
+    let execution_paths = execute_cases(
+        &cases,
+        &cases_dir,
+        &run_dir,
+        &run_timestamp,
+        &dir_name,
+        &system_prompt,
+        &llm,
+        &model,
+    )
+    .await;
+
+    let failed_cases = evaluate_execution_artifacts(&execution_paths, &run_dir, &llm, &model).await;
+
+    if !failed_cases.is_empty() {
+        panic!(
+            "{} case(s) failed: {:?}. Artifacts: {}",
+            failed_cases.len(),
+            failed_cases,
+            run_dir.display()
+        );
+    }
+
+    println!(
+        "\n=== All {} cases passed. Artifacts: {} ===",
+        execution_paths.len(),
+        run_dir.display()
+    );
+}
+
+async fn execute_cases(
+    cases: &[md_testing::TestCase],
+    cases_dir: &Path,
+    run_dir: &Path,
+    run_timestamp: &str,
+    run_id: &str,
+    system_prompt: &str,
+    llm: &MlxLlmClient,
+    model: &str,
+) -> Vec<PathBuf> {
+    let mut execution_paths = Vec::new();
 
     for case in cases {
         if case.front_matter.target != "telegram-channel" {
@@ -53,14 +91,15 @@ pub async fn run() {
         let session_dir = case_dir.join("session");
         std::fs::create_dir_all(&session_dir).expect("failed to create session dir");
         let session_path = session_dir.join("main-agent.jsonl");
-        let harness = ChannelHarness::new(&system_prompt, session_path.clone()).await;
+        let harness = ChannelHarness::new(system_prompt, session_path.clone()).await;
 
         let timeout = Duration::from_secs(case.front_matter.timeout.max(60));
 
         let mut user_messages = Vec::new();
         let mut assistant_slots: Vec<(OrderingDirective, Vec<String>)> = Vec::new();
-        let mut message_batches: Vec<Vec<String>> = Vec::new();
+        let mut message_batches: Vec<(usize, Vec<String>)> = Vec::new();
         let mut current_batch: Vec<String> = Vec::new();
+        let mut exchange_failures: Vec<ExchangeFailure> = Vec::new();
 
         for msg in case.messages.iter() {
             match msg {
@@ -68,7 +107,7 @@ pub async fn run() {
                     let text = match content {
                         UserContent::PlainText(t) => t.clone(),
                         UserContent::Guidance(guidance) => {
-                            render_guidance(guidance, &llm, &model).await
+                            render_guidance(guidance, llm, model).await
                         }
                     };
                     user_messages.push(text.clone());
@@ -80,7 +119,8 @@ pub async fn run() {
                 } => {
                     // End of a user-message batch; flush it.
                     if !current_batch.is_empty() {
-                        message_batches.push(current_batch);
+                        message_batches
+                            .push((user_messages.len().saturating_sub(1), current_batch));
                         current_batch = Vec::new();
                     }
                     assistant_slots.push((directive.clone(), assertions.clone()));
@@ -90,29 +130,35 @@ pub async fn run() {
 
         // Flush any trailing user messages after the last assistant slot.
         if !current_batch.is_empty() {
-            message_batches.push(current_batch);
+            message_batches.push((user_messages.len().saturating_sub(1), current_batch));
         }
 
         let mut all_responses = Vec::new();
-        for batch in &message_batches {
-            let responses = if batch.len() == 1 {
+        for (last_user_msg_idx, batch) in &message_batches {
+            let exchange = if batch.len() == 1 {
                 harness.send_message(&batch[0], timeout).await
             } else {
                 harness.send_messages_batch(batch, timeout).await
             };
-            all_responses.extend(responses);
+            if let Some(reason) = exchange.failure_reason {
+                exchange_failures.push(ExchangeFailure {
+                    user_message_index: *last_user_msg_idx,
+                    reason,
+                });
+            }
+            all_responses.extend(exchange.responses);
         }
 
         let trajectory = Trajectory {
             case_name: case.name.clone(),
-            test_time: run_timestamp.clone(),
-            user_messages: user_messages.iter().map(|t| t.clone()).collect(),
+            test_time: run_timestamp.to_string(),
+            user_messages: user_messages.clone(),
             responses: all_responses,
             session_path: session_path.clone(),
         };
 
         let narration_text = trajectory.format_for_eval();
-        std::fs::write(session_dir.join("main-agent.md"), &narration_text)
+        md_testing::write_text_atomically(&session_dir.join("main-agent.md"), &narration_text)
             .expect("failed to write narration");
 
         trajectory.write_subagent_narrations();
@@ -122,22 +168,102 @@ pub async fn run() {
 
         // Count actual assistant messages from the session transcript.
         let actual_assistant_count = count_assistant_messages(&session_path);
-        let directives: Vec<OrderingDirective> =
-            assistant_slots.iter().map(|(d, _)| d.clone()).collect();
+
+        let case_content =
+            std::fs::read_to_string(cases_dir.join(format!("{}.testcase.md", case.name)))
+                .expect("failed to read testcase file");
+
+        let artifact = ExecutionArtifact {
+            testcase_name: case.name.clone(),
+            run_id: run_id.to_string(),
+            timestamp: run_timestamp.to_string(),
+            target: case.front_matter.target.clone(),
+            case_content,
+            trajectory_markdown: narration_text,
+            user_messages,
+            assistant_slots: assistant_slots
+                .into_iter()
+                .map(|(directive, assertions)| AssistantSlotArtifact {
+                    directive,
+                    assertions,
+                })
+                .collect(),
+            actual_assistant_count,
+            exchange_failures,
+        };
+
+        let execution_path = case_dir.join("execution.json");
+        artifact
+            .write(&execution_path)
+            .expect("failed to write execution.json");
+        execution_paths.push(execution_path);
+    }
+
+    execution_paths
+}
+
+async fn evaluate_execution_artifacts(
+    execution_paths: &[PathBuf],
+    run_dir: &Path,
+    llm: &MlxLlmClient,
+    model: &str,
+) -> Vec<String> {
+    let evaluator = AssertionEvaluator::new(llm.clone())
+        .with_model(model)
+        .with_consistency_votes(3);
+    let mut artifacts: Vec<ExecutionArtifact> = execution_paths
+        .iter()
+        .map(|path| ExecutionArtifact::read(path).expect("failed to read execution.json"))
+        .collect();
+    artifacts.sort_by(|a, b| a.testcase_name.cmp(&b.testcase_name));
+
+    let mut failed_cases: Vec<String> = Vec::new();
+
+    for artifact in artifacts {
+        println!("\n=== Evaluating case: {} ===", artifact.testcase_name);
+
+        let case_dir = run_dir.join(&artifact.testcase_name);
+        let case = md_testing::parser::parse(&artifact.case_content, &artifact.testcase_name)
+            .expect("failed to parse execution testcase content");
+        let trajectory = ExecutionTrajectory {
+            markdown: &artifact.trajectory_markdown,
+        };
+        let directives: Vec<OrderingDirective> = artifact
+            .assistant_slots
+            .iter()
+            .map(|slot| slot.directive.clone())
+            .collect();
 
         let mut eval_results = String::new();
         let mut all_passed = true;
+        let mut storyline_results = Vec::new();
+        let mut assistant_results = Vec::new();
+
+        for failure in &artifact.exchange_failures {
+            eval_results.push_str(&format!(
+                "## User Message {} Exchange\n",
+                failure.user_message_index
+            ));
+            eval_results.push_str("- Passed: false\n");
+            eval_results.push_str(&format!("- Reasoning: {}\n\n", failure.reason));
+            println!(
+                "  User Message {} exchange failed: {}",
+                failure.user_message_index, failure.reason
+            );
+            all_passed = false;
+        }
 
         // Run ordering match first.
-        let matched_indices = match match_assistant_slots(&directives, actual_assistant_count) {
-            Ok(indices) => indices,
-            Err(e) => {
-                eval_results.push_str(&format!("## Ordering Match Error\n\n{}\n\n", e));
-                println!("  Ordering match failed: {}", e);
-                all_passed = false;
-                Vec::new()
-            }
-        };
+        let (matched_indices, ordering_error) =
+            match match_assistant_slots(&directives, artifact.actual_assistant_count) {
+                Ok(indices) => (indices, None),
+                Err(e) => {
+                    eval_results.push_str(&format!("## Ordering Match Error\n\n{}\n\n", e));
+                    println!("  Ordering match failed: {}", e);
+                    all_passed = false;
+                    (Vec::new(), Some(e))
+                }
+            };
 
         for assertion in &case.storyline {
             let result = evaluator.evaluate_storyline(&trajectory, assertion).await;
@@ -153,11 +279,12 @@ pub async fn run() {
             if !result.passed {
                 all_passed = false;
             }
+            storyline_results.push((assertion.clone(), result));
         }
 
-        for (slot_idx, (_, assertions)) in assistant_slots.iter().enumerate() {
+        for (slot_idx, slot) in artifact.assistant_slots.iter().enumerate() {
             let actual_idx = matched_indices.get(slot_idx).copied();
-            for assertion in assertions {
+            for assertion in &slot.assertions {
                 let result = if let Some(idx) = actual_idx {
                     evaluator
                         .evaluate_assistant(&trajectory, assertion, idx)
@@ -199,43 +326,58 @@ pub async fn run() {
                 if !result.passed {
                     all_passed = false;
                 }
+                assistant_results.push((slot_idx, actual_idx, assertion.clone(), result));
             }
         }
 
-        std::fs::write(case_dir.join("evaluation.md"), &eval_results)
+        md_testing::write_text_atomically(&case_dir.join("evaluation.md"), &eval_results)
             .expect("failed to write evaluation");
 
         // Write machine-readable results.json for LSP
-        let case_content =
-            std::fs::read_to_string(cases_dir.join(format!("{}.testcase.md", case.name)))
-                .unwrap_or_default();
-        let assertion_lines = md_testing::map_assertion_lines(&case_content, &case);
+        let case_content = &artifact.case_content;
+        let assertion_lines = md_testing::map_assertion_lines(case_content, &case);
         let mut results_assertions = Vec::new();
 
+        // User-message exchange failures
+        let user_lines = md_testing::find_user_heading_lines(case_content);
+        for failure in &artifact.exchange_failures {
+            results_assertions.push(md_testing::AssertionResult {
+                scope: md_testing::AssertionScope::UserMessage {
+                    msg_index: failure.user_message_index,
+                },
+                line: user_lines
+                    .get(failure.user_message_index)
+                    .copied()
+                    .unwrap_or(1),
+                assertion: "Message exchange completed with a final assistant response".to_string(),
+                passed: false,
+                reasoning: failure.reason.clone(),
+            });
+        }
+
         // Storyline assertions
-        let storyline_line = md_testing::find_heading_line(&case_content, "Storyline").unwrap_or(1);
-        for assertion in &case.storyline {
+        let storyline_line = md_testing::find_heading_line(case_content, "Storyline").unwrap_or(1);
+        for (assertion, result) in &storyline_results {
             let line = assertion_lines
                 .iter()
                 .find(|l| l.msg_index == 0 && l.assertion == *assertion)
                 .map(|l| l.line)
                 .unwrap_or(storyline_line);
-            let result = evaluator.evaluate_storyline(&trajectory, assertion).await;
             results_assertions.push(md_testing::AssertionResult {
                 scope: md_testing::AssertionScope::Storyline,
                 line,
                 assertion: assertion.clone(),
                 passed: result.passed,
-                reasoning: result.reasoning,
+                reasoning: result.reasoning.clone(),
             });
         }
 
         // Ordering match result
-        let ordering_line = md_testing::find_assistant_heading_lines(&case_content)
+        let ordering_line = md_testing::find_assistant_heading_lines(case_content)
             .first()
             .copied()
             .unwrap_or(1);
-        if let Err(ref e) = match_assistant_slots(&directives, actual_assistant_count) {
+        if let Some(e) = &ordering_error {
             results_assertions.push(md_testing::AssertionResult {
                 scope: md_testing::AssertionScope::OrderingMatch,
                 line: ordering_line,
@@ -246,40 +388,31 @@ pub async fn run() {
         }
 
         // Assistant assertions
-        let assistant_lines = md_testing::find_assistant_heading_lines(&case_content);
-        for (slot_idx, (_, assertions)) in assistant_slots.iter().enumerate() {
-            let actual_idx = matched_indices.get(slot_idx).copied();
-            let heading_line = assistant_lines.get(slot_idx).copied().unwrap_or(1);
-            for assertion in assertions {
-                let result = if let Some(idx) = actual_idx {
-                    evaluator
-                        .evaluate_assistant(&trajectory, assertion, idx)
-                        .await
-                } else {
-                    md_testing::evaluator::EvaluationResult {
-                        passed: false,
-                        reasoning: "Could not match assistant message — ordering match failed"
-                            .to_string(),
-                    }
-                };
-                results_assertions.push(md_testing::AssertionResult {
-                    scope: md_testing::AssertionScope::AssistantMessage {
-                        slot_index: slot_idx,
-                        actual_index: actual_idx,
-                    },
-                    line: heading_line,
-                    assertion: assertion.clone(),
-                    passed: result.passed,
-                    reasoning: result.reasoning,
-                });
-            }
+        let assistant_lines = md_testing::find_assistant_heading_lines(case_content);
+        for (slot_idx, actual_idx, assertion, result) in &assistant_results {
+            let heading_line = assistant_lines.get(*slot_idx).copied().unwrap_or(1);
+            let line = assertion_lines
+                .iter()
+                .find(|l| l.msg_index == *slot_idx && l.assertion == *assertion)
+                .map(|l| l.line)
+                .unwrap_or(heading_line);
+            results_assertions.push(md_testing::AssertionResult {
+                scope: md_testing::AssertionScope::AssistantMessage {
+                    slot_index: *slot_idx,
+                    actual_index: *actual_idx,
+                },
+                line,
+                assertion: assertion.clone(),
+                passed: result.passed,
+                reasoning: result.reasoning.clone(),
+            });
         }
 
         let test_results = md_testing::TestResults {
-            testcase_name: case.name.clone(),
-            run_id: dir_name.clone(),
-            timestamp: run_timestamp.clone(),
-            target: case.front_matter.target.clone(),
+            testcase_name: artifact.testcase_name.clone(),
+            run_id: artifact.run_id.clone(),
+            timestamp: artifact.timestamp.clone(),
+            target: artifact.target.clone(),
             passed: all_passed,
             assertions: results_assertions,
         };
@@ -290,16 +423,24 @@ pub async fn run() {
         if !all_passed {
             eprintln!(
                 "\nFAILED: One or more assertions failed for case '{}'. See {}",
-                case.name,
+                artifact.testcase_name,
                 case_dir.display()
             );
+            failed_cases.push(artifact.testcase_name.clone());
         }
     }
 
-    println!(
-        "\n=== All cases completed. Artifacts: {} ===",
-        run_dir.display()
-    );
+    failed_cases
+}
+
+struct ExecutionTrajectory<'a> {
+    markdown: &'a str,
+}
+
+impl Evaluatable for ExecutionTrajectory<'_> {
+    fn format_for_eval(&self) -> String {
+        self.markdown.to_string()
+    }
 }
 
 /// LlmClient implementation for md-testing using MLX/local LLM env vars.
@@ -400,10 +541,11 @@ async fn ensure_mlx_server() {
 
     // Check if server is already running
     if reqwest::Client::new()
-        .get(format!("{}/v1/models", base_url.trim_end_matches('/')))
+        .get(format!("{}/models", base_url.trim_end_matches('/')))
         .send()
         .await
-        .is_ok()
+        .map(|response| response.status().is_success())
+        .unwrap_or(false)
     {
         return;
     }
@@ -412,16 +554,11 @@ async fn ensure_mlx_server() {
 
     let model = std::env::var("MD_TESTING_LLM_MODEL").expect("MD_TESTING_LLM_MODEL must be set");
 
-    let port = base_url
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split(':')
-        .nth(1)
-        .unwrap_or("8080");
+    let port = mlx_server_port(&base_url);
 
     // Start MLX server in background (don't store Child so it outlives the test)
     let mut cmd = std::process::Command::new("python3.11");
-    cmd.args(["-m", "mlx_lm.server", "--model", &model, "--port", port])
+    cmd.args(["-m", "mlx_lm.server", "--model", &model, "--port", &port])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
@@ -433,10 +570,11 @@ async fn ensure_mlx_server() {
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         if client
-            .get(format!("{}/v1/models", base_url.trim_end_matches('/')))
+            .get(format!("{}/models", base_url.trim_end_matches('/')))
             .send()
             .await
-            .is_ok()
+            .map(|response| response.status().is_success())
+            .unwrap_or(false)
         {
             println!("MLX server ready");
             break;
@@ -446,6 +584,17 @@ async fn ensure_mlx_server() {
             panic!("MLX server failed to start within 60 seconds");
         }
     }
+}
+
+fn mlx_server_port(base_url: &str) -> String {
+    let without_scheme = base_url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
+    authority
+        .rsplit_once(':')
+        .map(|(_, port)| port.to_string())
+        .unwrap_or_else(|| "8080".to_string())
 }
 
 /// Count assistant messages in a session JSONL file.

@@ -34,12 +34,33 @@ pub struct ChatMessage {
 
 /// Build an OpenAI-compatible chat request JSON string.
 pub fn build_request_json(model: &str, messages: &[ChatMessage], temperature: f64) -> String {
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
         "temperature": temperature,
-    })
-    .to_string()
+    });
+
+    if let Some(max_tokens) = configured_max_tokens() {
+        body["max_tokens"] = serde_json::json!(max_tokens);
+    }
+
+    if configured_disable_thinking() {
+        body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": false });
+    }
+
+    body.to_string()
+}
+
+fn configured_max_tokens() -> Option<u64> {
+    std::env::var("MD_TESTING_LLM_MAX_TOKENS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+fn configured_disable_thinking() -> bool {
+    std::env::var("MD_TESTING_LLM_DISABLE_THINKING")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 /// Parse an OpenAI-compatible chat response and extract assistant text.

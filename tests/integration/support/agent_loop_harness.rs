@@ -19,6 +19,11 @@ pub struct AgentLoopHarness {
     _handle: tokio::task::JoinHandle<()>,
 }
 
+pub struct MessageExchange {
+    pub outputs: Vec<LoopOutput>,
+    pub failure_reason: Option<String>,
+}
+
 impl AgentLoopHarness {
     pub async fn new(system_prompt: &str, session_path: PathBuf) -> Self {
         let client = Arc::new(MoonshotClient::from_env());
@@ -68,7 +73,7 @@ impl AgentLoopHarness {
 
     /// Send a user message and collect all `LoopOutput` responses
     /// until `is_final == true` or the timeout expires.
-    pub async fn send_message(&self, text: &str, timeout: Duration) -> Vec<LoopOutput> {
+    pub async fn send_message(&self, text: &str, timeout: Duration) -> MessageExchange {
         let (reply_tx, mut reply_rx) = mpsc::channel::<LoopOutput>(32);
 
         let event = LoopEvent::UserMessage {
@@ -86,6 +91,7 @@ impl AgentLoopHarness {
 
         let mut responses = Vec::new();
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut failure_reason = None;
 
         loop {
             match tokio::time::timeout_at(deadline, reply_rx.recv()).await {
@@ -96,12 +102,25 @@ impl AgentLoopHarness {
                         break;
                     }
                 }
-                Ok(None) => break,
-                Err(_) => break,
+                Ok(None) => {
+                    failure_reason =
+                        Some("Reply channel closed before a final assistant response".to_string());
+                    break;
+                }
+                Err(_) => {
+                    failure_reason = Some(format!(
+                        "Timed out after {} second(s) waiting for a final assistant response",
+                        timeout.as_secs()
+                    ));
+                    break;
+                }
             }
         }
 
-        responses
+        MessageExchange {
+            outputs: responses,
+            failure_reason,
+        }
     }
 
     /// Send multiple user messages as a batch.  All but the last message are
@@ -112,7 +131,7 @@ impl AgentLoopHarness {
         &self,
         messages: &[String],
         timeout: Duration,
-    ) -> Vec<LoopOutput> {
+    ) -> MessageExchange {
         assert!(
             !messages.is_empty(),
             "batch must contain at least one message"

@@ -39,8 +39,7 @@ pub enum AssertionScope {
 
 impl TestResults {
     pub fn write(&self, path: &Path) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)
+        crate::execution::write_json_atomically(path, self)
     }
 
     pub fn read(path: &Path) -> std::io::Result<Self> {

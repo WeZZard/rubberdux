@@ -1,5 +1,6 @@
 pub mod discovery;
 pub mod evaluator;
+pub mod execution;
 pub mod format;
 pub mod guidance;
 pub mod lines;
@@ -12,6 +13,10 @@ pub mod results;
 
 pub use discovery::discover_cases;
 pub use evaluator::{AssertionEvaluator, Evaluatable, EvaluationResult};
+pub use execution::{
+    AssistantSlotArtifact, ExchangeFailure, ExecutionArtifact, write_json_atomically,
+    write_text_atomically,
+};
 pub use format::render_agent_input;
 pub use lines::{
     AssertionLine, find_assistant_heading_lines, find_heading_line, find_user_heading_lines,
