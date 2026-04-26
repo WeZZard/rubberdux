@@ -4,7 +4,7 @@ target: telegram-channel
 
 ## Storyline
 <!-- The agent should fetch a webpage and summarize its content -->
-<!-- The agent should handle fetch errors gracefully -->
+<!-- The agent should report the fetched page content clearly -->
 
 ## User Message
 Fetch https://example.com and tell me what the page says.

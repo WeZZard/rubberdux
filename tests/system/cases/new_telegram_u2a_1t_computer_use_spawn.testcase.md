@@ -14,7 +14,4 @@ Use a computer-use agent to run "echo hello_from_child" and report the result.
 <!-- The assistant should dispatch a computer_use subagent -->
 
 ## Assistant Message
-<!-- The assistant should report the subagent's execution result to the user -->
-
-## Assistant Message
-<!-- The assistant should confirm the subagent completed the requested task -->
+<!-- The assistant should report the subagent's execution result to the user and include hello_from_child -->

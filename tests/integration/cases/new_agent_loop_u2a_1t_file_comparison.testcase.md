@@ -11,7 +11,7 @@ target: agent-loop
 Create two files /tmp/test_cmp_a.txt with "hello" and /tmp/test_cmp_b.txt with "world", then compare them.
 
 ## Assistant Message
-<!-- The assistant should create both files -->
+<!-- The assistant should initiate creating both files with an appropriate tool -->
 
 ## Assistant Message
 <!-- The assistant should compare the files and report differences -->

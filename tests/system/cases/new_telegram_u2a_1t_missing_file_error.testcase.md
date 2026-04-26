@@ -10,5 +10,8 @@ target: telegram-channel
 Read the file at /tmp/nonexistent_file_12345.txt and tell me its contents.
 
 ## Assistant Message
+<!-- The assistant should attempt to read the requested file with an appropriate tool -->
+
+## Assistant Message
 <!-- The assistant should report that the file does not exist -->
 <!-- The assistant should not hallucinate file contents -->

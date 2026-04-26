@@ -13,12 +13,16 @@ use md_testing::{Message, OrderingDirective, UserContent};
 
 use super::agent_loop_harness::AgentLoopHarness;
 
+const LLM_AUTO_START_ENV: &str = "MD_TESTING_LLM_AUTO_START";
+
 /// Run all integration test cases from the given directory.
 /// Only runs cases with `target: agent-loop`.
 pub async fn run() {
     dotenvy::dotenv().ok();
 
-    ensure_mlx_server().await;
+    ensure_llm_service()
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
 
     let llm = MlxLlmClient::from_env();
     let model = std::env::var("MD_TESTING_LLM_MODEL").expect("MD_TESTING_LLM_MODEL must be set");
@@ -218,15 +222,15 @@ async fn evaluate_execution_artifacts(
     let evaluator = AssertionEvaluator::new(llm.clone())
         .with_model(model)
         .with_consistency_votes(1);
-    let mut artifacts: Vec<ExecutionArtifact> = execution_paths
-        .iter()
-        .map(|path| ExecutionArtifact::read(path).expect("failed to read execution.json"))
-        .collect();
-    artifacts.sort_by(|a, b| a.testcase_name.cmp(&b.testcase_name));
+    let mut execution_paths = execution_paths.to_vec();
+    execution_paths
+        .sort_by(|a, b| case_name_from_execution_path(a).cmp(&case_name_from_execution_path(b)));
 
     let mut failed_cases: Vec<String> = Vec::new();
 
-    for artifact in artifacts {
+    for execution_path in execution_paths {
+        let artifact =
+            ExecutionArtifact::read(&execution_path).expect("failed to read execution.json");
         println!(
             "\n=== Evaluating case: {} (agent-loop) ===",
             artifact.testcase_name
@@ -442,6 +446,14 @@ async fn evaluate_execution_artifacts(
     failed_cases
 }
 
+fn case_name_from_execution_path(path: &Path) -> String {
+    path.parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn append_evaluation_timing(output: &mut String, result: &md_testing::EvaluationResult) {
     if result.llm_calls > 0 {
         output.push_str(&format!(
@@ -568,6 +580,22 @@ impl MlxLlmClient {
     fn auth_header(&self) -> String {
         format!("Bearer {}", self.api_key)
     }
+
+    async fn post_chat(&self, url: &str, auth: &str, body: &str) -> Result<String, LlmError> {
+        let response = self
+            .http
+            .post(url)
+            .header("Authorization", auth)
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| LlmError::Request(e.to_string()))?
+            .text()
+            .await
+            .map_err(|e| LlmError::Request(e.to_string()))?;
+        Ok(response)
+    }
 }
 
 impl LlmClient for MlxLlmClient {
@@ -578,19 +606,29 @@ impl LlmClient for MlxLlmClient {
         let url = self.url("/chat/completions");
         let auth = self.auth_header();
         Box::pin(async move {
-            let response = self
-                .http
-                .post(&url)
-                .header("Authorization", auth)
-                .header("Content-Type", "application/json")
-                .body(body)
-                .send()
-                .await
-                .map_err(|e| LlmError::Request(e.to_string()))?
-                .text()
-                .await
-                .map_err(|e| LlmError::Request(e.to_string()))?;
-            Ok(response)
+            match self.post_chat(&url, &auth, &body).await {
+                Ok(response) => Ok(response),
+                Err(first_error) => {
+                    println!(
+                        "Evaluator request failed; checking service and retrying: {}",
+                        first_error
+                    );
+                    ensure_llm_service().await.map_err(|service_error| {
+                        LlmError::Request(format!(
+                            "{}; evaluator service unavailable before retry: {}",
+                            first_error, service_error
+                        ))
+                    })?;
+                    self.post_chat(&url, &auth, &body)
+                        .await
+                        .map_err(|retry_error| {
+                            LlmError::Request(format!(
+                                "{}; retry after evaluator service check failed: {}",
+                                first_error, retry_error
+                            ))
+                        })
+                }
+            }
         })
     }
 }
@@ -602,56 +640,67 @@ fn build_system_prompt() -> String {
     rubberdux::hardened_prompts::compose_system_prompt(&parts, None)
 }
 
-/// Check if MLX server is running, start it if not.
-async fn ensure_mlx_server() {
+async fn ensure_llm_service() -> Result<(), String> {
     let base_url =
         std::env::var("MD_TESTING_LLM_BASE_URL").expect("MD_TESTING_LLM_BASE_URL must be set");
 
-    // Check if server is already running
-    if reqwest::Client::new()
-        .get(format!("{}/models", base_url.trim_end_matches('/')))
-        .send()
-        .await
-        .map(|response| response.status().is_success())
-        .unwrap_or(false)
-    {
-        return;
+    if llm_service_is_available(&base_url).await {
+        return Ok(());
     }
 
-    println!("MLX server not running, starting it...");
+    if !llm_auto_start_enabled() {
+        return Err(format!(
+            "md-testing LLM service is unavailable at {}. Start an OpenAI-compatible service externally, or set {}=true to let the test runner start mlx_lm.server.",
+            base_url, LLM_AUTO_START_ENV
+        ));
+    }
+
+    println!("LLM service not running, starting managed mlx_lm.server...");
 
     let model = std::env::var("MD_TESTING_LLM_MODEL").expect("MD_TESTING_LLM_MODEL must be set");
 
     let port = mlx_server_port(&base_url);
 
-    // Start MLX server in background (don't store Child so it outlives the test)
     let mut cmd = std::process::Command::new("python3.11");
     cmd.args(["-m", "mlx_lm.server", "--model", &model, "--port", &port])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    let _ = cmd.spawn().expect("Failed to start MLX server");
+    let _ = cmd
+        .spawn()
+        .map_err(|error| format!("Failed to start managed LLM service: {error}"))?;
 
-    // Wait for server to be ready
-    let client = reqwest::Client::new();
     let mut attempts = 0;
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        if client
-            .get(format!("{}/models", base_url.trim_end_matches('/')))
-            .send()
-            .await
-            .map(|response| response.status().is_success())
-            .unwrap_or(false)
-        {
-            println!("MLX server ready");
-            break;
+        if llm_service_is_available(&base_url).await {
+            println!("LLM service ready");
+            return Ok(());
         }
         attempts += 1;
         if attempts > 60 {
-            panic!("MLX server failed to start within 60 seconds");
+            return Err("Managed LLM service failed to start within 60 seconds".to_string());
         }
     }
+}
+
+async fn llm_service_is_available(base_url: &str) -> bool {
+    reqwest::Client::new()
+        .get(format!("{}/models", base_url.trim_end_matches('/')))
+        .send()
+        .await
+        .map(|response| response.status().is_success())
+        .unwrap_or(false)
+}
+
+fn llm_auto_start_enabled() -> bool {
+    std::env::var(LLM_AUTO_START_ENV)
+        .map(|value| env_truthy(&value))
+        .unwrap_or(false)
+}
+
+fn env_truthy(value: &str) -> bool {
+    matches!(value, "1" | "true" | "TRUE" | "yes" | "YES")
 }
 
 fn mlx_server_port(base_url: &str) -> String {

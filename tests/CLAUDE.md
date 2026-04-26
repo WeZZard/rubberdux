@@ -37,3 +37,9 @@ tests/results/
 
 ### Exemptions
 - Unit tests (inline `#[cfg(test)]` mod tests) are exempt — they test isolated functions
+
+## Testcase Evaluator Service
+
+- Testcase runners use `MD_TESTING_LLM_BASE_URL`, `MD_TESTING_LLM_API_KEY`, and `MD_TESTING_LLM_MODEL` for an OpenAI-compatible evaluator service.
+- The evaluator service is external-first: start it outside the test runner when possible.
+- Set `MD_TESTING_LLM_AUTO_START=true` only when the runner should start the local `mlx_lm.server` fallback itself.

@@ -1,5 +1,6 @@
 ---
 target: telegram-channel
+timeout: 240
 ---
 
 ## Storyline
@@ -7,7 +8,10 @@ target: telegram-channel
 <!-- The agent should dispatch a plan subagent -->
 
 ## User Message
-Create a plan for implementing a REST API in Rust.
+Use a plan subagent to propose three concise steps for adding a tiny `/health` REST endpoint in Rust, then report the three steps.
 
 ## Assistant Message
 <!-- The assistant should dispatch a plan subagent -->
+
+## Assistant Message
+<!-- The assistant should present the concise three-step plan produced by the subagent to the user -->

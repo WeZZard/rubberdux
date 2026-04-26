@@ -11,3 +11,6 @@ Use a general-purpose agent to write a haiku about coding.
 
 ## Assistant Message
 <!-- The assistant should dispatch a general purpose subagent -->
+
+## Assistant Message
+<!-- The assistant should present the haiku produced by the subagent to the user -->

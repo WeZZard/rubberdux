@@ -11,7 +11,7 @@ target: telegram-channel
 Create /tmp/test_checksum.txt with "checksum test" and compute its SHA-256 checksum.
 
 ## Assistant Message
-<!-- The assistant should create the file -->
+<!-- The assistant should start creating the file and computing its checksum with an appropriate tool -->
 
 ## Assistant Message
 <!-- The assistant should compute and report the SHA-256 checksum result -->

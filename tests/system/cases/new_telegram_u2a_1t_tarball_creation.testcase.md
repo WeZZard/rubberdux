@@ -10,5 +10,7 @@ target: telegram-channel
 Create a tarball /tmp/test_archive.tar.gz containing /tmp/test_archive_dir with a file inside.
 
 ## Assistant Message
-<!-- The assistant should create the directory and file -->
+<!-- The assistant should start creating the directory, file, and tarball with an appropriate tool -->
+
+## Assistant Message
 <!-- The assistant should create the tarball and confirm -->

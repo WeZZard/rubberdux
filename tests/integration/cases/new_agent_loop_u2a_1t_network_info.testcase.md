@@ -10,7 +10,7 @@ target: agent-loop
 What is the IP address of this machine?
 
 ## Assistant Message
-<!-- The assistant should report the IP address -->
+<!-- The assistant should use a tool to get the actual IP address -->
 
 ## Assistant Message
-<!-- The assistant should use a tool to get the actual IP -->
+<!-- The assistant should report the IP address to the user -->

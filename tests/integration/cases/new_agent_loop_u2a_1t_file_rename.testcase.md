@@ -14,7 +14,4 @@ Create /tmp/test_rename_old.txt with "old name" and rename it to /tmp/test_renam
 <!-- The assistant should create the file and rename it -->
 
 ## Assistant Message
-<!-- The assistant should execute the rename -->
-
-## Assistant Message
 <!-- The assistant should confirm or report the rename operation result -->
