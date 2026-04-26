@@ -349,15 +349,12 @@ async fn evaluate_execution_artifacts(
         // User-message exchange failures
         let user_lines = md_testing::find_user_heading_lines(case_content);
         for failure in &artifact.exchange_failures {
+            let (scope, line, assertion) =
+                exchange_failure_diagnostic(case_content, &user_lines, failure);
             results_assertions.push(md_testing::AssertionResult {
-                scope: md_testing::AssertionScope::UserMessage {
-                    msg_index: failure.user_message_index,
-                },
-                line: user_lines
-                    .get(failure.user_message_index)
-                    .copied()
-                    .unwrap_or(1),
-                assertion: "Message exchange completed with a final assistant response".to_string(),
+                scope,
+                line,
+                assertion,
                 passed: false,
                 reasoning: failure.reason.clone(),
                 evaluation_duration_ms: None,
@@ -465,6 +462,38 @@ fn evaluation_duration_ms(result: &md_testing::EvaluationResult) -> Option<u64> 
 
 fn evaluator_call_count(result: &md_testing::EvaluationResult) -> Option<usize> {
     (result.llm_calls > 0).then_some(result.llm_calls)
+}
+
+fn exchange_failure_diagnostic(
+    case_content: &str,
+    user_lines: &[usize],
+    failure: &ExchangeFailure,
+) -> (md_testing::AssertionScope, usize, String) {
+    if is_timeout_failure(&failure.reason) {
+        return (
+            md_testing::AssertionScope::FrontMatter {
+                key: "timeout".to_string(),
+            },
+            md_testing::find_front_matter_key_line(case_content, "timeout").unwrap_or(1),
+            "Message exchange completed before the configured timeout".to_string(),
+        );
+    }
+
+    (
+        md_testing::AssertionScope::UserMessage {
+            msg_index: failure.user_message_index,
+        },
+        user_lines
+            .get(failure.user_message_index)
+            .copied()
+            .unwrap_or(1),
+        "Message exchange completed with a final assistant response".to_string(),
+    )
+}
+
+fn is_timeout_failure(reason: &str) -> bool {
+    reason.starts_with("Timed out after ")
+        && reason.contains("waiting for a final assistant response")
 }
 
 struct ExecutionTrajectory<'a> {

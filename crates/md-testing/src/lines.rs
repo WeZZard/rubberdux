@@ -115,6 +115,29 @@ pub fn find_heading_line(content: &str, heading: &str) -> Option<usize> {
         .map(|(i, _)| i + 1)
 }
 
+/// Find the 1-based line number of a front-matter key.
+pub fn find_front_matter_key_line(content: &str, key: &str) -> Option<usize> {
+    let mut lines = content.lines().enumerate();
+    if lines.next()?.1.trim() != "---" {
+        return None;
+    }
+
+    for (index, line) in lines {
+        let trimmed = line.trim_start();
+        if trimmed == "---" {
+            return None;
+        }
+        if trimmed
+            .split_once(':')
+            .is_some_and(|(candidate, _)| candidate.trim() == key)
+        {
+            return Some(index + 1);
+        }
+    }
+
+    None
+}
+
 /// Find the 1-based line numbers of all assistant message headings.
 pub fn find_assistant_heading_lines(content: &str) -> Vec<usize> {
     content
@@ -194,5 +217,22 @@ Hello
         assert_eq!(find_heading_line(content, "Storyline"), Some(1));
         assert_eq!(find_heading_line(content, "User Message"), Some(3));
         assert_eq!(find_heading_line(content, "Assistant Message"), Some(5));
+    }
+
+    #[test]
+    fn test_find_front_matter_key_line() {
+        let content = "---\ntimeout : 120\ntarget: agent-loop\n---\n\n## Storyline\n";
+
+        assert_eq!(find_front_matter_key_line(content, "timeout"), Some(2));
+        assert_eq!(find_front_matter_key_line(content, "target"), Some(3));
+        assert_eq!(find_front_matter_key_line(content, "missing"), None);
+    }
+
+    #[test]
+    fn test_find_front_matter_key_line_without_front_matter() {
+        assert_eq!(
+            find_front_matter_key_line("## Storyline\n", "timeout"),
+            None
+        );
     }
 }

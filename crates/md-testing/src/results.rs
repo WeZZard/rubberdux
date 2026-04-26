@@ -30,6 +30,9 @@ pub struct AssertionResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AssertionScope {
+    FrontMatter {
+        key: String,
+    },
     Storyline,
     UserMessage {
         msg_index: usize,

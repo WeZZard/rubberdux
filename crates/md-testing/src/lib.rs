@@ -19,8 +19,8 @@ pub use execution::{
 };
 pub use format::render_agent_input;
 pub use lines::{
-    AssertionLine, find_assistant_heading_lines, find_heading_line, find_user_heading_lines,
-    map_assertion_lines,
+    AssertionLine, find_assistant_heading_lines, find_front_matter_key_line, find_heading_line,
+    find_user_heading_lines, map_assertion_lines,
 };
 pub use linter::{LintError, lint};
 pub use llm::{ChatMessage, LlmClient, LlmError};

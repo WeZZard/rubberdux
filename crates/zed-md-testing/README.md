@@ -71,7 +71,7 @@ To see assertion pass/fail indicators inline, enable inline diagnostics in Zed:
 cargo test --test telegram_channel_agent
 ```
 
-Results are written to `tests/results/<run_id>/<case>/results.json`. The LSP automatically picks them up.
+Results are written to `tests/results/<run_id>/<suite>/<case>/results.json`. The LSP automatically picks them up.
 
 ## Architecture
 
@@ -104,7 +104,7 @@ make clean
 ## How It Works
 
 1. When you open a `.testcase.md` file, the LSP server starts
-2. The LSP reads the latest test results from `tests/results/<run_id>/<case>/results.json`
+2. The LSP reads the latest test results from `tests/results/<run_id>/<suite>/<case>/results.json`
 3. It publishes diagnostics at the line numbers of each assertion
 4. Zed renders these as inline hints and underlines
 

@@ -33,6 +33,7 @@ pub fn build_icon_diagnostic(assertion: &AssertionResult, results: &TestResults)
     };
 
     let code = match &assertion.scope {
+        AssertionScope::FrontMatter { key } => Some(format!("front-matter-{}", key)),
         AssertionScope::Storyline => Some("storyline".to_string()),
         AssertionScope::UserMessage { msg_index } => Some(format!("user-msg-{}", msg_index)),
         AssertionScope::AssistantMessage { slot_index, .. } => {

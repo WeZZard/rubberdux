@@ -84,34 +84,10 @@ impl ResultsStore {
 
         run_dirs.sort();
 
-        // For each run directory, load results.json files
+        // For each run directory, load results.json files from both the old
+        // flat layout and the current suite-scoped layout.
         for run_dir in run_dirs {
-            let _run_id = run_dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-
-            let entries = match std::fs::read_dir(&run_dir) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            for entry in entries {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-                let case_dir = entry.path();
-                if !case_dir.is_dir() {
-                    continue;
-                }
-
-                let results_json = case_dir.join("results.json");
-                if !results_json.exists() {
-                    continue;
-                }
-
+            for results_json in result_files(&run_dir) {
                 match TestResults::read(&results_json) {
                     Ok(test_results) => {
                         let case_name = test_results.testcase_name.clone();
@@ -139,4 +115,40 @@ impl ResultsStore {
     pub async fn get_results(&self, case_name: &str) -> Option<TestResults> {
         self.results.read().await.get(case_name).cloned()
     }
+}
+
+fn result_files(run_dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+
+    let entries = match std::fs::read_dir(run_dir) {
+        Ok(entries) => entries,
+        Err(_) => return files,
+    };
+
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let direct_result = path.join("results.json");
+        if direct_result.exists() {
+            files.push(direct_result);
+            continue;
+        }
+
+        let suite_entries = match std::fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        files.extend(
+            suite_entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path().join("results.json"))
+                .filter(|path| path.exists()),
+        );
+    }
+
+    files
 }

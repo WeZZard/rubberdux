@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use md_testing::{TestResults, lint};
+use md_testing::{AssertionScope, TestResults, lint};
 use tower_lsp::lsp_types::*;
 
 use crate::code_actions::build_icon_diagnostic;
@@ -71,11 +71,16 @@ fn build_result_diagnostics(content: &str, results: &TestResults) -> Vec<Diagnos
 
     for assertion in &results.assertions {
         // Try to find the current line number by matching assertion text
-        let line = current_lines
-            .iter()
-            .find(|l| l.assertion == assertion.assertion)
-            .map(|l| l.line)
-            .unwrap_or(assertion.line);
+        let line = match &assertion.scope {
+            AssertionScope::FrontMatter { key } => {
+                md_testing::find_front_matter_key_line(content, key).unwrap_or(assertion.line)
+            }
+            _ => current_lines
+                .iter()
+                .find(|l| l.assertion == assertion.assertion)
+                .map(|l| l.line)
+                .unwrap_or(assertion.line),
+        };
 
         let mut assertion = assertion.clone();
         assertion.line = line;
