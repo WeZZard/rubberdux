@@ -266,11 +266,13 @@ mod tests {
             parameters["properties"]["query"]["type"].as_str(),
             Some("string")
         );
-        assert!(parameters["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value.as_str() == Some("query")));
+        assert!(
+            parameters["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("query"))
+        );
     }
 
     #[test]
@@ -411,7 +413,9 @@ mod tests {
                 assert!(is_error);
                 assert_eq!(content, "Web search failed: missing search query");
             }
-            ToolOutcome::Background { .. } => panic!("missing query must not start background work"),
+            ToolOutcome::Background { .. } => {
+                panic!("missing query must not start background work")
+            }
             ToolOutcome::Subagent { .. } => panic!("missing query must not start a subagent"),
         }
     }

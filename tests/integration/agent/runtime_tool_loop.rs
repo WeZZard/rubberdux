@@ -1122,8 +1122,5 @@ async fn test_web_search_tool_via_registry() {
         first_request["tools"][0]["function"]["name"].as_str(),
         Some("$web_search")
     );
-    assert_eq!(
-        first_request["thinking"]["type"].as_str(),
-        Some("disabled")
-    );
+    assert_eq!(first_request["thinking"]["type"].as_str(), Some("disabled"));
 }

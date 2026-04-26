@@ -1,8 +1,9 @@
 use std::path::Path;
 
-use md_testing::{AssertionScope, TestResults, lint};
+use md_testing::{TestResults, lint};
 use tower_lsp::lsp_types::*;
 
+use crate::code_actions::build_icon_diagnostic;
 use crate::results::ResultsStore;
 
 /// Build LSP diagnostics for a testcase.md file.
@@ -58,45 +59,27 @@ fn build_lint_diagnostics(content: &str) -> Vec<Diagnostic> {
     diagnostics
 }
 
-fn build_result_diagnostics(_content: &str, results: &TestResults) -> Vec<Diagnostic> {
+fn build_result_diagnostics(content: &str, results: &TestResults) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
+    // Re-parse current content to get updated line numbers
+    let current_lines = if let Ok(test_case) = md_testing::parser::parse(content, "") {
+        md_testing::map_assertion_lines(content, &test_case)
+    } else {
+        Vec::new()
+    };
+
     for assertion in &results.assertions {
-        let line = (assertion.line.saturating_sub(1)) as u32;
-        let range = Range {
-            start: Position { line, character: 0 },
-            end: Position { line, character: 0 },
-        };
+        // Try to find the current line number by matching assertion text
+        let line = current_lines
+            .iter()
+            .find(|l| l.assertion == assertion.assertion)
+            .map(|l| l.line)
+            .unwrap_or(assertion.line);
 
-        let (severity, prefix) = if assertion.passed {
-            (DiagnosticSeverity::HINT, "✓ Pass")
-        } else {
-            (DiagnosticSeverity::ERROR, "✗ Fail")
-        };
-
-        let message = if assertion.passed {
-            format!("{}: {}", prefix, assertion.assertion)
-        } else {
-            format!("{}: {}", prefix, assertion.reasoning)
-        };
-
-        let code = match &assertion.scope {
-            AssertionScope::Storyline => Some("storyline".to_string()),
-            AssertionScope::UserMessage { msg_index } => Some(format!("user-msg-{}", msg_index)),
-            AssertionScope::AssistantMessage { slot_index, .. } => {
-                Some(format!("assistant-msg-{}", slot_index))
-            }
-            AssertionScope::OrderingMatch => Some("ordering".to_string()),
-        };
-
-        diagnostics.push(Diagnostic {
-            range,
-            severity: Some(severity),
-            code: code.map(NumberOrString::String),
-            source: Some("md-testing".to_string()),
-            message,
-            ..Default::default()
-        });
+        let mut assertion = assertion.clone();
+        assertion.line = line;
+        diagnostics.push(build_icon_diagnostic(&assertion, results));
     }
 
     diagnostics

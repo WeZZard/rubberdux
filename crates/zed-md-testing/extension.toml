@@ -11,5 +11,5 @@ name = "md-testing-lsp"
 languages = ["Test Case Markdown"]
 
 [grammars.markdown]
-repository = "https://github.com/tree-sitter-grammars/tree-sitter-markdown"
-rev = "192981678e0ca9d1ea7459f606ad1e9310d9e4f9"
+repository = "https://github.com/tree-sitter-grammars/tree-sitter-markdown.git"
+rev = "f969cd3ae3f9fbd4e43205431d0ae286014c05b5"

@@ -18,7 +18,7 @@ Zed extension that provides LSP support for `*.testcase.md` files used by the md
 ## Quick Start (One Command)
 
 ```bash
-cd ide-support/zed-md-testing
+cd crates/zed-md-testing
 make dev
 ```
 
@@ -31,7 +31,7 @@ This will:
 Then in Zed:
 1. Open the command palette (`Cmd+Shift+P`)
 2. Run: `extensions: install dev extension`
-3. Select: `ide-support/zed-md-testing/`
+3. Select: `crates/zed-md-testing/`
 
 ## Manual Setup
 
@@ -47,6 +47,31 @@ export PATH="$HOME/.cargo/bin:$PATH"
 
 # Then reload your shell and try again
 ```
+
+## Usage
+
+### Enable Inline Diagnostics (Required)
+
+To see assertion pass/fail indicators inline, enable inline diagnostics in Zed:
+
+```json
+// ~/.config/zed/settings.json
+{
+  "diagnostics": {
+    "inline": {
+      "enabled": true
+    }
+  }
+}
+```
+
+### Run Tests
+
+```bash
+cargo test --test telegram_channel_agent
+```
+
+Results are written to `tests/results/<run_id>/<case>/results.json`. The LSP automatically picks them up.
 
 ## Architecture
 

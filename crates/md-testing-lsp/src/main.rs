@@ -1,16 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use md_testing_lsp::diagnostics::build_diagnostics;
+use md_testing_lsp::results::ResultsStore;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
-
-mod diagnostics;
-mod results;
-
-use diagnostics::build_diagnostics;
-use results::ResultsStore;
 
 #[derive(Debug)]
 struct MdTestingLsp {
@@ -21,7 +17,17 @@ struct MdTestingLsp {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for MdTestingLsp {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // Initialize results store with workspace root
+        if let Some(workspace) = params
+            .workspace_folders
+            .and_then(|folders| folders.first().cloned())
+        {
+            self.results_store.init(workspace.uri.path().as_ref()).await;
+        } else if let Some(root) = params.root_uri {
+            self.results_store.init(root.path().as_ref()).await;
+        }
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(

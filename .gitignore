@@ -4,7 +4,8 @@
 /test_results
 /vm-shares
 tests/results/
-ide-support/zed-md-testing/target/
+crates/zed-md-testing/target/
+crates/zed-md-testing/grammars/
 *.wasm
 Cargo.lock
 
