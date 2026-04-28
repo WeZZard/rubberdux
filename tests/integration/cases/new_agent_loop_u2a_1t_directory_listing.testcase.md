@@ -3,7 +3,7 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a summary of a directory structure -->
+<!-- The agent should handle a user asking to list a directory structure -->
 <!-- The agent should use glob or bash to list files -->
 
 ## User Message

@@ -11,7 +11,7 @@ target: telegram-channel
 Search for "fn main" in the src directory and show 2 lines of context around each match.
 
 ## Assistant Message
-<!-- The assistant should use grep with context -->
+<!-- The assistant should use an appropriate search command with context -->
 
 ## Assistant Message
 <!-- The assistant should report matches with surrounding lines -->

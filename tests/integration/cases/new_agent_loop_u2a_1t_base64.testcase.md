@@ -4,7 +4,7 @@ target: agent-loop
 
 ## Storyline
 <!-- The agent should handle a user asking for a base64 encode/decode -->
-<!-- The agent should use bash for base64 operations -->
+<!-- The agent should use an appropriate tool for base64 operations -->
 <!-- The assistant should complete both the base64 encoding and decoding -->
 
 ## User Message

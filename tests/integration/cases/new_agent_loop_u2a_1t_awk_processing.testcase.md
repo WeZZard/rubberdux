@@ -10,7 +10,7 @@ target: agent-loop
 Create /tmp/test_awk.txt with "1 apple\n2 banana\n3 cherry" and use awk to print the second column.
 
 ## Assistant Message
-<!-- The assistant should create the file -->
+<!-- The assistant should create the file before processing it -->
 
 ## Assistant Message
-<!-- The assistant should use awk to print the second column -->
+<!-- The assistant should report the second-column output -->

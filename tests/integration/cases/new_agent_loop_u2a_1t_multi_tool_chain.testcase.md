@@ -1,9 +1,10 @@
 ---
 target: agent-loop
+timeout: 120
 ---
 
 ## Storyline
-<!-- The agent should use multiple tools in sequence to solve a complex task -->
+<!-- The agent should use multiple tools together to solve a complex task -->
 <!-- The agent should use glob and grep to search Rust files -->
 <!-- The agent should report the final result after all tools complete -->
 

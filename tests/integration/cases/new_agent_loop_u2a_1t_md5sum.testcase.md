@@ -11,7 +11,7 @@ target: agent-loop
 Create /tmp/test_md5.txt with "md5 test" and compute its MD5 checksum.
 
 ## Assistant Message
-<!-- The assistant should create the file and compute md5sum -->
+<!-- The assistant should create the file before computing the checksum -->
 
 ## Assistant Message
 <!-- The assistant should report the MD5 checksum -->

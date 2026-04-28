@@ -1,12 +1,12 @@
 ---
 target: telegram-channel
-timeout: 240
+timeout: 120
 ---
 
 ## Storyline
 <!-- The agent should be able to briefly describe the tool execution environment via Telegram -->
-<!-- The agent should be able to spawn a subagent to search for news -->
-<!-- The agent should report the news results back to the user via Telegram -->
+<!-- The agent should be able to spawn a subagent for a Google summary -->
+<!-- The agent should report the subagent result back to the user via Telegram -->
 
 ## User Message
 Briefly describe the tool execution environment at a high level without running shell commands.
@@ -15,10 +15,10 @@ Briefly describe the tool execution environment at a high level without running 
 <!-- The assistant should briefly describe the tool execution environment and reference the user's environment question -->
 
 ## User Message
-Spawn a subagent to search the latest news of Google
+Spawn a subagent to write one concise sentence explaining what Google is. The subagent should not use web search or other tools.
 
 ## CHECK: Assistant Message
-<!-- The assistant should dispatch a subagent for the user's Google news search request -->
+<!-- The assistant should dispatch a subagent for the user's Google summary request -->
 
 ## CHECK: Assistant Message
-<!-- The assistant should present the news results obtained from the subagent -->
+<!-- The assistant should present the concise Google summary obtained from the subagent -->

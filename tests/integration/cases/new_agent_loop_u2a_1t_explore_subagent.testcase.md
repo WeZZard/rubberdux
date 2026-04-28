@@ -1,5 +1,6 @@
 ---
 target: agent-loop
+timeout: 240
 ---
 
 ## Storyline

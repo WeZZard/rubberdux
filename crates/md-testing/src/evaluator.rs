@@ -18,6 +18,12 @@ pub struct EvaluationResult {
     pub llm_calls: usize,
 }
 
+impl EvaluationResult {
+    pub fn evaluator_failed(&self) -> bool {
+        self.llm_calls > 0 && !self.reasoning.starts_with("[Vote ")
+    }
+}
+
 /// Uses an LLM to judge whether a trajectory satisfies a natural-language assertion.
 pub struct AssertionEvaluator<C: LlmClient> {
     client: C,
@@ -537,5 +543,29 @@ mod tests {
 
         assert!(!passed);
         assert_eq!(reasoning, "Missing required output.");
+    }
+
+    #[test]
+    fn flags_evaluator_failure_without_votes() {
+        let result = super::EvaluationResult {
+            passed: false,
+            reasoning: "Evaluator LLM call failed after 1 ms: service unavailable".to_string(),
+            duration_ms: 1,
+            llm_calls: 1,
+        };
+
+        assert!(result.evaluator_failed());
+    }
+
+    #[test]
+    fn does_not_flag_normal_failed_vote() {
+        let result = super::EvaluationResult {
+            passed: false,
+            reasoning: "[Vote 1 in 10 ms] FAIL: Missing required output.".to_string(),
+            duration_ms: 10,
+            llm_calls: 1,
+        };
+
+        assert!(!result.evaluator_failed());
     }
 }

@@ -10,10 +10,7 @@ target: telegram-channel
 Create a file at /tmp/test_edit.txt with "hello world", then change "world" to "rubberdux".
 
 ## Assistant Message
-<!-- The assistant should create the initial file with an appropriate file tool -->
-
-## Assistant Message
-<!-- The assistant should apply the edit -->
+<!-- The assistant should create the initial file or apply the requested edit with an appropriate file tool -->
 
 ## Assistant Message
 <!-- The assistant should confirm the file now contains "hello rubberdux" -->

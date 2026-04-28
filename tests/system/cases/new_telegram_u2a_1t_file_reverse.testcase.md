@@ -11,7 +11,7 @@ target: telegram-channel
 Create /tmp/test_reverse.txt with "line1\nline2\nline3" and reverse the line order.
 
 ## Assistant Message
-<!-- The assistant should create the file and reverse the lines -->
+<!-- The assistant should create the file before reversing the lines -->
 
 ## Assistant Message
 <!-- The assistant should perform the reversal -->

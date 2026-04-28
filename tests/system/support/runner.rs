@@ -273,6 +273,7 @@ async fn evaluate_execution_artifacts(
 
         for assertion in &case.storyline {
             let result = evaluator.evaluate_storyline(&trajectory, assertion).await;
+            panic_on_evaluator_failure(&artifact.testcase_name, assertion, &result);
 
             eval_results.push_str(&format!("## Storyline: {}\n", assertion));
             eval_results.push_str(&format!("- Passed: {}\n", result.passed));
@@ -306,6 +307,7 @@ async fn evaluate_execution_artifacts(
                         llm_calls: 0,
                     }
                 };
+                panic_on_evaluator_failure(&artifact.testcase_name, assertion, &result);
                 eval_results.push_str(&format!(
                     "## Assistant Message {} (slot {}){}\n",
                     actual_idx
@@ -474,6 +476,19 @@ fn evaluation_duration_ms(result: &md_testing::EvaluationResult) -> Option<u64> 
 
 fn evaluator_call_count(result: &md_testing::EvaluationResult) -> Option<usize> {
     (result.llm_calls > 0).then_some(result.llm_calls)
+}
+
+fn panic_on_evaluator_failure(
+    testcase_name: &str,
+    assertion: &str,
+    result: &md_testing::EvaluationResult,
+) {
+    if result.evaluator_failed() {
+        panic!(
+            "Evaluator failed while judging case '{}' assertion '{}': {}",
+            testcase_name, assertion, result.reasoning
+        );
+    }
 }
 
 fn exchange_failure_diagnostic(

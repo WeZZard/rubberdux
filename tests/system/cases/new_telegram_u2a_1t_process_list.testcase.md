@@ -10,7 +10,7 @@ target: telegram-channel
 List the current running processes.
 
 ## Assistant Message
-<!-- The assistant should list running processes -->
+<!-- The assistant should use a tool to get the actual process list -->
 
 ## Assistant Message
-<!-- The assistant should use a tool to get the actual process list -->
+<!-- The assistant should list running processes for the user -->

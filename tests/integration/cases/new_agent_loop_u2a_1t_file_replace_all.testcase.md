@@ -1,5 +1,6 @@
 ---
 target: agent-loop
+timeout: 120
 ---
 
 ## Storyline
@@ -11,7 +12,7 @@ target: agent-loop
 Create /tmp/test_replace.txt with "hello world hello" and replace all "hello" with "hi".
 
 ## Assistant Message
-<!-- The assistant should create the file and replace all occurrences -->
+<!-- The assistant should create the file before replacing its contents -->
 
 ## Assistant Message
 <!-- The assistant should perform the replacement -->

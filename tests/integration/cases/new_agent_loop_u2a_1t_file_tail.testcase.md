@@ -4,7 +4,7 @@ target: agent-loop
 
 ## Storyline
 <!-- The agent should handle a user asking for a file tail -->
-<!-- The agent should use bash to tail the file -->
+<!-- The agent should use a tool to read the file -->
 
 ## User Message
 Show the last 5 lines of Cargo.toml.

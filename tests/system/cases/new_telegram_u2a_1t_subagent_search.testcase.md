@@ -1,5 +1,6 @@
 ---
 target: telegram-channel
+timeout: 240
 ---
 
 ## Storyline

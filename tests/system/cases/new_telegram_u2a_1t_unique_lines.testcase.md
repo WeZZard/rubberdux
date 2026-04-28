@@ -11,7 +11,7 @@ target: telegram-channel
 Create /tmp/test_unique.txt with "a\nb\na\nc\nb" and show only unique lines.
 
 ## Assistant Message
-<!-- The assistant should create the file and show unique lines -->
+<!-- The assistant should create the file before showing unique lines -->
 
 ## Assistant Message
 <!-- The assistant should report or confirm the unique lines -->
