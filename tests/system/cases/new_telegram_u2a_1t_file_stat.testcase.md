@@ -11,7 +11,12 @@ target: telegram-channel
 Get detailed information about Cargo.toml using stat.
 
 ## Assistant Message
-<!-- The assistant should use stat to get file info -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should report the file details -->
+```cel
+message.text.contains("Cargo") || message.text.contains("size") || message.text.contains("bytes")
+```

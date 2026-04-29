@@ -3,15 +3,19 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a file stat -->
-<!-- The agent should use bash stat to get file info -->
+<!-- The agent should use stat to get detailed file information -->
 
-<!-- The agent should report the file details -->
 ## User Message
 Get detailed information about Cargo.toml using stat.
 
 ## Assistant Message
-<!-- The assistant should use stat to get file info -->
+
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
-<!-- The assistant should report the file details -->
+
+```cel
+message.text.contains("Cargo.toml") || message.text.contains("size") || message.text.contains("modif")
+```

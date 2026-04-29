@@ -11,7 +11,11 @@ target: telegram-channel
 Create /tmp/test_json.json with '{"name": "test", "value": 42}' and read it back.
 
 ## Assistant Message
-<!-- The assistant should create the JSON file and read it back -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should report the JSON contents -->
+```cel
+message.text.contains("test") && message.text.contains("42")
+```

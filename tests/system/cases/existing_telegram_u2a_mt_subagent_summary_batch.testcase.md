@@ -19,3 +19,6 @@ Spawn a subagent to write one concise sentence explaining what Google is. The su
 
 ## CHECK: Assistant Message
 <!-- The assistant should present the concise Google summary obtained from the subagent -->
+```cel
+message.text.contains("Google") || message.text.contains("google")
+```

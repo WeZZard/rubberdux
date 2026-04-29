@@ -10,7 +10,9 @@ target: telegram-channel
 What is the current date and time?
 
 ## Assistant Message
-<!-- The assistant should use a tool to get the actual time -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should provide the current date and time -->

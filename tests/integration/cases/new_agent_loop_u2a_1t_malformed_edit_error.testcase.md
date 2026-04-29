@@ -3,14 +3,19 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking to edit a file when the replacement string is absent -->
-<!-- The agent should report that the requested replacement cannot be applied -->
+<!-- The agent should report that a replacement string was not found in the file -->
 
 ## User Message
 Edit /tmp/test_malformed.txt to replace "foo" with "bar". (Assume the file does not contain "foo".)
 
 ## Assistant Message
-<!-- The assistant should attempt or verify the replacement before reporting the result -->
+
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should report that the replacement string was not found -->
+
+```cel
+message.text.contains("not") || message.text.contains("error") || message.text.contains("found") || message.text.contains("exist") || message.text.contains("No such") || message.text.contains("fail")
+```

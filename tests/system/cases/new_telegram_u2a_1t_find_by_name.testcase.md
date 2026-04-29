@@ -11,7 +11,12 @@ target: telegram-channel
 Find all files named "*.rs" in the src directory using the find command.
 
 ## Assistant Message
-<!-- The assistant should use find to locate files -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should report the matching files -->
+```cel
+message.text.contains(".rs")
+```

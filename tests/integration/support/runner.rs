@@ -101,7 +101,7 @@ async fn execute_cases(
         let timeout = Duration::from_secs(case.front_matter.timeout.max(60));
 
         let mut user_messages: Vec<String> = Vec::new();
-        let mut assistant_slots: Vec<(OrderingDirective, Vec<String>)> = Vec::new();
+        let mut assistant_slots: Vec<(OrderingDirective, Vec<md_testing::Assertion>)> = Vec::new();
         let mut pending_user_batch: Vec<String> = Vec::new();
         let mut exchange_failures: Vec<ExchangeFailure> = Vec::new();
 
@@ -295,25 +295,60 @@ async fn evaluate_execution_artifacts(
             storyline_results.push((assertion.clone(), result));
         }
 
+        let session_path = run_dir
+            .join(&artifact.testcase_name)
+            .join("session")
+            .join("main-agent.jsonl");
+        let assistant_messages = extract_assistant_messages(&session_path);
+
         for (slot_idx, slot) in artifact.assistant_slots.iter().enumerate() {
             let actual_idx = matched_indices.get(slot_idx).copied();
             for assertion in &slot.assertions {
-                let result = if let Some(idx) = actual_idx {
-                    evaluator
-                        .evaluate_assistant(&trajectory, assertion, idx)
-                        .await
+                let assertion_text = assertion.display_text();
+
+                let (result, cel_failed) = if assertion.is_cel() {
+                    let cel_ctx = build_cel_context(&assistant_messages, actual_idx);
+                    let cel_result = md_testing::cel_eval::evaluate(assertion_text, &cel_ctx);
+                    let failed_evidence = if !cel_result.passed {
+                        Some(cel_result.error.clone().unwrap_or_else(|| {
+                            format!("CEL expression `{}` evaluated to false", assertion_text)
+                        }))
+                    } else {
+                        None
+                    };
+                    let result = md_testing::evaluator::EvaluationResult {
+                        passed: cel_result.passed,
+                        reasoning: cel_result
+                            .error
+                            .unwrap_or_else(|| format!("CEL: {}", assertion_text)),
+                        duration_ms: 0,
+                        llm_calls: 0,
+                        vote_distribution: None,
+                    };
+                    (result, failed_evidence)
+                } else if let Some(idx) = actual_idx {
+                    let r = evaluator
+                        .evaluate_assistant(&trajectory, assertion_text, idx)
+                        .await;
+                    (r, None)
                 } else {
-                    md_testing::evaluator::EvaluationResult {
+                    let r = md_testing::evaluator::EvaluationResult {
                         passed: false,
                         reasoning: "Could not match assistant message — ordering match failed"
                             .to_string(),
                         duration_ms: 0,
                         llm_calls: 0,
-                    }
+                        vote_distribution: None,
+                    };
+                    (r, None)
                 };
-                panic_on_evaluator_failure(&artifact.testcase_name, assertion, &result);
+
+                if !assertion.is_cel() {
+                    panic_on_evaluator_failure(&artifact.testcase_name, assertion_text, &result);
+                }
+
                 eval_results.push_str(&format!(
-                    "## Assistant Message {} (slot {}){}\n",
+                    "## Assistant Message {} (slot {}){}{}\n",
                     actual_idx
                         .map(|i| format!("{}", i))
                         .unwrap_or_else(|| "?".to_string()),
@@ -322,26 +357,28 @@ async fn evaluate_execution_artifacts(
                         " [UNMATCHED]"
                     } else {
                         ""
-                    }
+                    },
+                    if assertion.is_cel() { " [CEL]" } else { "" }
                 ));
-                eval_results.push_str(&format!("Assertion: {}\n", assertion));
+                eval_results.push_str(&format!("Assertion: {}\n", assertion_text));
                 eval_results.push_str(&format!("- Passed: {}\n", result.passed));
                 append_evaluation_timing(&mut eval_results, &result);
                 eval_results.push_str(&format!("- Reasoning: {}\n\n", result.reasoning));
                 println!(
-                    "  Assistant Message {} (slot {}): {}",
+                    "  Assistant Message {} (slot {}){}: {}",
                     actual_idx
                         .map(|i| i.to_string())
                         .unwrap_or_else(|| "?".to_string()),
                     slot_idx,
-                    assertion
+                    if assertion.is_cel() { " [CEL]" } else { "" },
+                    assertion_text
                 );
                 println!("    Passed: {}", result.passed);
                 println!("    Duration: {} ms", result.duration_ms);
                 if !result.passed {
                     all_passed = false;
                 }
-                assistant_results.push((slot_idx, actual_idx, assertion.clone(), result));
+                assistant_results.push((slot_idx, actual_idx, assertion.clone(), result, cel_failed));
             }
         }
 
@@ -366,6 +403,8 @@ async fn evaluate_execution_artifacts(
                 reasoning: failure.reason.clone(),
                 evaluation_duration_ms: None,
                 evaluator_call_count: None,
+                attribution: None,
+                vote_distribution: None,
             });
         }
 
@@ -385,6 +424,8 @@ async fn evaluate_execution_artifacts(
                 reasoning: result.reasoning.clone(),
                 evaluation_duration_ms: evaluation_duration_ms(result),
                 evaluator_call_count: evaluator_call_count(result),
+                attribution: None,
+                vote_distribution: None,
             });
         }
 
@@ -402,29 +443,45 @@ async fn evaluate_execution_artifacts(
                 reasoning: e.to_string(),
                 evaluation_duration_ms: None,
                 evaluator_call_count: None,
+                attribution: None,
+                vote_distribution: None,
             });
         }
 
         // Assistant assertions
         let assistant_lines = md_testing::find_assistant_heading_lines(case_content);
-        for (slot_idx, actual_idx, assertion, result) in &assistant_results {
+        for (slot_idx, actual_idx, assertion, result, cel_failed) in &assistant_results {
+            let assertion_text = assertion.display_text();
             let heading_line = assistant_lines.get(*slot_idx).copied().unwrap_or(1);
             let line = assertion_lines
                 .iter()
-                .find(|l| l.msg_index == *slot_idx && l.assertion == *assertion)
+                .find(|l| l.msg_index == *slot_idx && l.assertion == assertion_text)
                 .map(|l| l.line)
                 .unwrap_or(heading_line);
+
+            let attribution = md_testing::attribution::attribute(
+                result.passed,
+                &md_testing::attribution::AttributionSignals {
+                    cel_failed: cel_failed.clone(),
+                    structural_failure: None,
+                    evaluator_failed: result.evaluator_failed(),
+                    vote_distribution: result.vote_distribution.clone(),
+                },
+            );
+
             results_assertions.push(md_testing::AssertionResult {
                 scope: md_testing::AssertionScope::AssistantMessage {
                     slot_index: *slot_idx,
                     actual_index: *actual_idx,
                 },
                 line,
-                assertion: assertion.clone(),
+                assertion: assertion_text.to_string(),
                 passed: result.passed,
                 reasoning: result.reasoning.clone(),
                 evaluation_duration_ms: evaluation_duration_ms(result),
                 evaluator_call_count: evaluator_call_count(result),
+                attribution,
+                vote_distribution: result.vote_distribution.clone(),
             });
         }
 
@@ -730,13 +787,22 @@ fn mlx_server_port(base_url: &str) -> String {
 }
 
 /// Count assistant messages in a session JSONL file.
+struct AssistantMessageData {
+    text: String,
+    tool_calls: Vec<md_testing::cel_eval::ToolCallContext>,
+}
+
 fn count_assistant_messages(session_path: &std::path::Path) -> usize {
+    extract_assistant_messages(session_path).len()
+}
+
+fn extract_assistant_messages(session_path: &std::path::Path) -> Vec<AssistantMessageData> {
     let content = match std::fs::read_to_string(session_path) {
         Ok(c) => c,
-        Err(_) => return 0,
+        Err(_) => return Vec::new(),
     };
 
-    let mut count = 0;
+    let mut messages = Vec::new();
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
@@ -744,10 +810,60 @@ fn count_assistant_messages(session_path: &std::path::Path) -> usize {
         if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
             if let Some(role) = entry["message"].get("role").and_then(|r| r.as_str()) {
                 if role == "assistant" {
-                    count += 1;
+                    let text = entry["message"]
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    let tool_calls = entry["message"]
+                        .get("tool_calls")
+                        .and_then(|tc| tc.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|tc| {
+                                    let name = tc
+                                        .get("function")
+                                        .and_then(|f| f.get("name"))
+                                        .and_then(|n| n.as_str())?
+                                        .to_string();
+                                    let arguments = tc
+                                        .get("function")
+                                        .and_then(|f| f.get("arguments"))
+                                        .and_then(|a| a.as_str())
+                                        .and_then(|s| serde_json::from_str(s).ok())
+                                        .unwrap_or_default();
+                                    Some(md_testing::cel_eval::ToolCallContext { name, arguments })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    messages.push(AssistantMessageData { text, tool_calls });
                 }
             }
         }
     }
-    count
+    messages
+}
+
+fn build_cel_context(
+    assistant_messages: &[AssistantMessageData],
+    actual_idx: Option<usize>,
+) -> md_testing::cel_eval::CelContext {
+    let message = actual_idx
+        .and_then(|idx| assistant_messages.get(idx))
+        .map(|msg| md_testing::cel_eval::MessageContext {
+            text: msg.text.clone(),
+            tool_calls: msg.tool_calls.clone(),
+            ..Default::default()
+        });
+
+    md_testing::cel_eval::CelContext {
+        message,
+        trajectory: Some(md_testing::cel_eval::TrajectoryContext {
+            assistant_count: assistant_messages.len() as i64,
+            ..Default::default()
+        }),
+    }
 }

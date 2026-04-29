@@ -3,15 +3,21 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a symlink creation -->
-<!-- The agent should use bash to create a symlink -->
+<!-- The agent should create a target file and a symlink pointing to it -->
 
-<!-- The agent should confirm or report the symlink creation -->
 ## User Message
 Create a symlink /tmp/test_link.txt pointing to /tmp/test_target.txt with content "target".
 
 ## Assistant Message
-<!-- The assistant should create the target file and symlink -->
+
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
+
+```cel
+message.text.contains("symlink") || message.text.contains("link") || message.text.contains("created") || message.text.contains("point")
+```
+
 <!-- The assistant should confirm or report the symlink creation -->

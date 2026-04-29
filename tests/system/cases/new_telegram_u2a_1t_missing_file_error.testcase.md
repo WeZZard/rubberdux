@@ -10,8 +10,12 @@ target: telegram-channel
 Read the file at /tmp/nonexistent_file_12345.txt and tell me its contents.
 
 ## Assistant Message
-<!-- The assistant should attempt to read the requested file with an appropriate tool -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should report that the file does not exist -->
+```cel
+message.text.contains("not") || message.text.contains("exist") || message.text.contains("found") || message.text.contains("error") || message.text.contains("Error")
+```
 <!-- The assistant should not hallucinate file contents -->

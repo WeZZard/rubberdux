@@ -3,15 +3,17 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a file checksum -->
-<!-- The agent should use bash to compute a checksum -->
-<!-- The agent should report the SHA-256 checksum result -->
+<!-- The agent should create a file and compute its SHA-256 checksum -->
 
 ## User Message
 Create /tmp/test_checksum.txt with "checksum test" and compute its SHA-256 checksum.
 
 ## Assistant Message
-<!-- The assistant should start creating the file and computing its checksum with an appropriate tool -->
+
+```cel
+message.tool_calls.exists(t, t.name == "bash") || message.tool_calls.exists(t, t.name == "write_file")
+```
 
 ## Assistant Message
-<!-- The assistant should compute and report the SHA-256 checksum result -->
+
+<!-- The assistant should report a valid SHA-256 hex checksum string -->

@@ -11,7 +11,9 @@ target: telegram-channel
 Find all files in the src directory larger than 1KB.
 
 ## Assistant Message
-<!-- The assistant should use find to locate large files -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should report the matching files -->

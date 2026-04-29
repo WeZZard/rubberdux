@@ -11,4 +11,6 @@ target: telegram-channel
 URL encode the string "hello world" and then decode it back.
 
 ## Assistant Message
-<!-- The assistant should URL encode the string and decode it back to the original string -->
+```cel
+message.text.contains("hello") && message.text.contains("world")
+```

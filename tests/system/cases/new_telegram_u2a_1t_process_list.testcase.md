@@ -10,7 +10,9 @@ target: telegram-channel
 List the current running processes.
 
 ## Assistant Message
-<!-- The assistant should use a tool to get the actual process list -->
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
 <!-- The assistant should list running processes for the user -->

@@ -11,7 +11,11 @@ target: telegram-channel
 Create a 1MB file at /tmp/test_large.bin filled with zeros.
 
 ## Assistant Message
-<!-- The assistant should create the large file -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should report the file size -->
+```cel
+message.text.contains("1") && (message.text.contains("MB") || message.text.contains("byte") || message.text.contains("1048576") || message.text.contains("1,048,576"))
+```

@@ -11,7 +11,11 @@ target: telegram-channel
 Search for all lines starting with "pub fn" in the src directory.
 
 ## Assistant Message
-<!-- The assistant should use grep with a regex pattern -->
+```cel
+message.tool_calls.exists(t, t.name == "grep" || t.name == "bash")
+```
 
 ## Assistant Message
-<!-- The assistant should report matching lines -->
+```cel
+message.text.contains("pub fn")
+```

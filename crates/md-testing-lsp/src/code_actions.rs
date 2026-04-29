@@ -1,4 +1,4 @@
-use md_testing::{AssertionResult, AssertionScope, TestResults};
+use md_testing::{AssertionResult, AssertionScope, FailureAttribution, TestResults};
 use tower_lsp::lsp_types::*;
 
 /// Build diagnostic with icon + detailed hover info
@@ -20,16 +20,23 @@ pub fn build_icon_diagnostic(assertion: &AssertionResult, results: &TestResults)
     } else {
         "✗ Failed"
     };
+
+    let attribution_line = assertion.attribution.as_ref().map(format_attribution);
+
     let message = if assertion.passed {
         format!(
             "{}\n\nAssertion: {}\nRun: {}\nTarget: {}",
             status, assertion.assertion, results.run_id, results.target
         )
     } else {
-        format!(
+        let mut msg = format!(
             "{}\n\nReasoning: {}\nRun: {}\nTarget: {}",
             status, assertion.reasoning, results.run_id, results.target
-        )
+        );
+        if let Some(attr) = &attribution_line {
+            msg.push_str(&format!("\nAttribution: {}", attr));
+        }
+        msg
     };
 
     let code = match &assertion.scope {
@@ -49,5 +56,22 @@ pub fn build_icon_diagnostic(assertion: &AssertionResult, results: &TestResults)
         source: Some("md-testing".to_string()),
         message,
         ..Default::default()
+    }
+}
+
+fn format_attribution(attr: &FailureAttribution) -> String {
+    match attr {
+        FailureAttribution::SubjectFailure {
+            confidence,
+            evidence,
+        } => format!("Subject Failure ({:?}) — {}", confidence, evidence),
+        FailureAttribution::AssertionDefect {
+            confidence,
+            evidence,
+        } => format!("Assertion Defect ({:?}) — {}", confidence, evidence),
+        FailureAttribution::JudgePipelineFailure {
+            confidence,
+            evidence,
+        } => format!("Judge Pipeline Failure ({:?}) — {}", confidence, evidence),
     }
 }

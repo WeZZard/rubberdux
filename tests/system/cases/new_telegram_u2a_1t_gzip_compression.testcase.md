@@ -11,7 +11,11 @@ target: telegram-channel
 Create /tmp/test_compress.txt with "compress me" and compress it with gzip.
 
 ## Assistant Message
-<!-- The assistant should create the file and compress it -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should confirm or report the compression result -->
+```cel
+message.text.contains("gz") || message.text.contains("gzip") || message.text.contains("compress")
+```

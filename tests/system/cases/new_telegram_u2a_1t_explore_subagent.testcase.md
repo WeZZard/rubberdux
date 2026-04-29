@@ -13,7 +13,12 @@ timeout: 240
 Explore the src directory and tell me about the project structure.
 
 ## Assistant Message
-<!-- The assistant should begin exploring the src directory with tools -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should present a coherent overview of the src directory and relevant project structure findings -->
+```cel
+message.text.contains("src")
+```

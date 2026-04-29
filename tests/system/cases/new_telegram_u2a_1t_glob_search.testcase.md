@@ -10,7 +10,11 @@ target: telegram-channel
 Find all Rust source files in the src directory using glob.
 
 ## Assistant Message
-<!-- The assistant should use the glob tool -->
+```cel
+message.tool_calls.exists(t, t.name == "glob" || t.name == "bash")
+```
 
 ## Assistant Message
-<!-- The assistant should list .rs files found -->
+```cel
+message.text.contains(".rs")
+```

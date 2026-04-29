@@ -16,5 +16,8 @@ features:
 Create a poll with options: "Yes", "No", "Maybe".
 
 ## Assistant Message
+```cel
+message.text.size() > 0
+```
 <!-- The assistant should create a poll with the specified options -->
 <!-- The assistant should confirm the poll was created -->

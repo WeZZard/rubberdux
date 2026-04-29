@@ -16,5 +16,8 @@ features:
 <!-- Send an image attachment with a caption "What is in this image?" -->
 
 ## Assistant Message
+```cel
+message.text.size() > 0
+```
 <!-- The assistant should acknowledge the image attachment -->
 <!-- The assistant should describe or analyze the image content -->

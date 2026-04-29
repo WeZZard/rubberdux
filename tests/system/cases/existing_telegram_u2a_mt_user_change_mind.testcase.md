@@ -10,10 +10,15 @@ target: telegram-channel
 Write "hello" to /tmp/test_change.txt.
 
 ## Assistant Message
-<!-- The assistant should use a file writing tool -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## User Message
 Actually, write "goodbye" to /tmp/test_change.txt instead.
 
 ## Assistant Message
 <!-- The assistant should handle the updated request appropriately -->
+```cel
+message.text.contains("goodbye") || message.text.contains("updated") || message.text.contains("changed") || message.text.contains("written")
+```

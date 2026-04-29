@@ -11,7 +11,9 @@ target: telegram-channel
 Use bash wc -w to count the number of words in crates/zed-md-testing/README.md.
 
 ## Assistant Message
-<!-- The assistant should use a tool to count the words in crates/zed-md-testing/README.md -->
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
 <!-- The assistant should report the word count -->

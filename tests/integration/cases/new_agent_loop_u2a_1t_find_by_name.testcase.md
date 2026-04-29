@@ -3,15 +3,19 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a file find by name -->
-<!-- The agent should use bash find to locate the file -->
+<!-- The agent should use find to locate files by name pattern -->
 
-<!-- The agent should report the matching files -->
 ## User Message
 Find all files named "*.rs" in the src directory using the find command.
 
 ## Assistant Message
-<!-- The assistant should use find to locate files -->
+
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
-<!-- The assistant should report the matching files -->
+
+```cel
+message.text.contains(".rs")
+```

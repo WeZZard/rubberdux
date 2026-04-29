@@ -10,7 +10,12 @@ target: telegram-channel
 List all files in the src directory.
 
 ## Assistant Message
-<!-- The assistant should use a tool to get the actual file list -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should list files in the src directory -->
+```cel
+message.text.contains("src") || message.text.contains(".rs")
+```

@@ -10,7 +10,9 @@ target: telegram-channel
 Use a general-purpose agent to write a haiku about coding.
 
 ## Assistant Message
-<!-- The assistant should dispatch a general purpose subagent -->
+```cel
+message.tool_calls.exists(t, t.name == "general_purpose")
+```
 
 ## Assistant Message
 <!-- The assistant should present the haiku produced by the subagent to the user -->

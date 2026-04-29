@@ -12,5 +12,8 @@ features:
 <!-- Share a contact (e.g., John Doe, +1-555-1234) -->
 
 ## Assistant Message
+```cel
+message.text.size() > 0
+```
 <!-- The assistant should acknowledge the contact -->
 <!-- The assistant should offer to save or use the contact information -->

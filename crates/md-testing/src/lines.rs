@@ -1,4 +1,4 @@
-use crate::parser::{Message, TestCase};
+use crate::parser::{Assertion, Message, TestCase};
 
 /// A mapped assertion with its line number in the original file.
 #[derive(Debug, Clone, PartialEq)]
@@ -49,10 +49,9 @@ pub fn map_assertion_lines(content: &str, test_case: &TestCase) -> Vec<Assertion
     let mut assistant_slot_idx = 0;
     let mut in_assistant = false;
     let mut assistant_comment_idx = 0;
-    let mut current_assistant_assertions: Vec<String> = Vec::new();
+    let mut current_nl_assertions: Vec<String> = Vec::new();
 
-    // Pre-collect assistant messages with their assertion counts
-    let assistant_messages: Vec<&Vec<String>> = test_case
+    let assistant_messages: Vec<&Vec<Assertion>> = test_case
         .messages
         .iter()
         .filter_map(|msg| match msg {
@@ -64,19 +63,23 @@ pub fn map_assertion_lines(content: &str, test_case: &TestCase) -> Vec<Assertion
     for (i, line) in content_lines.iter().enumerate() {
         let trimmed = line.trim();
 
-        // Detect assistant message headings (bare or CHECK:)
         if trimmed == "## Assistant Message" || trimmed == "## CHECK: Assistant Message" {
             in_assistant = true;
             assistant_comment_idx = 0;
             if assistant_slot_idx < assistant_messages.len() {
-                current_assistant_assertions = assistant_messages[assistant_slot_idx].clone();
+                current_nl_assertions = assistant_messages[assistant_slot_idx]
+                    .iter()
+                    .filter_map(|a| match a {
+                        Assertion::NaturalLanguage { text } => Some(text.clone()),
+                        Assertion::Cel { .. } => None,
+                    })
+                    .collect();
             }
             assistant_slot_idx += 1;
             continue;
         }
 
         if in_assistant {
-            // End of assistant section
             if trimmed.starts_with("## ")
                 && trimmed != "## Assistant Message"
                 && trimmed != "## CHECK: Assistant Message"
@@ -88,12 +91,12 @@ pub fn map_assertion_lines(content: &str, test_case: &TestCase) -> Vec<Assertion
             let line_trimmed = trimmed;
             if line_trimmed.starts_with("<!--")
                 && line_trimmed.ends_with("-->")
-                && assistant_comment_idx < current_assistant_assertions.len()
+                && assistant_comment_idx < current_nl_assertions.len()
             {
                 lines.push(AssertionLine {
                     msg_index: assistant_slot_idx - 1,
                     line: i + 1,
-                    assertion: current_assistant_assertions[assistant_comment_idx].clone(),
+                    assertion: current_nl_assertions[assistant_comment_idx].clone(),
                 });
                 assistant_comment_idx += 1;
             }

@@ -11,7 +11,9 @@ target: telegram-channel
 Create the directory /tmp/test_nested/a/b/c.
 
 ## Assistant Message
-<!-- The assistant should create the nested directories -->
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
 <!-- The assistant should confirm or report the directory creation -->

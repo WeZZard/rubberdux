@@ -11,7 +11,11 @@ target: telegram-channel
 Use a computer-use agent to run "echo hello_from_child" and report the result.
 
 ## Assistant Message
-<!-- The assistant should dispatch a computer_use subagent -->
+```cel
+message.tool_calls.exists(t, t.name == "computer_use")
+```
 
 ## Assistant Message
-<!-- The assistant should report the subagent's execution result to the user and include hello_from_child -->
+```cel
+message.text.contains("hello_from_child")
+```

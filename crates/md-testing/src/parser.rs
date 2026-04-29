@@ -30,15 +30,50 @@ pub enum OrderingDirective {
     Check,
 }
 
+/// A single assertion within a test case section.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Assertion {
+    /// Natural language assertion evaluated by LLM judge.
+    NaturalLanguage { text: String },
+    /// CEL expression evaluated deterministically.
+    Cel { expression: String },
+}
+
+impl Assertion {
+    pub fn display_text(&self) -> &str {
+        match self {
+            Assertion::NaturalLanguage { text } => text,
+            Assertion::Cel { expression } => expression,
+        }
+    }
+
+    pub fn is_cel(&self) -> bool {
+        matches!(self, Assertion::Cel { .. })
+    }
+}
+
+impl PartialEq<&str> for Assertion {
+    fn eq(&self, other: &&str) -> bool {
+        self.display_text() == *other
+    }
+}
+
+impl std::fmt::Display for Assertion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.display_text())
+    }
+}
+
 /// A single message in the test case sequence.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     /// A user message — either plain text or guidance for LLM generation.
     User(UserContent),
-    /// An assistant message — carries an ordering directive and HTML-comment assertions.
+    /// An assistant message — carries an ordering directive and assertions.
     Assistant {
         directive: OrderingDirective,
-        assertions: Vec<String>,
+        assertions: Vec<Assertion>,
     },
 }
 
@@ -72,40 +107,41 @@ pub fn parse(content: &str, name: &str) -> Result<TestCase, String> {
 
         if let Some((heading_text, _)) = read_heading(&events, &mut pos) {
             if heading_text == "User Message" {
-                let (comments, plain_text) = collect_section_content(&events, &mut pos)?;
+                let content = collect_section_content(&events, &mut pos)?;
 
-                if !comments.is_empty() && !plain_text.is_empty() {
+                if !content.comments.is_empty() && !content.plain_text.is_empty() {
                     return Err("User message cannot mix HTML comments and plain text".to_string());
                 }
 
-                if !comments.is_empty() {
-                    messages.push(Message::User(UserContent::Guidance(comments)));
-                } else if !plain_text.is_empty() {
-                    messages.push(Message::User(UserContent::PlainText(plain_text)));
+                if !content.comments.is_empty() {
+                    messages.push(Message::User(UserContent::Guidance(content.comments)));
+                } else if !content.plain_text.is_empty() {
+                    messages.push(Message::User(UserContent::PlainText(content.plain_text)));
                 } else {
                     return Err(
                         "User message must contain either HTML comments or plain text".to_string(),
                     );
                 }
             } else if heading_text == "Assistant Message" {
-                let (comments, plain_text) = collect_section_content(&events, &mut pos)?;
+                let content = collect_section_content(&events, &mut pos)?;
 
-                if !plain_text.is_empty() {
+                if !content.plain_text.is_empty() {
                     return Err(
-                        "Assistant message must contain only HTML comments, not plain text"
+                        "Assistant message must contain only HTML comments or CEL blocks, not plain text"
                             .to_string(),
                     );
                 }
 
-                if comments.is_empty() {
+                let assertions = content.into_assertions();
+                if assertions.is_empty() {
                     return Err(
-                        "Assistant message must contain at least one HTML comment".to_string()
+                        "Assistant message must contain at least one assertion".to_string()
                     );
                 }
 
                 messages.push(Message::Assistant {
                     directive: OrderingDirective::Check,
-                    assertions: comments,
+                    assertions,
                 });
             } else {
                 match parse_directive_from_heading(&heading_text) {
@@ -117,23 +153,24 @@ pub fn parse(content: &str, name: &str) -> Result<TestCase, String> {
                             ));
                         }
 
-                        let (comments, plain_text) = collect_section_content(&events, &mut pos)?;
+                        let content = collect_section_content(&events, &mut pos)?;
 
-                        if !plain_text.is_empty() {
+                        if !content.plain_text.is_empty() {
                             return Err(
-                                "Assistant message must contain only HTML comments, not plain text"
+                                "Assistant message must contain only HTML comments or CEL blocks, not plain text"
                                     .to_string(),
                             );
                         }
 
-                        if comments.is_empty() {
-                            return Err("Assistant message must contain at least one HTML comment"
+                        let assertions = content.into_assertions();
+                        if assertions.is_empty() {
+                            return Err("Assistant message must contain at least one assertion"
                                 .to_string());
                         }
 
                         messages.push(Message::Assistant {
                             directive,
-                            assertions: comments,
+                            assertions,
                         });
                     }
                     DirectiveParseResult::Unsupported(name) => {
@@ -256,17 +293,17 @@ fn parse_storyline(events: &[Event], pos: &mut usize) -> Result<Vec<String>, Str
         None => return Err("Test case must start with '## Storyline'".to_string()),
     }
 
-    let (comments, plain_text) = collect_section_content(events, pos)?;
+    let content = collect_section_content(events, pos)?;
 
-    if !plain_text.is_empty() {
+    if !content.plain_text.is_empty() {
         return Err("Storyline must contain only HTML comments, no plain text".to_string());
     }
 
-    if comments.is_empty() {
+    if content.comments.is_empty() && content.cel_blocks.is_empty() {
         return Err("Storyline must contain at least one HTML comment".to_string());
     }
 
-    Ok(comments)
+    Ok(content.comments)
 }
 
 /// Read a heading at the current position.
@@ -388,18 +425,62 @@ fn skip_section(events: &[Event], pos: &mut usize) {
     }
 }
 
+/// Collected section content: HTML comments, CEL code blocks, and plain text.
+struct SectionContent {
+    comments: Vec<String>,
+    cel_blocks: Vec<String>,
+    plain_text: String,
+}
+
+impl SectionContent {
+    fn into_assertions(self) -> Vec<Assertion> {
+        let mut assertions = Vec::new();
+        for expr in self.cel_blocks {
+            assertions.push(Assertion::Cel { expression: expr });
+        }
+        for text in self.comments {
+            assertions.push(Assertion::NaturalLanguage { text });
+        }
+        assertions
+    }
+}
+
 /// Collect all content from the current position until the next heading or EOF.
-/// Returns (html_comments, plain_text).
 fn collect_section_content(
     events: &[Event],
     pos: &mut usize,
-) -> Result<(Vec<String>, String), String> {
+) -> Result<SectionContent, String> {
     let mut comments = Vec::new();
+    let mut cel_blocks = Vec::new();
     let mut plain_text = String::new();
 
     while *pos < events.len() {
         match &events[*pos] {
             Event::Start(Tag::Heading { .. }) => break,
+            Event::Start(Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Fenced(lang))) => {
+                let lang = lang.as_ref().trim().to_lowercase();
+                *pos += 1;
+                let mut code = String::new();
+                while *pos < events.len() {
+                    match &events[*pos] {
+                        Event::End(TagEnd::CodeBlock) => {
+                            *pos += 1;
+                            break;
+                        }
+                        Event::Text(t) => {
+                            code.push_str(t.as_ref());
+                            *pos += 1;
+                        }
+                        _ => {
+                            *pos += 1;
+                        }
+                    }
+                }
+                let trimmed = code.trim().to_string();
+                if lang == "cel" && !trimmed.is_empty() {
+                    cel_blocks.push(trimmed);
+                }
+            }
             Event::Html(html) => {
                 let s = html.as_ref().trim();
                 if s.starts_with("<!--") && s.ends_with("-->") {
@@ -428,7 +509,11 @@ fn collect_section_content(
         }
     }
 
-    Ok((comments, plain_text.trim().to_string()))
+    Ok(SectionContent {
+        comments,
+        cel_blocks,
+        plain_text: plain_text.trim().to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -800,5 +885,41 @@ Hello
             "Expected error about directive on wrong heading, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_parse_cel_assertion() {
+        let content = "## Storyline\n<!-- Test -->\n\n## User Message\nHello\n\n## Assistant Message\n\n```cel\nmessage.text.contains(\"hello\")\n```\n\n<!-- Should be friendly -->\n";
+
+        let case = parse(content, "cel-test").unwrap();
+        match &case.messages[1] {
+            Message::Assistant { assertions, .. } => {
+                assert_eq!(assertions.len(), 2);
+                assert!(assertions[0].is_cel());
+                assert_eq!(
+                    assertions[0],
+                    Assertion::Cel {
+                        expression: "message.text.contains(\"hello\")".to_string()
+                    }
+                );
+                assert!(!assertions[1].is_cel());
+                assert_eq!(assertions[1], "Should be friendly");
+            }
+            _ => panic!("Expected assistant message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cel_only_assistant() {
+        let content = "## Storyline\n<!-- Test -->\n\n## User Message\nHello\n\n## Assistant Message\n\n```cel\nmessage.tool_calls.size() == 0\n```\n";
+
+        let case = parse(content, "cel-only").unwrap();
+        match &case.messages[1] {
+            Message::Assistant { assertions, .. } => {
+                assert_eq!(assertions.len(), 1);
+                assert!(assertions[0].is_cel());
+            }
+            _ => panic!("Expected assistant message"),
+        }
     }
 }

@@ -10,10 +10,18 @@ target: agent-loop
 Write "hello" to /tmp/test_change.txt.
 
 ## Assistant Message
-<!-- The assistant should use a file writing tool -->
+
+```cel
+message.tool_calls.exists(t, t.name == "write_file") || message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## User Message
 Actually, write "goodbye" to /tmp/test_change.txt instead.
 
 ## Assistant Message
+
+```cel
+message.tool_calls.exists(t, t.name == "write_file") || message.tool_calls.exists(t, t.name == "bash")
+```
+
 <!-- The assistant should handle the updated request appropriately -->

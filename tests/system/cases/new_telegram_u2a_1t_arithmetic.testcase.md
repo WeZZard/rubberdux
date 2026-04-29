@@ -10,5 +10,10 @@ target: telegram-channel
 What is 12345 multiplied by 67890?
 
 ## Assistant Message
+```cel
+message.tool_calls.size() == 0
+```
 <!-- The assistant should provide the correct product -->
-<!-- The assistant should show its reasoning -->
+```cel
+message.text.contains("838102050")
+```

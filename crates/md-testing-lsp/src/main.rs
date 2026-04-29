@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use md_testing_lsp::completions::cel_completions;
 use md_testing_lsp::diagnostics::build_diagnostics;
 use md_testing_lsp::results::ResultsStore;
 use tokio::sync::RwLock;
@@ -41,6 +42,10 @@ impl LanguageServer for MdTestingLsp {
                         })),
                     },
                 )),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![".".to_string(), "\"".to_string()]),
+                    ..Default::default()
+                }),
                 diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
                     DiagnosticOptions {
                         identifier: Some("md-testing".into()),
@@ -114,6 +119,27 @@ impl LanguageServer for MdTestingLsp {
         }
     }
 
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        if !is_testcase_file(uri) {
+            return Ok(None);
+        }
+
+        let docs = self.documents.read().await;
+        let content = match docs.get(uri) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        if is_inside_cel_block(content, position.line as usize) {
+            return Ok(Some(CompletionResponse::Array(cel_completions())));
+        }
+
+        Ok(None)
+    }
+
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.documents
             .write()
@@ -134,6 +160,23 @@ impl MdTestingLsp {
 
 fn is_testcase_file(uri: &Url) -> bool {
     uri.path().ends_with(".testcase.md")
+}
+
+fn is_inside_cel_block(content: &str, line: usize) -> bool {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut in_cel = false;
+    for (i, l) in lines.iter().enumerate() {
+        if i >= line {
+            return in_cel;
+        }
+        let trimmed = l.trim();
+        if trimmed == "```cel" {
+            in_cel = true;
+        } else if in_cel && trimmed == "```" {
+            in_cel = false;
+        }
+    }
+    in_cel
 }
 
 #[tokio::main]

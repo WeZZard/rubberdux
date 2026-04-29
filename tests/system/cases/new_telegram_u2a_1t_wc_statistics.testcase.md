@@ -11,7 +11,9 @@ target: telegram-channel
 Get the line, word, and byte count of Cargo.toml.
 
 ## Assistant Message
-<!-- The assistant should use wc to get statistics -->
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
 <!-- The assistant should report line, word, and byte counts -->

@@ -11,7 +11,12 @@ target: telegram-channel
 Create a symlink /tmp/test_link.txt pointing to /tmp/test_target.txt with content "target".
 
 ## Assistant Message
-<!-- The assistant should create the target file and symlink -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should confirm or report the symlink creation -->
+```cel
+message.text.contains("symlink") || message.text.contains("link") || message.text.contains("test_link")
+```

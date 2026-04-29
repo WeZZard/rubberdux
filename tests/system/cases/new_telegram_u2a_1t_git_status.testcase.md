@@ -11,7 +11,12 @@ target: telegram-channel
 What is the git status of this repository?
 
 ## Assistant Message
-<!-- The assistant should use a tool to get the actual git status -->
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
 <!-- The assistant should report the git status -->
+```cel
+message.text.contains("branch") || message.text.contains("clean") || message.text.contains("modified") || message.text.contains("git")
+```

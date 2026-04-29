@@ -10,7 +10,9 @@ target: telegram-channel
 Edit /tmp/test_malformed.txt to replace "foo" with "bar". (Assume the file does not contain "foo".)
 
 ## Assistant Message
-<!-- The assistant should attempt or verify the replacement before reporting the result -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should report that the replacement string was not found -->

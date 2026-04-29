@@ -3,15 +3,19 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a JSON file read -->
-<!-- The agent should parse and report JSON contents -->
+<!-- The agent should create a JSON file and read it back -->
 
-<!-- The agent should report the JSON contents -->
 ## User Message
 Create /tmp/test_json.json with '{"name": "test", "value": 42}' and read it back.
 
 ## Assistant Message
-<!-- The assistant should create the JSON file and read it back -->
+
+```cel
+message.tool_calls.exists(t, t.name == "write_file") || message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
-<!-- The assistant should report the JSON contents -->
+
+```cel
+message.text.contains("test") && message.text.contains("42")
+```

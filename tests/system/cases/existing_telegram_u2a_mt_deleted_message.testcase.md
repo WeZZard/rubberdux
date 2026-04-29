@@ -12,11 +12,16 @@ features:
 Hello, this message will be deleted.
 
 ## Assistant Message
+```cel
+message.text.size() > 0
+```
 <!-- The assistant should respond normally -->
 
 ## User Message
 <!-- Delete the previous message -->
 
 ## Assistant Message
-<!-- The assistant should acknowledge the deletion or ask for clarification -->
-<!-- The assistant should not crash -->
+```cel
+message.text.size() > 0
+```
+<!-- The assistant should acknowledge the deletion or ask for clarification without crashing -->

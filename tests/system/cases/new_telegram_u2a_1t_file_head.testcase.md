@@ -10,7 +10,12 @@ target: telegram-channel
 Show the first 5 lines of Cargo.toml.
 
 ## Assistant Message
-<!-- The assistant should use a tool to get the actual lines -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should show the first 5 lines of Cargo.toml -->
+```cel
+message.text.contains("Cargo") || message.text.contains("package") || message.text.contains("toml")
+```

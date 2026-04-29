@@ -16,5 +16,8 @@ features:
 <!-- Send a voice message saying "Hello, how are you?" -->
 
 ## Assistant Message
+```cel
+message.text.size() > 0
+```
 <!-- The assistant should acknowledge the voice message -->
 <!-- The assistant should transcribe and respond to the content -->

@@ -3,14 +3,19 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a file append -->
-<!-- The agent should use bash to append to a file -->
+<!-- The agent should create a file and append content to it -->
 
 ## User Message
 Create /tmp/test_append.txt with "line1" and append "line2" to it.
 
 ## Assistant Message
-<!-- The assistant should start creating the file and appending to it with an appropriate tool -->
+
+```cel
+message.tool_calls.exists(t, t.name == "bash") || message.tool_calls.exists(t, t.name == "write_file")
+```
 
 ## Assistant Message
-<!-- The assistant should confirm that the file contains both line1 and line2 -->
+
+```cel
+message.text.contains("line1") && message.text.contains("line2")
+```

@@ -11,7 +11,11 @@ target: telegram-channel
 Create /tmp/test_csv.csv with "name,age\nAlice,30\nBob,25" and read it back.
 
 ## Assistant Message
-<!-- The assistant should create the CSV file and read it back -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should report the CSV contents -->
+```cel
+message.text.contains("Alice") && message.text.contains("Bob")
+```

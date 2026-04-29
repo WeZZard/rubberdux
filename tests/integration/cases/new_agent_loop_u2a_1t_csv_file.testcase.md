@@ -3,15 +3,19 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a CSV file read -->
-<!-- The agent should read and report the CSV file contents -->
+<!-- The agent should create a CSV file and read it back -->
 
-<!-- The agent should report the CSV contents -->
 ## User Message
 Create /tmp/test_csv.csv with "name,age\nAlice,30\nBob,25" and read it back.
 
 ## Assistant Message
-<!-- The assistant should create the CSV file -->
+
+```cel
+message.tool_calls.exists(t, t.name == "write_file") || message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
-<!-- The assistant should read the CSV contents and report them to the user -->
+
+```cel
+message.text.contains("Alice") && message.text.contains("Bob")
+```

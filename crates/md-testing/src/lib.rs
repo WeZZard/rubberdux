@@ -1,3 +1,5 @@
+pub mod attribution;
+pub mod cel_eval;
 pub mod discovery;
 pub mod evaluator;
 pub mod execution;
@@ -25,5 +27,8 @@ pub use lines::{
 pub use linter::{LintError, lint};
 pub use llm::{ChatMessage, LlmClient, LlmError};
 pub use ordering::{MatchError, match_assistant_slots};
-pub use parser::{FrontMatter, Message, OrderingDirective, TestCase, UserContent};
-pub use results::{AssertionResult, AssertionScope, TestResults};
+pub use parser::{Assertion, FrontMatter, Message, OrderingDirective, TestCase, UserContent};
+pub use results::{
+    AssertionResult, AssertionScope, AttributionConfidence, FailureAttribution, TestResults, Vote,
+    VoteDistribution,
+};

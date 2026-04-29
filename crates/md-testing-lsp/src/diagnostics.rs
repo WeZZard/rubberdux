@@ -17,7 +17,10 @@ pub async fn build_diagnostics(
     // 1. Lint diagnostics (always shown)
     diagnostics.extend(build_lint_diagnostics(content));
 
-    // 2. Test result diagnostics (if results exist)
+    // 2. CEL compile diagnostics (always shown)
+    diagnostics.extend(build_cel_diagnostics(content));
+
+    // 3. Test result diagnostics (if results exist)
     let case_name = extract_case_name(uri);
     if let Some(results) = results_store.get_results(&case_name).await {
         diagnostics.extend(build_result_diagnostics(content, &results));
@@ -54,6 +57,54 @@ fn build_lint_diagnostics(content: &str) -> Vec<Diagnostic> {
                 });
             }
         }
+    }
+
+    diagnostics
+}
+
+fn build_cel_diagnostics(content: &str) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    let lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        if trimmed == "```cel" {
+            let block_start = i;
+            i += 1;
+            let mut expression = String::new();
+            while i < lines.len() && lines[i].trim() != "```" {
+                if !expression.is_empty() {
+                    expression.push('\n');
+                }
+                expression.push_str(lines[i]);
+                i += 1;
+            }
+
+            let expr = expression.trim();
+            if !expr.is_empty() {
+                if let Err(e) = cel_interpreter::Program::compile(expr) {
+                    diagnostics.push(Diagnostic {
+                        range: Range {
+                            start: Position {
+                                line: block_start as u32,
+                                character: 0,
+                            },
+                            end: Position {
+                                line: i as u32,
+                                character: 0,
+                            },
+                        },
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        code: Some(NumberOrString::String("cel-compile".to_string())),
+                        source: Some("md-testing-cel".to_string()),
+                        message: format!("CEL compile error: {}", e),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        i += 1;
     }
 
     diagnostics

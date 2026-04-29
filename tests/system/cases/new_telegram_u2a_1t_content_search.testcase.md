@@ -11,7 +11,9 @@ target: telegram-channel
 Find all files in the src directory containing the word "error".
 
 ## Assistant Message
-<!-- The assistant should use grep to find files -->
+```cel
+message.tool_calls.exists(t, t.name == "grep" || t.name == "bash")
+```
 
 ## Assistant Message
 <!-- The assistant should report the files containing "error" -->

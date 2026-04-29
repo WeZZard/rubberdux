@@ -10,7 +10,9 @@ target: telegram-channel
 Show the last 5 lines of Cargo.toml.
 
 ## Assistant Message
-<!-- The assistant should use a tool to get the actual lines -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should show the last 5 lines of Cargo.toml -->

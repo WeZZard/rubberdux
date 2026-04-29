@@ -10,7 +10,11 @@ target: telegram-channel
 Create /tmp/test_append.txt with "line1" and append "line2" to it.
 
 ## Assistant Message
-<!-- The assistant should start creating the file and appending to it with an appropriate tool -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should confirm that the file contains both line1 and line2 -->
+```cel
+message.text.contains("line1") && message.text.contains("line2")
+```

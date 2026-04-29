@@ -24,6 +24,10 @@ pub struct AssertionResult {
     pub evaluation_duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluator_call_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<FailureAttribution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vote_distribution: Option<VoteDistribution>,
 }
 
 /// The scope of an evaluation assertion.
@@ -42,6 +46,52 @@ pub enum AssertionScope {
         actual_index: Option<usize>,
     },
     OrderingMatch,
+}
+
+/// Attribution of why an assertion failed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "category", rename_all = "snake_case")]
+pub enum FailureAttribution {
+    SubjectFailure {
+        confidence: AttributionConfidence,
+        evidence: String,
+    },
+    AssertionDefect {
+        confidence: AttributionConfidence,
+        evidence: String,
+    },
+    JudgePipelineFailure {
+        confidence: AttributionConfidence,
+        evidence: String,
+    },
+}
+
+/// How confident the attribution is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttributionConfidence {
+    Definitive,
+    High,
+    Moderate,
+    Low,
+}
+
+/// Per-vote breakdown from self-consistency evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoteDistribution {
+    pub total_votes: usize,
+    pub pass_votes: usize,
+    pub fail_votes: usize,
+    pub error_votes: usize,
+    pub votes: Vec<Vote>,
+}
+
+/// A single judge vote.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Vote {
+    pub passed: bool,
+    pub reasoning: String,
+    pub duration_ms: u64,
 }
 
 impl TestResults {

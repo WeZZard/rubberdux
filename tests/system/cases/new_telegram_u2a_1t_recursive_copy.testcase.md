@@ -11,7 +11,9 @@ target: telegram-channel
 Copy the src directory to /tmp/test_src_copy.
 
 ## Assistant Message
-<!-- The assistant should copy the directory recursively -->
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
 <!-- The assistant should confirm or report the copy operation result -->

@@ -10,7 +10,11 @@ target: telegram-channel
 Create a tarball /tmp/test_archive.tar.gz containing /tmp/test_archive_dir with a file inside.
 
 ## Assistant Message
-<!-- The assistant should start creating the directory, file, and tarball with an appropriate tool -->
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
-<!-- The assistant should create the tarball and confirm -->
+```cel
+message.text.contains("tar") || message.text.contains(".tar.gz") || message.text.contains("archive")
+```

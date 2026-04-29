@@ -4,18 +4,25 @@ timeout: 120
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a file replace -->
-<!-- The agent should replace text in the file -->
+<!-- The agent should create a file and replace all occurrences of a word -->
 
-<!-- The agent should confirm the final content -->
 ## User Message
 Create /tmp/test_replace.txt with "hello world hello" and replace all "hello" with "hi".
 
 ## Assistant Message
-<!-- The assistant should create the file before replacing its contents -->
+
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should perform the replacement -->
+
+```cel
+message.text.contains("hi") || message.text.contains("replace")
+```
 
 ## Assistant Message
-<!-- The assistant should confirm the final content -->
+
+```cel
+message.text.contains("hi world hi") || message.text.contains("hi")
+```

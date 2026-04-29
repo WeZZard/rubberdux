@@ -4,13 +4,15 @@ target: agent-loop
 
 ## Storyline
 <!-- The agent should fetch a webpage and summarize its content -->
-<!-- The agent should report the fetched page content clearly -->
 
 ## User Message
 Fetch https://example.com and tell me what the page says.
 
 ## Assistant Message
-<!-- The assistant should attempt to fetch the webpage using available tools -->
+
+```cel
+message.tool_calls.exists(t, t.name == "web_fetch") || message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
 <!-- The assistant should summarize the page content -->

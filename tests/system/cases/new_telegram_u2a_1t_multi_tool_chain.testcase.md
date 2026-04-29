@@ -12,7 +12,11 @@ timeout: 120
 Find all Rust files in the src directory, then search for "fn main" in them and tell me which files contain it.
 
 ## Assistant Message
-<!-- The assistant should start searching Rust files with glob and grep or equivalent project search tools -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should report the files containing "fn main" -->
+```cel
+message.text.contains("fn main") || message.text.contains(".rs")
+```

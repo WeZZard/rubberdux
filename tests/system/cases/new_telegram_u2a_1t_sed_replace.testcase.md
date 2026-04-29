@@ -11,7 +11,11 @@ target: telegram-channel
 Create /tmp/test_sed.txt with "hello world" and use sed to replace "world" with "rubberdux".
 
 ## Assistant Message
-<!-- The assistant should create the file and use sed -->
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
-<!-- The assistant should confirm the final content -->
+```cel
+message.text.contains("rubberdux")
+```

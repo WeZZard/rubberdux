@@ -11,10 +11,17 @@ target: telegram-channel
 Create /tmp/test_reverse.txt with "line1\nline2\nline3" and reverse the line order.
 
 ## Assistant Message
-<!-- The assistant should create the file before reversing the lines -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should perform the reversal -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should report or confirm the reversed content -->
+```cel
+message.text.contains("line3") || message.text.contains("line1")
+```

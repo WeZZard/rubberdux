@@ -10,7 +10,11 @@ target: telegram-channel
 Read the file at Cargo.toml in the project root and tell me the package name.
 
 ## Assistant Message
-<!-- The assistant should read the file using a tool -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should mention "rubberdux" or "md-testing" as the package name -->
+```cel
+message.text.contains("rubberdux") || message.text.contains("md-testing")
+```

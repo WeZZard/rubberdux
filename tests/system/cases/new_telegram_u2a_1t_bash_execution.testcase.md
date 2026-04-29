@@ -12,7 +12,11 @@ target: telegram-channel
 Run "echo hello_from_bash" and show me the output.
 
 ## Assistant Message
-<!-- The assistant should call the bash tool -->
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
-<!-- The assistant should report the command output including hello_from_bash -->
+```cel
+message.text.contains("hello_from_bash")
+```

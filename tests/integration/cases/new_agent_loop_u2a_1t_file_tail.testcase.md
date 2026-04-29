@@ -3,14 +3,16 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a file tail -->
-<!-- The agent should use a tool to read the file -->
+<!-- The agent should show the last 5 lines of a file -->
 
 ## User Message
 Show the last 5 lines of Cargo.toml.
 
 ## Assistant Message
-<!-- The assistant should use a tool to get the actual lines -->
+
+```cel
+message.tool_calls.exists(t, t.name == "bash") || message.tool_calls.exists(t, t.name == "read_file")
+```
 
 ## Assistant Message
 <!-- The assistant should show the last 5 lines of Cargo.toml -->

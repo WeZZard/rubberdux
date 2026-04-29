@@ -10,7 +10,12 @@ target: telegram-channel
 Fetch https://example.com and tell me what the page says.
 
 ## Assistant Message
-<!-- The assistant should attempt to fetch the webpage using available tools -->
+```cel
+message.tool_calls.exists(t, t.name == "web_fetch" || t.name == "bash")
+```
 
 ## Assistant Message
 <!-- The assistant should summarize the page content -->
+```cel
+message.text.contains("Example") || message.text.contains("example")
+```

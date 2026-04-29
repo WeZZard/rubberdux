@@ -3,14 +3,21 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for network connectivity info -->
-<!-- The agent should use bash to check network info -->
+<!-- The agent should retrieve and report the machine's IP address -->
 
 ## User Message
 What is the IP address of this machine?
 
 ## Assistant Message
-<!-- The assistant should use a tool to get the actual IP address -->
+
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
+
+```cel
+message.text.matches("[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+") || message.text.matches("[0-9a-fA-F]*:[0-9a-fA-F]*:")
+```
+
 <!-- The assistant should report the IP address to the user -->

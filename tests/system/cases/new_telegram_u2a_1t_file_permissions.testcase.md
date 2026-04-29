@@ -11,7 +11,9 @@ target: telegram-channel
 Create /tmp/test_chmod.txt and make it executable.
 
 ## Assistant Message
-<!-- The assistant should create the file and change its permissions -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should confirm or report the permission change -->

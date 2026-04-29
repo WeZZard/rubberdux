@@ -16,11 +16,16 @@ features:
 What is the weather today?
 
 ## Assistant Message
+```cel
+message.text.size() > 0
+```
 <!-- The assistant should respond about weather or ask for location -->
 
 ## User Message
 <!-- Reply to the previous message with a quote: "What about tomorrow?" -->
 
 ## Assistant Message
-<!-- The assistant should reference the quoted message in the response -->
-<!-- The assistant should answer about tomorrow's weather -->
+```cel
+message.text.size() > 0
+```
+<!-- The assistant should reference the quoted message and answer about tomorrow's weather -->

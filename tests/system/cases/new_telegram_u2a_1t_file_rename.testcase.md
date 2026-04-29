@@ -11,7 +11,9 @@ target: telegram-channel
 Create /tmp/test_rename_old.txt with "old name" and rename it to /tmp/test_rename_new.txt.
 
 ## Assistant Message
-<!-- The assistant should start the rename workflow with an appropriate tool -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should confirm or report the rename operation result -->

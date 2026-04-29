@@ -11,7 +11,9 @@ target: telegram-channel
 Move /tmp/test_move_src.txt to /tmp/test_move_dst.txt. (Create the source file with "move me" first if needed.)
 
 ## Assistant Message
-<!-- The assistant should move the file -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should confirm or report the move operation result -->

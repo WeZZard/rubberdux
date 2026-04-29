@@ -11,7 +11,9 @@ target: telegram-channel
 Delete the file /tmp/test_delete_me.txt. (Create it first if needed.)
 
 ## Assistant Message
-<!-- The assistant should delete the file -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should confirm or report the deletion result -->

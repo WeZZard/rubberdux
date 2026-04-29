@@ -16,5 +16,8 @@ features:
 <!-- Share a location (e.g., New York City) -->
 
 ## Assistant Message
+```cel
+message.text.size() > 0
+```
 <!-- The assistant should acknowledge the location -->
 <!-- The assistant should offer relevant information about the location -->

@@ -3,15 +3,19 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a file compression -->
-<!-- The agent should use bash to compress the file -->
+<!-- The agent should create a file and compress it with gzip -->
 
-<!-- The agent should confirm or report the compression result -->
 ## User Message
 Create /tmp/test_compress.txt with "compress me" and compress it with gzip.
 
 ## Assistant Message
-<!-- The assistant should create the file and compress it -->
+
+```cel
+message.tool_calls.exists(t, t.name == "bash") || message.tool_calls.exists(t, t.name == "write_file")
+```
 
 ## Assistant Message
-<!-- The assistant should confirm or report the compression result -->
+
+```cel
+message.text.contains("gz") || message.text.contains("compress")
+```

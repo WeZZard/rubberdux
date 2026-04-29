@@ -3,15 +3,19 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a base64 encode/decode -->
-<!-- The agent should use an appropriate tool for base64 operations -->
-<!-- The assistant should complete both the base64 encoding and decoding -->
+<!-- The agent should base64 encode and decode a string and present both results -->
 
 ## User Message
 Base64 encode the string "hello world" and then decode it back.
 
 ## Assistant Message
-<!-- The assistant should initiate the base64 operation with an appropriate tool -->
+
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
-<!-- The assistant should present the encoded string and the final decoded result to the user -->
+
+```cel
+message.text.contains("aGVsbG8gd29ybGQ") && message.text.contains("hello world")
+```

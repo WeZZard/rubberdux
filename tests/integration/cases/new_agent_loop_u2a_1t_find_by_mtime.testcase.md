@@ -3,15 +3,19 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a file find by modification time -->
-<!-- The agent should use bash find to locate recently modified files -->
+<!-- The agent should use find to locate recently modified files -->
 
-<!-- The agent should report the matching files -->
 ## User Message
 Find all files in the src directory modified in the last 7 days.
 
 ## Assistant Message
-<!-- The assistant should use find to locate recently modified files -->
+
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
-<!-- The assistant should report the matching files -->
+
+```cel
+message.text.contains(".rs") || message.text.contains("src")
+```

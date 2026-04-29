@@ -3,15 +3,21 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a file wc statistics -->
-<!-- The agent should use bash wc to get statistics -->
+<!-- The agent should use wc to get line, word, and byte counts -->
 
-<!-- The agent should report line, word, and byte counts -->
 ## User Message
 Get the line, word, and byte count of Cargo.toml.
 
 ## Assistant Message
-<!-- The assistant should use wc to get statistics -->
+
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
+
+```cel
+message.text.matches("[0-9]+")
+```
+
 <!-- The assistant should report line, word, and byte counts -->

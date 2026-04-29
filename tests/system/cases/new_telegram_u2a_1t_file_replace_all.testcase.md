@@ -12,7 +12,11 @@ timeout: 120
 Create /tmp/test_replace.txt with "hello world hello" and replace all "hello" with "hi".
 
 ## Assistant Message
-<!-- The assistant should create the file before replacing its contents -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should confirm the final content -->
+```cel
+message.text.contains("hi")
+```

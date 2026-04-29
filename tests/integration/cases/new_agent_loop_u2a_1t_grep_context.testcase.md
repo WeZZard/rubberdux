@@ -3,15 +3,19 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a file grep with context -->
-<!-- The agent should use grep with context lines -->
+<!-- The agent should search for a pattern with context lines around each match -->
 
-<!-- The agent should report matches with surrounding lines -->
 ## User Message
 Search for "fn main" in the src directory and show 2 lines of context around each match.
 
 ## Assistant Message
-<!-- The assistant should use an appropriate search command with context -->
+
+```cel
+message.tool_calls.exists(t, t.name == "grep") || message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
-<!-- The assistant should report matches with surrounding lines -->
+
+```cel
+message.text.contains("fn main")
+```

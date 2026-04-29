@@ -3,15 +3,21 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a file md5sum -->
-<!-- The agent should use bash to compute md5sum -->
+<!-- The agent should create a file and compute its MD5 checksum -->
 
-<!-- The agent should report the MD5 checksum -->
 ## User Message
 Create /tmp/test_md5.txt with "md5 test" and compute its MD5 checksum.
 
 ## Assistant Message
-<!-- The assistant should create the file before computing the checksum -->
+
+```cel
+message.tool_calls.exists(t, t.name == "bash") || message.tool_calls.exists(t, t.name == "write_file")
+```
 
 ## Assistant Message
+
+```cel
+message.text.matches("[0-9a-fA-F]{32}")
+```
+
 <!-- The assistant should report the MD5 checksum -->

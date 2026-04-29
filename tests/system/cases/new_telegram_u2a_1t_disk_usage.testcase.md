@@ -11,7 +11,9 @@ target: telegram-channel
 How much disk space is available?
 
 ## Assistant Message
-<!-- The assistant should use a tool to get actual disk usage -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should report disk space information -->

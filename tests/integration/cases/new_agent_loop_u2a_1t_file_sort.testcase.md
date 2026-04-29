@@ -3,15 +3,19 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a file sort -->
-<!-- The agent should use bash to sort the file -->
+<!-- The agent should create a file and sort it alphabetically -->
 
-<!-- The agent should report or confirm the sorted content -->
 ## User Message
 Create /tmp/test_sort.txt with "zebra\napple\nmango" and sort it alphabetically.
 
 ## Assistant Message
-<!-- The assistant should create the file and sort it -->
+
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should report or confirm the sorted content -->
+
+```cel
+message.text.contains("apple") && message.text.contains("mango") && message.text.contains("zebra")
+```

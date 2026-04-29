@@ -3,15 +3,19 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a large file creation -->
-<!-- The agent should use bash to create a large file -->
+<!-- The agent should create a large file and report its size -->
 
-<!-- The agent should report the file size -->
 ## User Message
 Create a 1MB file at /tmp/test_large.bin filled with zeros.
 
 ## Assistant Message
-<!-- The assistant should create the large file -->
+
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
-<!-- The assistant should report the file size -->
+
+```cel
+message.text.contains("1") && (message.text.contains("MB") || message.text.contains("byte") || message.text.contains("1048576") || message.text.contains("1024"))
+```

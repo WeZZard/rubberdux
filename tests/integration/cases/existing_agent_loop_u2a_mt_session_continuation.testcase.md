@@ -10,18 +10,27 @@ target: agent-loop
 What is my name?
 
 ## Assistant Message
+
+```cel
+message.tool_calls.size() == 0
+```
+
 <!-- The assistant should indicate it does not know the user's name yet -->
-<!-- The assistant should be open to learning the user's name -->
 
 ## User Message
 My name is Alice.
 
 ## Assistant Message
-<!-- The assistant should acknowledge the user's name -->
+
+```cel
+message.text.contains("Alice")
+```
 
 ## User Message
 What is my name?
 
 ## Assistant Message
-<!-- The assistant should remember and say "Alice" -->
-<!-- The assistant should reference the prior turn where the name was given -->
+
+```cel
+message.text.contains("Alice")
+```

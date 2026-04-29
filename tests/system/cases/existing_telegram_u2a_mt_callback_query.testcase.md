@@ -16,11 +16,19 @@ features:
 Show me options for pizza toppings.
 
 ## Assistant Message
+```cel
+message.text.size() > 0
+```
 <!-- The assistant should present pizza topping options as inline buttons -->
 
 ## User Message
 <!-- Click the "Pepperoni" button -->
 
 ## Assistant Message
-<!-- The assistant should acknowledge the "Pepperoni" selection -->
-<!-- The assistant should update the message or send a confirmation -->
+```cel
+message.text.size() > 0
+```
+<!-- The assistant should acknowledge the "Pepperoni" selection and update the message or send a confirmation -->
+```cel
+message.text.contains("epperoni")
+```

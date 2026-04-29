@@ -11,7 +11,11 @@ target: telegram-channel
 Create /tmp/test_sort.txt with "zebra\napple\nmango" and sort it alphabetically.
 
 ## Assistant Message
-<!-- The assistant should create the file and sort it -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should report or confirm the sorted content -->
+```cel
+message.text.contains("apple") && message.text.contains("mango") && message.text.contains("zebra")
+```

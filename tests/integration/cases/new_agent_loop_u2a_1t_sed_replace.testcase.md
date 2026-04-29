@@ -3,15 +3,19 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a file sed replacement -->
-<!-- The agent should use bash sed to replace text -->
+<!-- The agent should create a file and use sed to replace text in it -->
 
-<!-- The agent should confirm the final content -->
 ## User Message
 Create /tmp/test_sed.txt with "hello world" and use sed to replace "world" with "rubberdux".
 
 ## Assistant Message
-<!-- The assistant should create the file and use sed -->
+
+```cel
+message.tool_calls.exists(t, t.name == "bash") || message.tool_calls.exists(t, t.name == "write_file")
+```
 
 ## Assistant Message
-<!-- The assistant should confirm the final content -->
+
+```cel
+message.text.contains("rubberdux")
+```

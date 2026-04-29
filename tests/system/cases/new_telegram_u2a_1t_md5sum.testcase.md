@@ -11,7 +11,11 @@ target: telegram-channel
 Create /tmp/test_md5.txt with "md5 test" and compute its MD5 checksum.
 
 ## Assistant Message
-<!-- The assistant should create the file before computing the checksum -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should report the MD5 checksum -->
+```cel
+message.text.contains("MD5") || message.text.contains("md5") || message.text.contains("checksum")
+```

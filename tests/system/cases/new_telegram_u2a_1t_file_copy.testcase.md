@@ -11,7 +11,9 @@ target: telegram-channel
 Copy /tmp/test_copy_src.txt to /tmp/test_copy_dst.txt. (Create the source file with "copy me" first if needed.)
 
 ## Assistant Message
-<!-- The assistant should copy the file -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should confirm or report the copy operation result -->

@@ -10,7 +10,12 @@ target: telegram-channel
 Search the web for "Rust programming language".
 
 ## Assistant Message
-<!-- The assistant should use the web_search tool -->
+```cel
+message.tool_calls.exists(t, t.name == "web_search" || t.name == "$web_search")
+```
 
 ## Assistant Message
 <!-- The assistant should summarize the search results -->
+```cel
+message.text.contains("Rust") || message.text.contains("rust")
+```

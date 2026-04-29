@@ -10,7 +10,9 @@ target: telegram-channel
 What is the IP address of this machine?
 
 ## Assistant Message
-<!-- The assistant should use a tool to get the actual IP address -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should report the IP address to the user -->

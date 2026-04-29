@@ -11,7 +11,9 @@ target: telegram-channel
 Use bash wc -l to count the number of lines in Cargo.toml.
 
 ## Assistant Message
-<!-- The assistant should use a tool to count the lines in Cargo.toml -->
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
 <!-- The assistant should report the line count -->

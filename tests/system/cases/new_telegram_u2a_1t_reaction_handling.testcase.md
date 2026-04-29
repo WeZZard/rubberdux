@@ -16,5 +16,8 @@ features:
 👍
 
 ## Assistant Message
+```cel
+message.text.size() > 0
+```
 <!-- The assistant should acknowledge the reaction or ask for clarification -->
 <!-- The assistant should not crash on emoji-only input -->

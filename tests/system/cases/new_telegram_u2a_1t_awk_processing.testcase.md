@@ -10,7 +10,12 @@ target: telegram-channel
 Create /tmp/test_awk.txt with "1 apple\n2 banana\n3 cherry" and use awk to print the second column.
 
 ## Assistant Message
-<!-- The assistant should create the file before processing it -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
 <!-- The assistant should report the second-column output -->
+```cel
+message.text.contains("apple") || message.text.contains("banana") || message.text.contains("cherry")
+```

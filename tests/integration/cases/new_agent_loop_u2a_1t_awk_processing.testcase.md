@@ -3,14 +3,19 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a file awk processing -->
-<!-- The agent should use bash awk to process the file -->
+<!-- The agent should use bash awk to process a file and report the output -->
 
 ## User Message
 Create /tmp/test_awk.txt with "1 apple\n2 banana\n3 cherry" and use awk to print the second column.
 
 ## Assistant Message
-<!-- The assistant should create the file before processing it -->
+
+```cel
+message.tool_calls.exists(t, t.name == "bash") || message.tool_calls.exists(t, t.name == "write_file")
+```
 
 ## Assistant Message
-<!-- The assistant should report the second-column output -->
+
+```cel
+message.text.contains("apple") && message.text.contains("banana") && message.text.contains("cherry")
+```

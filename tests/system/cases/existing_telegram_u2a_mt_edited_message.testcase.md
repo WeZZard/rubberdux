@@ -12,11 +12,15 @@ features:
 What is the capital of France?
 
 ## Assistant Message
-<!-- The assistant should answer "Paris" -->
+```cel
+message.text.contains("Paris")
+```
 
 ## User Message
 <!-- Edit the previous message to: "What is the capital of Germany?" -->
 
 ## Assistant Message
-<!-- The assistant should answer "Berlin" -->
+```cel
+message.text.contains("Berlin")
+```
 <!-- The assistant should reference the edited message -->

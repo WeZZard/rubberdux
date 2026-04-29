@@ -16,5 +16,8 @@ features:
 <!-- Send a text document attachment with a caption "Summarize this document." -->
 
 ## Assistant Message
+```cel
+message.text.size() > 0
+```
 <!-- The assistant should acknowledge the document attachment -->
 <!-- The assistant should read and summarize the document content -->

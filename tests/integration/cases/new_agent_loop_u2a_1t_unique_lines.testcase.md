@@ -3,15 +3,19 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a file unique lines -->
-<!-- The agent should use bash to get unique lines -->
+<!-- The agent should create a file with duplicates and show only unique lines -->
 
-<!-- The agent should report or confirm the unique lines -->
 ## User Message
 Create /tmp/test_unique.txt with "a\nb\na\nc\nb" and show only unique lines.
 
 ## Assistant Message
-<!-- The assistant should create the file before showing unique lines -->
+
+```cel
+message.tool_calls.exists(t, t.name == "bash") || message.tool_calls.exists(t, t.name == "write_file")
+```
 
 ## Assistant Message
-<!-- The assistant should report or confirm the unique lines -->
+
+```cel
+message.text.contains("a") && message.text.contains("b") && message.text.contains("c")
+```

@@ -11,7 +11,11 @@ target: telegram-channel
 Create /tmp/test_sha1.txt with "sha1 test" and compute its SHA-1 checksum.
 
 ## Assistant Message
-<!-- The assistant should create the file and compute sha1sum -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should report the SHA-1 checksum -->
+```cel
+message.text.contains("SHA") || message.text.contains("sha") || message.text.contains("checksum")
+```

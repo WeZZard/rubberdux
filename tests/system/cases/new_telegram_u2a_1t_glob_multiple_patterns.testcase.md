@@ -11,7 +11,11 @@ target: telegram-channel
 Find all .rs and .toml files in the project.
 
 ## Assistant Message
-<!-- The assistant should use glob to find both .rs and .toml files -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should report the matching files -->
+```cel
+message.text.contains(".rs") && message.text.contains(".toml")
+```

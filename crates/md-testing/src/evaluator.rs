@@ -16,6 +16,7 @@ pub struct EvaluationResult {
     pub reasoning: String,
     pub duration_ms: u64,
     pub llm_calls: usize,
+    pub vote_distribution: Option<crate::results::VoteDistribution>,
 }
 
 impl EvaluationResult {
@@ -63,8 +64,12 @@ impl<C: LlmClient> AssertionEvaluator<C> {
             "You are a strict test evaluator. Given an AI agent's full conversation trajectory \
              and a storyline assertion, determine whether the assertion is TRUE across the \
              entire conversation.\n\n{}\n\nSTORYLINE ASSERTION: {}\n\n\
+             Think step by step:\n\
+             1. What does the assertion specifically require?\n\
+             2. What did the agent actually do?\n\
+             3. Is there a clear match or mismatch?\n\n\
              Respond with ONLY a JSON object in this exact format:\n\
-             {{\"passed\": true, \"reasoning\": \"concise explanation\"}}\n\
+             {{\"reasoning\": \"step-by-step analysis\", \"passed\": true}}\n\
              If the assertion is false, use passed: false and explain why.",
             subject.format_for_eval(),
             assertion
@@ -91,13 +96,18 @@ impl<C: LlmClient> AssertionEvaluator<C> {
              IMPORTANT: The assertion refers to ASSISTANT MESSAGE NUMBER {} (counting only assistant messages, starting from 1). \
              Evaluate ONLY that specific assistant message, not the final or any other message.\n\n{}\n\n\
              ASSISTANT MESSAGE ASSERTION (for assistant message {}): {}\n\n\
+             Think step by step:\n\
+             1. What does the assertion specifically require?\n\
+             2. What did assistant message {} actually do?\n\
+             3. Is there a clear match or mismatch?\n\n\
              Respond with ONLY a JSON object in this exact format:\n\
-             {{\"passed\": true, \"reasoning\": \"concise explanation\"}}\n\
+             {{\"reasoning\": \"step-by-step analysis\", \"passed\": true}}\n\
              If the assertion is false, use passed: false and explain why.",
             msg_idx + 1,
             subject.format_for_eval(),
             msg_idx + 1,
-            assertion
+            assertion,
+            msg_idx + 1
         );
 
         self.evaluate_with_prompt(&prompt).await
@@ -115,8 +125,12 @@ impl<C: LlmClient> AssertionEvaluator<C> {
              and a guidance assertion about a user message, determine whether the agent's \
              behavior matched the guidance.\n\n{}\n\n\
              USER MESSAGE GUIDANCE: {}\n\n\
+             Think step by step:\n\
+             1. What does the guidance specifically require?\n\
+             2. What did the agent actually do?\n\
+             3. Is there a clear match or mismatch?\n\n\
              Respond with ONLY a JSON object in this exact format:\n\
-             {{\"passed\": true, \"reasoning\": \"concise explanation\"}}\n\
+             {{\"reasoning\": \"step-by-step analysis\", \"passed\": true}}\n\
              If the assertion is false, use passed: false and explain why.",
             subject.format_for_eval(),
             assertion
@@ -139,12 +153,12 @@ impl<C: LlmClient> AssertionEvaluator<C> {
             },
         ];
 
-        let mut votes_passed = 0usize;
-        let mut all_reasonings = Vec::new();
+        let mut votes: Vec<crate::results::Vote> = Vec::new();
+        let mut error_votes = 0usize;
         let mut last_error = None;
         let mut llm_calls = 0usize;
 
-        for attempt in 0..self.consistency_votes {
+        for _attempt in 0..self.consistency_votes {
             let body = build_request_json(&self.model, &messages, 0.0);
             let call_start = Instant::now();
             let raw = match self.client.chat_raw(body).await {
@@ -159,6 +173,7 @@ impl<C: LlmClient> AssertionEvaluator<C> {
                         "Evaluator LLM call failed after {} ms: {}",
                         call_ms, e
                     ));
+                    error_votes += 1;
                     continue;
                 }
             };
@@ -171,6 +186,7 @@ impl<C: LlmClient> AssertionEvaluator<C> {
                         "Failed to parse evaluator response after {} ms: {}. Raw: {}",
                         call_ms, e, raw
                     ));
+                    error_votes += 1;
                     continue;
                 }
             };
@@ -187,9 +203,6 @@ impl<C: LlmClient> AssertionEvaluator<C> {
                 &sanitized
             };
 
-            // Pre-process: remove any trailing commas before } or ] which
-            // some LLMs emit, and normalize common Unicode punctuation to
-            // ASCII equivalents so JSON parsers don't choke.
             let cleaned = json_str
                 .replace(", }", " }")
                 .replace(",}", "}")
@@ -382,40 +395,67 @@ impl<C: LlmClient> AssertionEvaluator<C> {
                         "Failed to parse evaluator response as JSON after {} ms. Raw: {}",
                         call_ms, text
                     ));
+                    error_votes += 1;
                     continue;
                 }
             };
 
-            if passed {
-                votes_passed += 1;
-            }
-            all_reasonings.push(format!(
-                "[Vote {} in {} ms] {}: {}",
-                attempt + 1,
-                call_ms,
-                if passed { "PASS" } else { "FAIL" },
-                reasoning
-            ));
+            votes.push(crate::results::Vote {
+                passed,
+                reasoning,
+                duration_ms: call_ms,
+            });
         }
 
-        let total_votes = all_reasonings.len();
-        if total_votes == 0 {
-            // All attempts failed
+        if votes.is_empty() {
             return EvaluationResult {
                 passed: false,
                 reasoning: last_error.unwrap_or_else(|| "All evaluator attempts failed".into()),
                 duration_ms: duration_ms(evaluation_start.elapsed()),
                 llm_calls,
+                vote_distribution: Some(crate::results::VoteDistribution {
+                    total_votes: 0,
+                    pass_votes: 0,
+                    fail_votes: 0,
+                    error_votes,
+                    votes: Vec::new(),
+                }),
             };
         }
 
-        let passed = votes_passed > total_votes / 2;
+        let pass_votes = votes.iter().filter(|v| v.passed).count();
+        let fail_votes = votes.iter().filter(|v| !v.passed).count();
+        let passed = pass_votes > (votes.len() / 2);
+
+        let reasoning = votes
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                format!(
+                    "[Vote {} in {} ms] {}: {}",
+                    i + 1,
+                    v.duration_ms,
+                    if v.passed { "PASS" } else { "FAIL" },
+                    v.reasoning
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let distribution = crate::results::VoteDistribution {
+            total_votes: votes.len(),
+            pass_votes,
+            fail_votes,
+            error_votes,
+            votes,
+        };
 
         EvaluationResult {
             passed,
-            reasoning: all_reasonings.join("\n"),
+            reasoning,
             duration_ms: duration_ms(evaluation_start.elapsed()),
             llm_calls,
+            vote_distribution: Some(distribution),
         }
     }
 }
@@ -552,6 +592,7 @@ mod tests {
             reasoning: "Evaluator LLM call failed after 1 ms: service unavailable".to_string(),
             duration_ms: 1,
             llm_calls: 1,
+            vote_distribution: None,
         };
 
         assert!(result.evaluator_failed());
@@ -564,6 +605,7 @@ mod tests {
             reasoning: "[Vote 1 in 10 ms] FAIL: Missing required output.".to_string(),
             duration_ms: 10,
             llm_calls: 1,
+            vote_distribution: None,
         };
 
         assert!(!result.evaluator_failed());

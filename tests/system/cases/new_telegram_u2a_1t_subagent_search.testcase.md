@@ -11,7 +11,11 @@ timeout: 240
 Spawn an agent to search for Rust source files in the src directory.
 
 ## Assistant Message
-<!-- The assistant should dispatch a subagent -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should mention .rs files or source files found -->
+```cel
+message.text.contains(".rs") || message.text.contains("Rust") || message.text.contains("source")
+```

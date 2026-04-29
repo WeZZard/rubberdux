@@ -3,15 +3,16 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a file find by size -->
-<!-- The agent should use bash find to locate large files -->
+<!-- The agent should use find to locate files larger than a given size -->
 
-<!-- The agent should report the matching files -->
 ## User Message
 Find all files in the src directory larger than 1KB.
 
 ## Assistant Message
-<!-- The assistant should use find to locate large files -->
+
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
 <!-- The assistant should report the matching files -->

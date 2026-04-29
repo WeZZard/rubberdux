@@ -11,7 +11,11 @@ target: telegram-channel
 Search for "fn main" in all Rust files in the src directory.
 
 ## Assistant Message
-<!-- The assistant should use the grep tool -->
+```cel
+message.tool_calls.exists(t, t.name == "grep" || t.name == "bash")
+```
 
 ## Assistant Message
-<!-- The assistant should report files containing "fn main" -->
+```cel
+message.text.contains("fn main") || message.text.contains(".rs")
+```

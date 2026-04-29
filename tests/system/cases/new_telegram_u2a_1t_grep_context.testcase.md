@@ -11,7 +11,11 @@ target: telegram-channel
 Search for "fn main" in the src directory and show 2 lines of context around each match.
 
 ## Assistant Message
-<!-- The assistant should use an appropriate search command with context -->
+```cel
+message.tool_calls.exists(t, t.name == "grep" || t.name == "bash")
+```
 
 ## Assistant Message
-<!-- The assistant should report matches with surrounding lines -->
+```cel
+message.text.contains("fn main")
+```

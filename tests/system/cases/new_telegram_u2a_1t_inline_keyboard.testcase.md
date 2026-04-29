@@ -12,5 +12,8 @@ features:
 Show me options for pizza toppings.
 
 ## Assistant Message
+```cel
+message.text.size() > 0
+```
 <!-- The assistant should present pizza topping options -->
 <!-- The assistant should use inline keyboard buttons if supported -->

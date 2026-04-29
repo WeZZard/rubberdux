@@ -3,14 +3,19 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking for a tarball creation -->
-<!-- The agent should use bash to create a tarball -->
+<!-- The agent should create a directory with a file and archive it as a tarball -->
 
 ## User Message
 Create a tarball /tmp/test_archive.tar.gz containing /tmp/test_archive_dir with a file inside.
 
 ## Assistant Message
-<!-- The assistant should start creating the directory, file, and tarball with an appropriate tool -->
+
+```cel
+message.tool_calls.exists(t, t.name == "bash")
+```
 
 ## Assistant Message
-<!-- The assistant should create the tarball and confirm -->
+
+```cel
+message.text.contains("tar") || message.text.contains("archive") || message.text.contains(".gz")
+```

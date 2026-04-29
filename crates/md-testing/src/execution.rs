@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::parser::Assertion;
 use crate::OrderingDirective;
 
 /// Immutable record of a testcase execution before LLM-based evaluation.
@@ -25,7 +26,7 @@ pub struct ExecutionArtifact {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssistantSlotArtifact {
     pub directive: OrderingDirective,
-    pub assertions: Vec<String>,
+    pub assertions: Vec<Assertion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -146,7 +147,9 @@ mod tests {
             user_messages: vec!["hello".to_string()],
             assistant_slots: vec![AssistantSlotArtifact {
                 directive: OrderingDirective::Check,
-                assertions: vec!["responds".to_string()],
+                assertions: vec![Assertion::NaturalLanguage {
+                    text: "responds".to_string(),
+                }],
             }],
             actual_assistant_count: 1,
             exchange_failures: vec![ExchangeFailure {

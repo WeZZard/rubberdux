@@ -11,7 +11,14 @@ target: telegram-channel
 Base64 encode the string "hello world" and then decode it back.
 
 ## Assistant Message
-<!-- The assistant should initiate the base64 operation with an appropriate tool -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should present the encoded string and the final decoded result to the user -->
+```cel
+message.text.contains("aGVsbG8gd29ybGQ=") || message.text.contains("aGVsbG8gd29ybGQ")
+```
+```cel
+message.text.contains("hello world")
+```

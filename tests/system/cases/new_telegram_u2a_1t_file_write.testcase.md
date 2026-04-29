@@ -11,7 +11,9 @@ target: telegram-channel
 Write "hello world" to /tmp/test_write.txt.
 
 ## Assistant Message
-<!-- The assistant should use the write_file tool -->
+```cel
+message.tool_calls.exists(t, t.name == "write_file" || t.name == "bash")
+```
 
 ## Assistant Message
 <!-- The assistant should confirm or report the file operation result -->

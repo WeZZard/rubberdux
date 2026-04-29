@@ -11,7 +11,11 @@ target: telegram-channel
 What is the value of the HOME environment variable?
 
 ## Assistant Message
-<!-- The assistant should use a tool to get the actual value -->
+```cel
+message.tool_calls.size() > 0
+```
 
 ## Assistant Message
-<!-- The assistant should report the value of HOME -->
+```cel
+message.text.contains("HOME") || message.text.contains("/")
+```

@@ -46,10 +46,10 @@ pub fn render_evaluations(test_case: &TestCase) -> Vec<Evaluation> {
                 }
             }
             Message::Assistant { assertions, .. } => {
-                for c in assertions {
+                for a in assertions {
                     evaluations.push(Evaluation {
                         scope: EvaluationScope::AssistantMessage(i),
-                        assertion: c.clone(),
+                        assertion: a.display_text().to_string(),
                     });
                 }
             }
