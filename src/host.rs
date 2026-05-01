@@ -81,7 +81,7 @@ impl HostConfig {
 }
 
 fn build_agent_command(config: &HostConfig, task_id: Option<&str>) -> String {
-    let binary = config.agent_binary_path.as_deref().unwrap_or("rubberdux");
+    let binary = config.agent_binary_path.as_deref().unwrap_or("rubberduxd");
     let binary_quoted = shell_quote(binary);
     let mut cmd = format!(
         "{} --agent --rpc-host {}:{}",
@@ -338,8 +338,8 @@ pub async fn run_child_vm(
                 "run_child_vm: copying binary and prompt",
             )
             .await;
-            let main_binary = config.share_root.join("main").join("rubberdux");
-            let child_binary = mgr.share_dir(task_id).join("rubberdux");
+            let main_binary = config.share_root.join("main").join("rubberduxd");
+            let child_binary = mgr.share_dir(task_id).join("rubberduxd");
             if main_binary.exists() {
                 tokio::fs::copy(&main_binary, &child_binary).await?;
             }
@@ -525,7 +525,7 @@ mod tests {
         };
 
         let cmd = build_agent_command(&config, None);
-        assert!(cmd.contains("rubberdux"));
+        assert!(cmd.contains("rubberduxd"));
         assert!(cmd.contains("--agent"));
         assert!(cmd.contains("192.168.64.1:19384"));
     }

@@ -9,7 +9,11 @@ edition = "2024"
 description = "A centralized AI agent that manages context, memory, and dispatches tasks to other AI agents"
 license = "MIT"
 repository = "https://github.com/WeZZard/rubberdux"
-default-run = "rubberdux"
+default-run = "rubberduxd"
+
+[[bin]]
+name = "rubberduxd"
+path = "src/main.rs"
 
 [profile.test]
 opt-level = 0

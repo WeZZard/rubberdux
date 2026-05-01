@@ -23,7 +23,7 @@ enum BinaryLocator {
                 let candidate = workspace
                     .appendingPathComponent("target")
                     .appendingPathComponent(profile)
-                    .appendingPathComponent("rubberdux")
+                    .appendingPathComponent("rubberduxd")
                 if isUsableBackend(candidate, selfPath: selfPath) {
                     return candidate
                 }

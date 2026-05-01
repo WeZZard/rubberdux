@@ -237,7 +237,7 @@ impl VMManager {
                 .join("target")
                 .join("aarch64-unknown-linux-musl")
                 .join("release")
-                .join("rubberdux")
+                .join("rubberduxd")
         } else {
             std::env::current_exe()
                 .map_err(|e| Error::Vm(format!("failed to get current exe: {}", e)))?
@@ -262,7 +262,7 @@ impl VMManager {
                 "-i",
                 &key_path.to_string_lossy(),
                 &binary_path.to_string_lossy(),
-                &format!("admin@{}:/tmp/rubberdux.new", handle.ip),
+                &format!("admin@{}:/tmp/rubberduxd.new", handle.ip),
             ])
             .output()
             .await
@@ -280,7 +280,7 @@ impl VMManager {
                 "-o", "ConnectTimeout=10",
                 "-i", &key_path.to_string_lossy(),
                 &format!("admin@{}", handle.ip),
-                "sudo cp /tmp/rubberdux.new /usr/local/bin/rubberdux && sudo chmod +x /usr/local/bin/rubberdux",
+                "sudo cp /tmp/rubberduxd.new /usr/local/bin/rubberduxd && sudo chmod +x /usr/local/bin/rubberduxd",
             ])
             .output()
             .await

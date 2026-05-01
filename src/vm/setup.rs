@@ -434,7 +434,7 @@ async fn provision_base_vm(image: &VMImage) -> Result<(), Error> {
             .join("target")
             .join("aarch64-unknown-linux-musl")
             .join("release")
-            .join("rubberdux");
+            .join("rubberduxd");
         if !linux_binary.exists() {
             return Err(Error::Vm(format!(
                 "Linux agent binary not found at {}. Build it with:\n\
@@ -442,11 +442,11 @@ async fn provision_base_vm(image: &VMImage) -> Result<(), Error> {
                 linux_binary.display()
             )));
         }
-        tokio::fs::copy(&linux_binary, provision_dir.join("rubberdux")).await?;
+        tokio::fs::copy(&linux_binary, provision_dir.join("rubberduxd")).await?;
     } else {
         let exe_path = std::env::current_exe()
             .map_err(|e| Error::Vm(format!("failed to get current exe: {}", e)))?;
-        tokio::fs::copy(&exe_path, provision_dir.join("rubberdux")).await?;
+        tokio::fs::copy(&exe_path, provision_dir.join("rubberduxd")).await?;
     }
 
     // Start VM with shared directory
@@ -566,7 +566,7 @@ fn compute_provision_hash(image: &VMImage) -> Result<String, Error> {
             .join("target")
             .join("aarch64-unknown-linux-musl")
             .join("release")
-            .join("rubberdux")
+            .join("rubberduxd")
     } else {
         std::env::current_exe()
             .map_err(|e| Error::Vm(format!("failed to get current exe: {}", e)))?
