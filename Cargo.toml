@@ -48,6 +48,7 @@ md-testing = { path = "crates/md-testing" }
 unicode-segmentation = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
+axum = { version = "0.8", features = ["ws"] }
 spider = { version = "2", features = [
     "chrome",
     "chrome_stealth",
@@ -60,6 +61,8 @@ spider = { version = "2", features = [
 [dev-dependencies]
 wiremock = "0.6"
 serial_test = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [[test]]
 name = "telegram_channel_agent"

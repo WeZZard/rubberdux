@@ -2,6 +2,7 @@ mod agent;
 #[cfg(feature = "host")]
 mod channel;
 mod error;
+mod gateway;
 mod hardened_prompts;
 #[cfg(feature = "host")]
 mod host;

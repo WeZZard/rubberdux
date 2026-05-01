@@ -188,8 +188,21 @@ pub async fn run(
 
     let client = Arc::new(crate::provider::moonshot::MoonshotClient::from_env());
 
+    let gateway_system_prompt = system_prompt.clone();
     let builder = AgentLoopBuilder::new(system_prompt, session_manager).with_session_id(session_id);
     let (agent_loop, input_port, _context_tx) = builder.build(client).await;
+
+    let _gateway_handle = {
+        let output_port = agent_loop.subscribe_output();
+        let identity = std::fs::read_to_string(prompt_dir.join("IDENTITY.md")).unwrap_or_default();
+        let soul = std::fs::read_to_string(prompt_dir.join("SOUL.md")).unwrap_or_default();
+        let gateway_state = Arc::new(crate::gateway::state::GatewayState::new(
+            gateway_system_prompt, identity, soul,
+        ));
+        let state_clone = gateway_state.clone();
+        tokio::spawn(crate::gateway::stream::mirror_entries(output_port, state_clone));
+        tokio::spawn(crate::gateway::server::run(gateway_state))
+    };
 
     // Spawn AgentLoop
     tokio::spawn(async move {

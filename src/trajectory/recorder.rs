@@ -116,6 +116,35 @@ impl TrajectoryRecorder for FilesystemTrajectoryRecorder {
     }
 }
 
+pub struct BroadcastTrajectoryRecorder {
+    inner: SharedTrajectoryRecorder,
+    tx: tokio::sync::broadcast::Sender<TrajectoryEvent>,
+    next_seq: AtomicU64,
+}
+
+impl BroadcastTrajectoryRecorder {
+    pub fn new(
+        inner: SharedTrajectoryRecorder,
+        tx: tokio::sync::broadcast::Sender<TrajectoryEvent>,
+    ) -> Self {
+        Self {
+            inner,
+            tx,
+            next_seq: AtomicU64::new(0),
+        }
+    }
+}
+
+impl TrajectoryRecorder for BroadcastTrajectoryRecorder {
+    fn record(&self, draft: TrajectoryEventDraft) {
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let inner_draft = draft.clone();
+        let event = TrajectoryEvent::from_draft(seq, draft);
+        self.inner.record(inner_draft);
+        let _ = self.tx.send(event);
+    }
+}
+
 pub fn noop_recorder() -> SharedTrajectoryRecorder {
     std::sync::Arc::new(NoopTrajectoryRecorder)
 }
@@ -141,5 +170,33 @@ mod tests {
         assert_eq!(events[1].seq, 1);
         assert_eq!(events[0].event_id, "evt_0");
         assert_eq!(events[1].event_id, "evt_1");
+    }
+
+    #[test]
+    fn test_broadcast_recorder_delegates_to_inner() {
+        let inner = std::sync::Arc::new(MemoryTrajectoryRecorder::new());
+        let shared: SharedTrajectoryRecorder = inner.clone();
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let recorder = BroadcastTrajectoryRecorder::new(shared, tx);
+
+        recorder.record(TrajectoryEventDraft::new("test.event", "test", "main"));
+
+        let events = inner.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "test.event");
+    }
+
+    #[test]
+    fn test_broadcast_recorder_broadcasts() {
+        let inner = std::sync::Arc::new(MemoryTrajectoryRecorder::new());
+        let shared: SharedTrajectoryRecorder = inner.clone();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let recorder = BroadcastTrajectoryRecorder::new(shared, tx);
+
+        recorder.record(TrajectoryEventDraft::new("broadcast.test", "test", "main"));
+
+        let event = rx.try_recv().expect("should receive broadcast event");
+        assert_eq!(event.event_type, "broadcast.test");
+        assert_eq!(event.seq, 0);
     }
 }
