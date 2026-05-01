@@ -34,6 +34,10 @@ class MainSplitViewController: NSSplitViewController {
             self?.showContent(for: item)
         }
 
+        sidebarViewController.onSettingsClicked = {
+            (NSApp.delegate as? AppDelegate)?.showSettings()
+        }
+
         webSocketClient.connect()
     }
 
