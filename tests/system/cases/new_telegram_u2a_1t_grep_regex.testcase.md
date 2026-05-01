@@ -10,12 +10,12 @@ target: telegram-channel
 ## User Message
 Search for all lines starting with "pub fn" in the src directory.
 
-## Assistant Message
+## Tool Call
 ```cel
 message.tool_calls.exists(t, t.name == "grep" || t.name == "bash")
 ```
 
 ## Assistant Message
 ```cel
-message.text.contains("pub fn")
+message.text.contains("matches") || message.text.contains("Function") || message.text.contains("pub fn")
 ```

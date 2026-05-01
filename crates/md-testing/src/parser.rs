@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub struct TestCase {
     pub name: String,
     pub front_matter: FrontMatter,
+    pub system_message: Option<String>,
     pub storyline: Vec<String>,
     pub messages: Vec<Message>,
 }
@@ -28,6 +29,15 @@ pub enum OrderingDirective {
     /// Match this assistant message somewhere after the previous match.
     /// Intervening unmatched assistant messages are allowed.
     Check,
+}
+
+/// The kind of content an expected assistant slot requires.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SlotKind {
+    /// The slot expects a tool-call message.
+    ToolCall,
+    /// The slot expects a text message.
+    Text,
 }
 
 /// A single assertion within a test case section.
@@ -68,8 +78,15 @@ impl std::fmt::Display for Assertion {
 /// A single message in the test case sequence.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
+    /// A system message — plain text system prompt.
+    System(String),
     /// A user message — either plain text or guidance for LLM generation.
     User(UserContent),
+    /// An expected tool-call turn — carries an ordering directive and assertions.
+    ToolCall {
+        directive: OrderingDirective,
+        assertions: Vec<Assertion>,
+    },
     /// An assistant message — carries an ordering directive and assertions.
     Assistant {
         directive: OrderingDirective,
@@ -97,6 +114,9 @@ pub fn parse(content: &str, name: &str) -> Result<TestCase, String> {
     // Expect ## Storyline first
     let storyline = parse_storyline(&events, &mut pos)?;
 
+    // Check for optional ## System Message between Storyline and first User Message
+    let system_message = parse_system_message(&events, &mut pos)?;
+
     // Collect messages in order
     let mut messages = Vec::new();
     while pos < events.len() {
@@ -106,7 +126,12 @@ pub fn parse(content: &str, name: &str) -> Result<TestCase, String> {
         }
 
         if let Some((heading_text, _)) = read_heading(&events, &mut pos) {
-            if heading_text == "User Message" {
+            if heading_text == "System Message" {
+                return Err(
+                    "Only one '## System Message' is allowed, and it must appear before any '## User Message'"
+                        .to_string(),
+                );
+            } else if heading_text == "User Message" {
                 let content = collect_section_content(&events, &mut pos)?;
 
                 if !content.comments.is_empty() && !content.plain_text.is_empty() {
@@ -122,6 +147,27 @@ pub fn parse(content: &str, name: &str) -> Result<TestCase, String> {
                         "User message must contain either HTML comments or plain text".to_string(),
                     );
                 }
+            } else if heading_text == "Tool Call" {
+                let content = collect_section_content(&events, &mut pos)?;
+
+                if !content.plain_text.is_empty() {
+                    return Err(
+                        "Tool call must contain only HTML comments or CEL blocks, not plain text"
+                            .to_string(),
+                    );
+                }
+
+                let assertions = content.into_assertions();
+                if assertions.is_empty() {
+                    return Err(
+                        "Tool call must contain at least one assertion".to_string()
+                    );
+                }
+
+                messages.push(Message::ToolCall {
+                    directive: OrderingDirective::Check,
+                    assertions,
+                });
             } else if heading_text == "Assistant Message" {
                 let content = collect_section_content(&events, &mut pos)?;
 
@@ -146,9 +192,9 @@ pub fn parse(content: &str, name: &str) -> Result<TestCase, String> {
             } else {
                 match parse_directive_from_heading(&heading_text) {
                     DirectiveParseResult::Found(directive, title) => {
-                        if title != "Assistant Message" {
+                        if title != "Assistant Message" && title != "Tool Call" {
                             return Err(format!(
-                                "Directive '{:?}' is only valid on '## Assistant Message', found '## {}'",
+                                "Directive '{:?}' is only valid on '## Assistant Message' or '## Tool Call', found '## {}'",
                                 directive, heading_text
                             ));
                         }
@@ -156,22 +202,41 @@ pub fn parse(content: &str, name: &str) -> Result<TestCase, String> {
                         let content = collect_section_content(&events, &mut pos)?;
 
                         if !content.plain_text.is_empty() {
-                            return Err(
-                                "Assistant message must contain only HTML comments or CEL blocks, not plain text"
-                                    .to_string(),
-                            );
+                            let label = if title == "Tool Call" {
+                                "Tool call"
+                            } else {
+                                "Assistant message"
+                            };
+                            return Err(format!(
+                                "{} must contain only HTML comments or CEL blocks, not plain text",
+                                label
+                            ));
                         }
 
                         let assertions = content.into_assertions();
                         if assertions.is_empty() {
-                            return Err("Assistant message must contain at least one assertion"
-                                .to_string());
+                            let label = if title == "Tool Call" {
+                                "Tool call"
+                            } else {
+                                "Assistant message"
+                            };
+                            return Err(format!(
+                                "{} must contain at least one assertion",
+                                label
+                            ));
                         }
 
-                        messages.push(Message::Assistant {
-                            directive,
-                            assertions,
-                        });
+                        if title == "Tool Call" {
+                            messages.push(Message::ToolCall {
+                                directive,
+                                assertions,
+                            });
+                        } else {
+                            messages.push(Message::Assistant {
+                                directive,
+                                assertions,
+                            });
+                        }
                     }
                     DirectiveParseResult::Unsupported(name) => {
                         return Err(format!(
@@ -204,6 +269,7 @@ pub fn parse(content: &str, name: &str) -> Result<TestCase, String> {
     Ok(TestCase {
         name: name.to_string(),
         front_matter,
+        system_message,
         storyline,
         messages,
     })
@@ -304,6 +370,54 @@ fn parse_storyline(events: &[Event], pos: &mut usize) -> Result<Vec<String>, Str
     }
 
     Ok(content.comments)
+}
+
+/// Parse an optional System Message section between Storyline and the first User Message.
+///
+/// If the next heading is `## System Message`, consumes it and returns
+/// the plain text content. Rejects HTML comments and CEL blocks within
+/// the system message. Returns `None` when the next heading is not
+/// `## System Message`.
+fn parse_system_message(events: &[Event], pos: &mut usize) -> Result<Option<String>, String> {
+    let saved = *pos;
+    skip_non_content(events, pos);
+
+    if *pos >= events.len() {
+        *pos = saved;
+        return Ok(None);
+    }
+
+    // Peek at the next heading without consuming it if it's not System Message
+    let peek_pos = *pos;
+    if let Some((text, _)) = read_heading(events, pos) {
+        if text == "System Message" {
+            let content = collect_section_content(events, pos)?;
+
+            if !content.comments.is_empty() {
+                return Err(
+                    "System Message must contain only plain text, not HTML comments".to_string(),
+                );
+            }
+
+            if !content.cel_blocks.is_empty() {
+                return Err(
+                    "System Message must contain only plain text, not CEL blocks".to_string(),
+                );
+            }
+
+            if content.plain_text.is_empty() {
+                return Err("System Message must contain plain text".to_string());
+            }
+
+            return Ok(Some(content.plain_text));
+        }
+        // Not a System Message heading — restore position
+        *pos = peek_pos;
+    } else {
+        *pos = saved;
+    }
+
+    Ok(None)
 }
 
 /// Read a heading at the current position.
@@ -921,5 +1035,206 @@ Hello
             }
             _ => panic!("Expected assistant message"),
         }
+    }
+
+    #[test]
+    fn test_parse_system_message() {
+        let content = r##"---
+target: agent-loop
+---
+
+## Storyline
+<!-- Test -->
+
+## System Message
+You are a helpful assistant.
+
+## User Message
+Hello
+
+## Assistant Message
+<!-- Should greet -->
+"##;
+
+        let case = parse(content, "system-msg").unwrap();
+        assert_eq!(
+            case.system_message,
+            Some("You are a helpful assistant.".to_string())
+        );
+        assert_eq!(case.messages.len(), 2);
+        match &case.messages[0] {
+            Message::User(UserContent::PlainText(t)) => assert_eq!(t, "Hello"),
+            _ => panic!("Expected user message"),
+        }
+        match &case.messages[1] {
+            Message::Assistant { assertions, .. } => {
+                assert_eq!(assertions.len(), 1);
+                assert_eq!(assertions[0], "Should greet");
+            }
+            _ => panic!("Expected assistant message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_tool_call() {
+        let content = "## Storyline\n<!-- Test -->\n\n## User Message\nCreate a file\n\n## Tool Call\n\n```cel\nmessage.tool_calls.exists(t, t.name == \"write_file\")\n```\n\n## Assistant Message\n<!-- Should confirm -->\n";
+
+        let case = parse(content, "tool-call").unwrap();
+        assert_eq!(case.messages.len(), 3);
+
+        match &case.messages[1] {
+            Message::ToolCall {
+                directive,
+                assertions,
+            } => {
+                assert!(matches!(directive, OrderingDirective::Check));
+                assert_eq!(assertions.len(), 1);
+                assert!(assertions[0].is_cel());
+            }
+            _ => panic!("Expected tool call message"),
+        }
+
+        match &case.messages[2] {
+            Message::Assistant { assertions, .. } => {
+                assert_eq!(assertions.len(), 1);
+                assert_eq!(assertions[0], "Should confirm");
+            }
+            _ => panic!("Expected assistant message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_check_tool_call() {
+        let content = r##"## Storyline
+<!-- Test -->
+
+## User Message
+Do something
+
+## CHECK: Tool Call
+<!-- Should use a tool -->
+"##;
+
+        let case = parse(content, "check-tool-call").unwrap();
+        assert_eq!(case.messages.len(), 2);
+        match &case.messages[1] {
+            Message::ToolCall {
+                directive,
+                assertions,
+            } => {
+                assert!(matches!(directive, OrderingDirective::Check));
+                assert_eq!(assertions.len(), 1);
+                assert_eq!(assertions[0], "Should use a tool");
+            }
+            _ => panic!("Expected tool call message with CHECK directive"),
+        }
+    }
+
+    #[test]
+    fn test_parse_mixed_tool_call_and_assistant() {
+        let content = "## Storyline\n<!-- Test -->\n\n## User Message\nCreate and verify\n\n## Tool Call\n\n```cel\nmessage.tool_calls.size() > 0\n```\n\n## Tool Call\n\n```cel\nmessage.tool_calls.exists(t, t.name == \"bash\")\n```\n\n## Assistant Message\n<!-- Should confirm -->\n";
+
+        let case = parse(content, "mixed-tool-assistant").unwrap();
+        assert_eq!(case.messages.len(), 4);
+
+        match &case.messages[0] {
+            Message::User(UserContent::PlainText(t)) => assert_eq!(t, "Create and verify"),
+            _ => panic!("Expected user message"),
+        }
+        match &case.messages[1] {
+            Message::ToolCall { assertions, .. } => {
+                assert_eq!(assertions.len(), 1);
+                assert!(assertions[0].is_cel());
+            }
+            _ => panic!("Expected first tool call"),
+        }
+        match &case.messages[2] {
+            Message::ToolCall { assertions, .. } => {
+                assert_eq!(assertions.len(), 1);
+                assert!(assertions[0].is_cel());
+            }
+            _ => panic!("Expected second tool call"),
+        }
+        match &case.messages[3] {
+            Message::Assistant { assertions, .. } => {
+                assert_eq!(assertions[0], "Should confirm");
+            }
+            _ => panic!("Expected assistant message"),
+        }
+    }
+
+    #[test]
+    fn test_rejects_multiple_system_messages() {
+        let content = r##"## Storyline
+<!-- Test -->
+
+## System Message
+First system message
+
+## System Message
+Second system message
+
+## User Message
+Hello
+
+## Assistant Message
+<!-- Greet -->
+"##;
+
+        let result = parse(content, "multiple-system");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("System Message"),
+            "Expected error about System Message, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_rejects_system_message_after_user() {
+        let content = r##"## Storyline
+<!-- Test -->
+
+## User Message
+Hello
+
+## System Message
+Too late
+
+## Assistant Message
+<!-- Greet -->
+"##;
+
+        let result = parse(content, "system-after-user");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("System Message"),
+            "Expected error about System Message, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_rejects_tool_call_plain_text() {
+        let content = r##"## Storyline
+<!-- Test -->
+
+## User Message
+Hello
+
+## Tool Call
+This is plain text
+"##;
+
+        let result = parse(content, "tool-call-plain");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("plain text"),
+            "Expected error about plain text, got: {}",
+            err
+        );
     }
 }

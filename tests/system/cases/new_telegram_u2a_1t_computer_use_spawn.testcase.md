@@ -10,9 +10,9 @@ target: telegram-channel
 ## User Message
 Use a computer-use agent to run "echo hello_from_child" and report the result.
 
-## Assistant Message
+## Tool Call
 ```cel
-message.tool_calls.exists(t, t.name == "computer_use")
+message.tool_calls.exists(t, t.name == "agent")
 ```
 
 ## Assistant Message

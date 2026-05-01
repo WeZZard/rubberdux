@@ -6,13 +6,13 @@ Test cases use FileCheck-inspired ordering directives to match expected assistan
 
 ### `CHECK:` — Gap-Tolerant Sequential Match
 
-**Syntax:** `## CHECK: Assistant Message`
+**Syntax:** `## CHECK: Assistant Message` or `## CHECK: Tool Call`
 
 **Semantics:**
-- Matches the assistant message somewhere after the previous matched slot.
-- Allows gaps: unmatched assistant messages may appear between consecutive matched slots.
-- The last expected slot is anchored to the last actual assistant message.
-- Any trailing assistant messages after the final expected slot cause the test to fail.
+- Matches the next actual message of compatible kind somewhere after the previous matched slot.
+- Allows gaps: unmatched actual messages may appear between consecutive matched slots.
+- The last expected slot is anchored to the last actual message and must be kind-compatible.
+- Any trailing actual messages after the final expected slot cause the test to fail.
 
 **Example:**
 ```markdown
@@ -36,7 +36,7 @@ If the agent produces 4 assistant messages for a 2-slot test:
 If the agent produces only 1 assistant message for a 2-slot test:
 - **Failure:** `TooFewMessages` — the test expects at least 2 assistant messages.
 
-**Bare heading shorthand:** `## Assistant Message` (without any directive prefix) is treated as implicit `## CHECK: Assistant Message`.
+**Bare heading shorthand:** `## Assistant Message` (without any directive prefix) is treated as implicit `## CHECK: Assistant Message`. Likewise, `## Tool Call` is treated as implicit `## CHECK: Tool Call`.
 
 ### `CHECK-NEXT:` — Immediate Adjacency (NOT IMPLEMENTED)
 
@@ -50,7 +50,7 @@ If the agent produces only 1 assistant message for a 2-slot test:
 
 ### Matching Algorithm
 
-The `match_assistant_slots` function implements the following rules:
+The `match_slots` function implements the following rules:
 
 1. **Exact count (1:1 mapping):** When `expected_count == actual_count`, each slot maps directly to the corresponding actual message index.
 
@@ -59,6 +59,28 @@ The `match_assistant_slots` function implements the following rules:
 3. **Multi-slot gap tolerance:** When `expected_count > 1` and `actual_count > expected_count`, earlier slots map to their corresponding index, and the final slot is anchored to the last actual message. Extra messages between the second-to-last mapped slot and the final anchored slot are treated as allowed gaps.
 
 4. **Insufficient messages:** When `actual_count < expected_count`, the test fails immediately with `TooFewMessages` before any LLM judge evaluation occurs.
+
+### Typed Slot Matching
+
+Expected slots are typed by their section heading:
+
+- **`## Tool Call`** (or `## CHECK: Tool Call`) — matches the next actual message where `tool_calls` is non-empty.
+- **`## Assistant Message`** (or `## CHECK: Assistant Message`) — matches the next actual message where text content is non-empty.
+
+Both slot types use CHECK: semantics (gap-tolerant, forward-scanning). The matching cursor advances through actual messages in order, skipping messages whose kind does not match the current slot's type. Each slot consumes the first kind-compatible actual message at or after the cursor.
+
+**Last-slot anchor rule:** The final expected slot is anchored to the last actual message. That last actual message must be kind-compatible with the final slot (e.g., a `## Tool Call` final slot requires the last actual message to have tool calls). If it is not kind-compatible, the test fails.
+
+### `## System Message`
+
+**Syntax:** `## System Message`
+
+Provides the system prompt for the agent conversation. Optional. Appears between `## Storyline` and the first `## User Message`. At most one per testcase. It is not an expected slot — it does not participate in slot matching.
+
+```markdown
+## System Message
+You are a helpful coding assistant.
+```
 
 ### Unsupported Directives
 

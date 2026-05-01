@@ -3,12 +3,12 @@ target: agent-loop
 ---
 
 ## Storyline
-<!-- The agent should report that a replacement string was not found in the file -->
+<!-- The agent should create a file and then fail to replace a string that is not present -->
 
 ## User Message
-Edit /tmp/test_malformed.txt to replace "foo" with "bar". (Assume the file does not contain "foo".)
+First, create /tmp/test_malformed.txt with the content "hello world". Then edit it to replace "foo" with "bar".
 
-## Assistant Message
+## Tool Call
 
 ```cel
 message.tool_calls.size() > 0

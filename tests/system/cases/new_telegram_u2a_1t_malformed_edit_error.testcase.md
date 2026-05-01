@@ -3,16 +3,21 @@ target: telegram-channel
 ---
 
 ## Storyline
-<!-- The agent should handle a user asking to edit a file when the replacement string is absent -->
-<!-- The agent should report that the requested replacement cannot be applied -->
+<!-- The agent should create a file and then fail to replace a string that is not present -->
+<!-- The agent should report that the replacement string was not found -->
 
 ## User Message
-Edit /tmp/test_malformed.txt to replace "foo" with "bar". (Assume the file does not contain "foo".)
+First, create /tmp/test_malformed.txt with the content "hello world". Then edit it to replace "foo" with "bar".
 
-## Assistant Message
+## Tool Call
 ```cel
 message.tool_calls.size() > 0
 ```
 
 ## Assistant Message
+
+```cel
+message.text_lower.contains("not") || message.text_lower.contains("error") || message.text_lower.contains("found") || message.text_lower.contains("fail")
+```
+
 <!-- The assistant should report that the replacement string was not found -->

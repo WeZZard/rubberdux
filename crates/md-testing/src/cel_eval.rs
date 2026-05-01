@@ -86,6 +86,11 @@ fn populate_context(context: &mut Context, variables: &CelContext) {
             Value::String(Arc::new(msg.text.clone())),
         );
 
+        message_map.insert(
+            Arc::new("text_lower".to_string()),
+            Value::String(Arc::new(msg.text.to_lowercase())),
+        );
+
         let tool_calls: Vec<Value> = msg
             .tool_calls
             .iter()

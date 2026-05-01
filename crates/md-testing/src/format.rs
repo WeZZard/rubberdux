@@ -14,6 +14,8 @@ pub fn render_agent_input(test_case: &TestCase) -> Vec<String> {
         .filter_map(|msg| match msg {
             Message::User(UserContent::PlainText(text)) => Some(text.clone()),
             Message::User(UserContent::Guidance(_)) => None, // Must be generated
+            Message::System(_) => None,                      // Not sent as user input
+            Message::ToolCall { .. } => None,                // Not sent to agent
             Message::Assistant { .. } => None,               // Not sent to agent
         })
         .collect()

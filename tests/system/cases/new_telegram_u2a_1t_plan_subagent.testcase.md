@@ -10,9 +10,9 @@ timeout: 240
 ## User Message
 Use a plan subagent to propose three concise steps for adding a tiny `/health` REST endpoint in Rust, then report the three steps.
 
-## Assistant Message
+## Tool Call
 ```cel
-message.tool_calls.exists(t, t.name == "plan")
+message.tool_calls.exists(t, t.name == "agent")
 ```
 
 ## Assistant Message

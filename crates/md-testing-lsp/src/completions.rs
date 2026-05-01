@@ -10,6 +10,11 @@ pub fn cel_completions() -> Vec<CompletionItem> {
         "The assistant's text content",
     ));
     items.push(variable_completion(
+        "message.text_lower",
+        "string",
+        "Lowercased text content (for case-insensitive matching)",
+    ));
+    items.push(variable_completion(
         "message.tool_calls",
         "list",
         "Tool calls made in this message",

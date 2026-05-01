@@ -7,9 +7,9 @@ use md_testing::evaluator::{AssertionEvaluator, Evaluatable};
 use md_testing::guidance::render_guidance;
 use md_testing::llm::{LlmClient, LlmError};
 use md_testing::narration;
-use md_testing::ordering::match_assistant_slots;
-use md_testing::{AssistantSlotArtifact, ExchangeFailure, ExecutionArtifact};
-use md_testing::{Message, OrderingDirective, UserContent};
+use md_testing::ordering::match_slots;
+use md_testing::{ActualMessage, ExchangeFailure, ExecutionArtifact, SlotArtifact};
+use md_testing::{Message, OrderingDirective, SlotKind, UserContent};
 
 use super::agent_loop_harness::AgentLoopHarness;
 
@@ -101,9 +101,11 @@ async fn execute_cases(
         let timeout = Duration::from_secs(case.front_matter.timeout.max(60));
 
         let mut user_messages: Vec<String> = Vec::new();
-        let mut assistant_slots: Vec<(OrderingDirective, Vec<md_testing::Assertion>)> = Vec::new();
+        let mut assistant_slots: Vec<(SlotKind, OrderingDirective, Vec<md_testing::Assertion>)> =
+            Vec::new();
         let mut pending_user_batch: Vec<String> = Vec::new();
         let mut exchange_failures: Vec<ExchangeFailure> = Vec::new();
+        let mut system_message: Option<String> = None;
 
         for msg in case.messages.iter() {
             match msg {
@@ -117,6 +119,33 @@ async fn execute_cases(
                     println!("  User: {}", text);
                     user_messages.push(text.clone());
                     pending_user_batch.push(text);
+                }
+                Message::ToolCall {
+                    directive,
+                    assertions,
+                } => {
+                    // Flush any accumulated user messages before processing the assistant slot.
+                    if !pending_user_batch.is_empty() {
+                        let exchange = if pending_user_batch.len() == 1 {
+                            harness.send_message(&pending_user_batch[0], timeout).await
+                        } else {
+                            harness
+                                .send_messages_batch(&pending_user_batch, timeout)
+                                .await
+                        };
+                        if let Some(reason) = exchange.failure_reason {
+                            exchange_failures.push(ExchangeFailure {
+                                user_message_index: user_messages.len().saturating_sub(1),
+                                reason,
+                            });
+                        }
+                        pending_user_batch.clear();
+                    }
+                    assistant_slots.push((
+                        SlotKind::ToolCall,
+                        directive.clone(),
+                        assertions.clone(),
+                    ));
                 }
                 Message::Assistant {
                     directive,
@@ -139,7 +168,11 @@ async fn execute_cases(
                         }
                         pending_user_batch.clear();
                     }
-                    assistant_slots.push((directive.clone(), assertions.clone()));
+                    assistant_slots
+                        .push((SlotKind::Text, directive.clone(), assertions.clone()));
+                }
+                Message::System(text) => {
+                    system_message = Some(text.clone());
                 }
             }
         }
@@ -189,12 +222,14 @@ async fn execute_cases(
             run_id: run_id.to_string(),
             timestamp: run_timestamp.to_string(),
             target: case.front_matter.target.clone(),
+            system_message: system_message.clone(),
             case_content,
             trajectory_markdown: narration_text,
             user_messages,
-            assistant_slots: assistant_slots
+            slots: assistant_slots
                 .into_iter()
-                .map(|(directive, assertions)| AssistantSlotArtifact {
+                .map(|(kind, directive, assertions)| SlotArtifact {
+                    kind,
                     directive,
                     assertions,
                 })
@@ -242,10 +277,10 @@ async fn evaluate_execution_artifacts(
         let trajectory = ExecutionTrajectory {
             markdown: &artifact.trajectory_markdown,
         };
-        let directives: Vec<OrderingDirective> = artifact
-            .assistant_slots
+        let expected_slots: Vec<(SlotKind, OrderingDirective)> = artifact
+            .slots
             .iter()
-            .map(|slot| slot.directive.clone())
+            .map(|s| (s.kind.clone(), s.directive.clone()))
             .collect();
 
         let mut eval_results = String::new();
@@ -267,9 +302,23 @@ async fn evaluate_execution_artifacts(
             all_passed = false;
         }
 
+        // Build actual message descriptors from the session transcript.
+        let session_path = run_dir
+            .join(&artifact.testcase_name)
+            .join("session")
+            .join("main-agent.jsonl");
+        let assistant_messages = extract_assistant_messages(&session_path);
+        let actual_messages: Vec<ActualMessage> = assistant_messages
+            .iter()
+            .map(|m| ActualMessage {
+                has_tool_calls: !m.tool_calls.is_empty(),
+                has_text: !m.text.is_empty(),
+            })
+            .collect();
+
         // Run ordering match first.
         let (matched_indices, ordering_error) =
-            match match_assistant_slots(&directives, artifact.actual_assistant_count) {
+            match match_slots(&expected_slots, &actual_messages) {
                 Ok(indices) => (indices, None),
                 Err(e) => {
                     eval_results.push_str(&format!("## Ordering Match Error\n\n{}\n\n", e));
@@ -295,13 +344,7 @@ async fn evaluate_execution_artifacts(
             storyline_results.push((assertion.clone(), result));
         }
 
-        let session_path = run_dir
-            .join(&artifact.testcase_name)
-            .join("session")
-            .join("main-agent.jsonl");
-        let assistant_messages = extract_assistant_messages(&session_path);
-
-        for (slot_idx, slot) in artifact.assistant_slots.iter().enumerate() {
+        for (slot_idx, slot) in artifact.slots.iter().enumerate() {
             let actual_idx = matched_indices.get(slot_idx).copied();
             for assertion in &slot.assertions {
                 let assertion_text = assertion.display_text();
@@ -430,7 +473,7 @@ async fn evaluate_execution_artifacts(
         }
 
         // Ordering match result
-        let ordering_line = md_testing::find_assistant_heading_lines(case_content)
+        let ordering_line = md_testing::find_slot_heading_lines(case_content)
             .first()
             .copied()
             .unwrap_or(1);
@@ -449,7 +492,7 @@ async fn evaluate_execution_artifacts(
         }
 
         // Assistant assertions
-        let assistant_lines = md_testing::find_assistant_heading_lines(case_content);
+        let assistant_lines = md_testing::find_slot_heading_lines(case_content);
         for (slot_idx, actual_idx, assertion, result, cel_failed) in &assistant_results {
             let assertion_text = assertion.display_text();
             let heading_line = assistant_lines.get(*slot_idx).copied().unwrap_or(1);

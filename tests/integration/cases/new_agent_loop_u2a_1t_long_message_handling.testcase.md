@@ -18,7 +18,7 @@ The note then introduces traits and generics. Traits define shared behavior, sup
 ## Assistant Message
 
 ```cel
-message.text.contains("async") && message.text.contains("ownership")
+message.text_lower.contains("async") && message.text_lower.contains("ownership")
 ```
 
 <!-- The assistant should provide a coherent response covering all topics without truncation -->

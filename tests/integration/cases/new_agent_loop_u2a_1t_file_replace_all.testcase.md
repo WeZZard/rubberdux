@@ -9,7 +9,7 @@ timeout: 120
 ## User Message
 Create /tmp/test_replace.txt with "hello world hello" and replace all "hello" with "hi".
 
-## Assistant Message
+## Tool Call
 
 ```cel
 message.tool_calls.size() > 0
@@ -18,11 +18,5 @@ message.tool_calls.size() > 0
 ## Assistant Message
 
 ```cel
-message.text.contains("hi") || message.text.contains("replace")
-```
-
-## Assistant Message
-
-```cel
-message.text.contains("hi world hi") || message.text.contains("hi")
+message.text_lower.contains("hi world hi") || message.text_lower.contains("hi")
 ```

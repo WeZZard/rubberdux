@@ -9,7 +9,7 @@ target: agent-loop
 ## User Message
 Write "hello" to /tmp/test_change.txt.
 
-## Assistant Message
+## Tool Call
 
 ```cel
 message.tool_calls.exists(t, t.name == "write_file") || message.tool_calls.exists(t, t.name == "bash")
@@ -18,10 +18,12 @@ message.tool_calls.exists(t, t.name == "write_file") || message.tool_calls.exist
 ## User Message
 Actually, write "goodbye" to /tmp/test_change.txt instead.
 
-## Assistant Message
+## Tool Call
 
 ```cel
 message.tool_calls.exists(t, t.name == "write_file") || message.tool_calls.exists(t, t.name == "bash")
 ```
 
-<!-- The assistant should handle the updated request appropriately -->
+## Assistant Message
+
+<!-- The assistant should handle the updated request appropriately and write "goodbye" to the file -->

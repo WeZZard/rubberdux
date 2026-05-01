@@ -126,6 +126,11 @@ fn build_result_diagnostics(content: &str, results: &TestResults) -> Vec<Diagnos
             AssertionScope::FrontMatter { key } => {
                 md_testing::find_front_matter_key_line(content, key).unwrap_or(assertion.line)
             }
+            AssertionScope::AssistantMessage { slot_index, .. } => current_lines
+                .iter()
+                .find(|l| l.msg_index == *slot_index && l.assertion == assertion.assertion)
+                .map(|l| l.line)
+                .unwrap_or(assertion.line),
             _ => current_lines
                 .iter()
                 .find(|l| l.assertion == assertion.assertion)

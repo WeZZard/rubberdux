@@ -9,9 +9,9 @@ target: telegram-channel
 ## User Message
 Use a general-purpose agent to write a haiku about coding.
 
-## Assistant Message
+## Tool Call
 ```cel
-message.tool_calls.exists(t, t.name == "general_purpose")
+message.tool_calls.exists(t, t.name == "agent")
 ```
 
 ## Assistant Message

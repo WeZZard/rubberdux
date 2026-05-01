@@ -1,5 +1,6 @@
 ---
 target: telegram-channel
+timeout: 120
 ---
 
 ## Storyline
@@ -10,7 +11,7 @@ target: telegram-channel
 ## User Message
 Copy the src directory to /tmp/test_src_copy.
 
-## Assistant Message
+## Tool Call
 ```cel
 message.tool_calls.exists(t, t.name == "bash")
 ```

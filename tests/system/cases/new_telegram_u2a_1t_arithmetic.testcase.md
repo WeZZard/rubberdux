@@ -15,5 +15,5 @@ message.tool_calls.size() == 0
 ```
 <!-- The assistant should provide the correct product -->
 ```cel
-message.text.contains("838102050")
+message.text.contains("838102050") || message.text.contains("838,102,050")
 ```

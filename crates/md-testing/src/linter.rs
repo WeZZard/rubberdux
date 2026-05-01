@@ -160,6 +160,18 @@ pub fn lint_test_case(test_case: &TestCase) -> Result<(), Vec<LintError>> {
                     }
                 }
             },
+            Message::ToolCall { assertions, .. } => {
+                if assertions.is_empty() {
+                    errors.push(LintError {
+                        line: 1,
+                        rule: "R5",
+                        message: format!(
+                            "Tool call {} must contain at least one assertion",
+                            i + 1
+                        ),
+                    });
+                }
+            }
             Message::Assistant { assertions, .. } => {
                 if assertions.is_empty() {
                     errors.push(LintError {
@@ -172,6 +184,7 @@ pub fn lint_test_case(test_case: &TestCase) -> Result<(), Vec<LintError>> {
                     });
                 }
             }
+            Message::System(_) => {}
         }
     }
 

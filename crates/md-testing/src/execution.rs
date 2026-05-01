@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::parser::Assertion;
+use crate::parser::{Assertion, SlotKind};
 use crate::OrderingDirective;
 
 /// Immutable record of a testcase execution before LLM-based evaluation.
@@ -15,19 +15,23 @@ pub struct ExecutionArtifact {
     pub run_id: String,
     pub timestamp: String,
     pub target: String,
+    pub system_message: Option<String>,
     pub case_content: String,
     pub trajectory_markdown: String,
     pub user_messages: Vec<String>,
-    pub assistant_slots: Vec<AssistantSlotArtifact>,
+    pub slots: Vec<SlotArtifact>,
     pub actual_assistant_count: usize,
     pub exchange_failures: Vec<ExchangeFailure>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AssistantSlotArtifact {
+pub struct SlotArtifact {
+    pub kind: SlotKind,
     pub directive: OrderingDirective,
     pub assertions: Vec<Assertion>,
 }
+
+pub type AssistantSlotArtifact = SlotArtifact;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExchangeFailure {
@@ -142,10 +146,12 @@ mod tests {
             run_id: "run".to_string(),
             timestamp: "2026-04-26-00-00-00-UTC".to_string(),
             target: "agent-loop".to_string(),
+            system_message: None,
             case_content: "## Storyline\n<!-- ok -->".to_string(),
             trajectory_markdown: "# transcript".to_string(),
             user_messages: vec!["hello".to_string()],
-            assistant_slots: vec![AssistantSlotArtifact {
+            slots: vec![SlotArtifact {
+                kind: crate::parser::SlotKind::Text,
                 directive: OrderingDirective::Check,
                 assertions: vec![Assertion::NaturalLanguage {
                     text: "responds".to_string(),
