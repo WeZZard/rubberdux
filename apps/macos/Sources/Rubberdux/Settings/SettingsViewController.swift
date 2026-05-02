@@ -1,5 +1,4 @@
 import AppKit
-import ServiceManagement
 
 final class SettingsViewController: NSViewController {
     var onAppearanceModeChanged: ((AppearanceMode) -> Void)?
@@ -9,7 +8,7 @@ final class SettingsViewController: NSViewController {
                                           target: nil, action: nil)
 
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 220))
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 200))
 
         let showInLabel = NSTextField(labelWithString: "Show in:")
         showInLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
@@ -49,20 +48,6 @@ final class SettingsViewController: NSViewController {
             loginCheckbox.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
             loginCheckbox.topAnchor.constraint(equalTo: previousAnchor, constant: 16),
         ])
-
-        if !BuildType.current.supportsLaunchAtLogin {
-            loginCheckbox.isEnabled = false
-            let hint = NSTextField(labelWithString:
-                "Available when Rubberdux is installed as an application.")
-            hint.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-            hint.textColor = .secondaryLabelColor
-            hint.translatesAutoresizingMaskIntoConstraints = false
-            view.addSubview(hint)
-            NSLayoutConstraint.activate([
-                hint.leadingAnchor.constraint(equalTo: loginCheckbox.leadingAnchor, constant: 18),
-                hint.topAnchor.constraint(equalTo: loginCheckbox.bottomAnchor, constant: 2),
-            ])
-        }
     }
 
     override func viewDidLoad() {
@@ -71,9 +56,7 @@ final class SettingsViewController: NSViewController {
         for radio in radioButtons {
             radio.state = radio.tag == current.rawValue ? .on : .off
         }
-        if BuildType.current.supportsLaunchAtLogin {
-            loginCheckbox.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        }
+        loginCheckbox.state = LoginItemManager.isEnabled() ? .on : .off
     }
 
     @objc private func radioChanged(_ sender: NSButton) {
@@ -84,11 +67,7 @@ final class SettingsViewController: NSViewController {
 
     @objc private func loginCheckboxChanged(_ sender: NSButton) {
         do {
-            if sender.state == .on {
-                try SMAppService.mainApp.register()
-            } else {
-                try SMAppService.mainApp.unregister()
-            }
+            try LoginItemManager.setEnabled(sender.state == .on)
         } catch {
             sender.state = sender.state == .on ? .off : .on
         }

@@ -35,7 +35,7 @@ enum SidebarItem: Hashable, CustomStringConvertible {
     }
 
     static var topLevel: [SidebarItem] {
-        var items: [SidebarItem] = [.conversation, .systemPrompts, .liveEvents]
-        return items
+        [.conversation, .systemPrompts, .liveEvents]
     }
+
 }

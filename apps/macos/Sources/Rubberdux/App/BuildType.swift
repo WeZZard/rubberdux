@@ -13,7 +13,7 @@ enum BuildType {
         return .release
     }
 
-    var supportsLaunchAtLogin: Bool {
-        self == .distributed
+    var usesLaunchAgent: Bool {
+        self != .distributed
     }
 }
