@@ -123,7 +123,7 @@ Cross-cutting files that don't belong to a single domain sit at `src/` root.
 **System tests:** full-application tests that run on the host machine with real dependencies (e.g., live LLM APIs) but without VM infrastructure or production external services. They exercise the complete application stack natively. Keep them in `tests/system/`.
 
 <SYSTEM_TESTS_EXAMPLES>
-  tests: `tests/system/{system_test_purpose}.rs`
+  tests: `tests/system/{system_test_purpose}.{rs|sh}`
 </SYSTEM_TESTS_EXAMPLES>
 
 <SYSTEM_TESTS_EXAMPLES>
@@ -133,7 +133,7 @@ Cross-cutting files that don't belong to a single domain sit at `src/` root.
 **End-to-end tests:** full-application tests that run on the host machine with real dependencies (e.g., live LLM APIs). They exercise the complete application stack natively. Keep them in `tests/e2e/`.
 
 <E2E_TESTS_EXAMPLES>
-  tests: `tests/e2e/{<archecture>-<vendor>-<os>[-<environment>]}/{optional: locale}/test_{e2e_life_cycle}_{e2e_test_purpose}.rs`
+  tests: `tests/e2e/{<archecture>-<vendor>-<os>[-<environment>]}/{optional: locale}/test_{e2e_life_cycle}_{e2e_test_purpose}.{rs|sh}`
 </E2E_TESTS_EXAMPLES>
 
 Explanation to `<archecture>-<vendor>-<os>[-<environment>]`:
