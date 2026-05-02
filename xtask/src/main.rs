@@ -1,10 +1,12 @@
 use clap::{Parser, Subcommand};
 
+mod distribute;
 mod launch;
 mod provision;
 mod sessions;
 mod stop;
 
+use distribute::distribute as distribute_app;
 use launch::launch_rubberdux;
 use provision::provision_images;
 use sessions::{archive_session, clear_sessions, delete_session, list_sessions};
@@ -28,6 +30,8 @@ enum Commands {
     Launch,
     /// Stop running rubberdux process and VMs
     Stop,
+    /// Build and package the macOS app for distribution
+    Distribute,
     /// Manage sessions
     Sessions {
         #[command(subcommand)]
@@ -66,6 +70,12 @@ async fn main() {
         Commands::Stop => {
             if let Err(e) = stop_rubberdux().await {
                 eprintln!("Stop failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Distribute => {
+            if let Err(e) = distribute_app().await {
+                eprintln!("Distribute failed: {}", e);
                 std::process::exit(1);
             }
         }

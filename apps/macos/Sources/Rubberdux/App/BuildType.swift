@@ -3,17 +3,14 @@ import Foundation
 enum BuildType {
     case debug
     case release
-    case distributed
+    case distribute
 
     static var current: BuildType {
-        guard let path = Bundle.main.executablePath else { return .release }
-        if path.contains("/target/debug/") { return .debug }
-        if path.contains("/target/release/") { return .release }
-        if Bundle.main.bundlePath.hasSuffix(".app") { return .distributed }
-        return .release
-    }
-
-    var usesLaunchAgent: Bool {
-        self != .distributed
+        switch Bundle.main.bundleIdentifier {
+        case "com.wezzard.rubberdux.debug": return .debug
+        case "com.wezzard.rubberdux.release": return .release
+        case "com.wezzard.rubberdux": return .distribute
+        default: return .debug
+        }
     }
 }

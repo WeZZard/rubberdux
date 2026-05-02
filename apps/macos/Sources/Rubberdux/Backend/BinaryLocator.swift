@@ -4,7 +4,6 @@ enum BinaryLocator {
     static func locate() throws -> URL {
         let selfPath = resolvedSelfExecutablePath()
 
-        // 1. RUBBERDUX_BIN environment variable
         if let envPath = ProcessInfo.processInfo.environment["RUBBERDUX_BIN"] {
             let url = URL(fileURLWithPath: envPath)
             if isUsableBackend(url, selfPath: selfPath) {
@@ -12,14 +11,22 @@ enum BinaryLocator {
             }
         }
 
-        // 2. Workspace-relative (walk up to find Cargo.toml)
+        if let workspacePath = Bundle.main.infoDictionary?["RubberduxWorkspaceRoot"] as? String,
+           !workspacePath.isEmpty {
+            let workspace = URL(fileURLWithPath: workspacePath)
+            for profile in preferredProfiles() {
+                let candidate = workspace
+                    .appendingPathComponent("target")
+                    .appendingPathComponent(profile)
+                    .appendingPathComponent("rubberduxd")
+                if isUsableBackend(candidate, selfPath: selfPath) {
+                    return candidate
+                }
+            }
+        }
+
         if let workspace = findWorkspaceRoot() {
-            #if DEBUG
-            let profiles = ["debug", "release"]
-            #else
-            let profiles = ["release", "debug"]
-            #endif
-            for profile in profiles {
+            for profile in preferredProfiles() {
                 let candidate = workspace
                     .appendingPathComponent("target")
                     .appendingPathComponent(profile)
@@ -31,6 +38,13 @@ enum BinaryLocator {
         }
 
         throw BackendProvider.Error.binaryNotFound
+    }
+
+    private static func preferredProfiles() -> [String] {
+        switch BuildType.current {
+        case .debug: return ["debug", "release"]
+        case .release, .distribute: return ["release", "debug"]
+        }
     }
 
     private static func isUsableBackend(_ url: URL, selfPath: String) -> Bool {

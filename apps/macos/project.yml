@@ -1,0 +1,39 @@
+name: Rubberdux
+configs:
+  Debug: debug
+  Release: release
+  Distribute: release
+configFiles:
+  Debug: Config/Debug.xcconfig
+  Release: Config/Release.xcconfig
+  Distribute: Config/Distribute.xcconfig
+settings:
+  base:
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    GENERATE_INFOPLIST_FILE: false
+    INFOPLIST_FILE: Sources/Rubberdux/Info.plist
+    CODE_SIGN_ENTITLEMENTS: Sources/Rubberdux/Rubberdux.entitlements
+    COMBINE_HIDPI_IMAGES: true
+    ENABLE_HARDENED_RUNTIME: true
+    LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
+targets:
+  Rubberdux:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/Rubberdux
+    settings:
+      base:
+        PRODUCT_NAME: "$(inherited)"
+        PRODUCT_BUNDLE_IDENTIFIER: "$(inherited)"
+  RubberduxTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/RubberduxTests
+    dependencies:
+      - target: Rubberdux
+    settings:
+      base:
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/$(PRODUCT_NAME).app/Contents/MacOS/$(PRODUCT_NAME)"
+        BUNDLE_LOADER: "$(TEST_HOST)"

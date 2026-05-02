@@ -105,22 +105,63 @@ Cross-cutting files that don't belong to a single domain sit at `src/` root.
 **Unit tests:** inline `#[cfg(test)] mod tests` at the bottom of the source file (Rust convention). Unit tests have direct access to private functions and run with `cargo test --lib`.
 
 **Integration tests:** replicate the path of the tested subject in `src` dir.
-<example>
+
+<INTEGRATION_TESTS_EXAMPLES>
   src: `src/<domain>/<layer>`
   tests: `tests/integration/<domain>/<layer>_{integration_test_purpose}.rs`
-</example>
+</INTEGRATION_TESTS_EXAMPLES>
 
-<example>
+<INTEGRATION_TESTS_EXAMPLES>
   src: `src/<domain>`
   tests: `tests/integration/<domain>_{integration_test_purpose}.rs`
-</example>
+</INTEGRATION_TESTS_EXAMPLES>
+
+<INTEGRATION_TESTS_EXAMPLES>
+  tests: `tests/integration/{agent-loop|telegram-channel}/test_{testing_purpose}.testcase.md`
+</INTEGRATION_TESTS_EXAMPLES>
 
 **System tests:** full-application tests that run on the host machine with real dependencies (e.g., live LLM APIs) but without VM infrastructure or production external services. They exercise the complete application stack natively. Keep them in `tests/system/`.
-<example>
+
+<SYSTEM_TESTS_EXAMPLES>
   tests: `tests/system/{system_test_purpose}.rs`
-  shared support: `tests/system/support/`
-  shared cases: `tests/system/cases/`
-</example>
+</SYSTEM_TESTS_EXAMPLES>
+
+<SYSTEM_TESTS_EXAMPLES>
+  tests: `tests/system/{agent-loop|telegram-channel}/test_{testing_purpose}.testcase.md`
+</SYSTEM_TESTS_EXAMPLES>
+
+**End-to-end tests:** full-application tests that run on the host machine with real dependencies (e.g., live LLM APIs). They exercise the complete application stack natively. Keep them in `tests/e2e/`.
+
+<E2E_TESTS_EXAMPLES>
+  tests: `tests/e2e/{<archecture>-<vendor>-<os>[-<environment>]}/{optional: locale}/test_{e2e_life_cycle}_{e2e_test_purpose}.rs`
+</E2E_TESTS_EXAMPLES>
+
+Explanation to `<archecture>-<vendor>-<os>[-<environment>]`:
+
+- `<architecture>`: Required. The processor architecture. Aligns to the architecture in the LLVM triple. **You MUST use lowercase.**
+- `<vendor>`: Required. The OS vendor. Aligns to the OS vendor in the LLVM triple. **You MUST use lowercase.**
+- `<os>`: Required. The OS. Aligns to the OS in the LLVM triple. **You MUST use lowercase.**
+- `<environemnt>` Optional. The environment of the OS. **You MUST use lowercase.**
+
+`<archecture>-<vendor>-<os>[-<environment>]` basically aligns to the LLVM triple with the optional `environment` fourth element.
+You **MUST** use lowercase in each element of the identifier `<archecture>-<vendor>-<os>[-<environment>]`.
+
+Available Environment:
+
+<E2E_ENVIRONMENT>
+GNU, GNUABIN32, GNUABI64, GNUEABI, GNUEABIHF, GNUX32, CODE16, EABI, EABIHF, ELFv1, ELFv2, Android, Musl, MuslEABI, MuslEABIHF,
+MSVC, Itanium, Cygnus, CoreCLR, Simulator, MacABI
+</E2E_ENVIRONMENT>
+
+Available E2E Life-cycle:
+
+<E2E_LIFE_CYCLE>
+Build
+Profile
+Integration
+Distribution
+Release
+</E2E_LIFE_CYCLE>
 
 **Mock data policy:** Only unit tests may use mocked data. Integration tests, system tests, and end-to-end tests must use real model calls.
 
@@ -209,6 +250,7 @@ Comments explain the purpose of the item they're attached to, not how other part
 
 ## Testing
 
+- You **MUST** make all the testing tasks in each programming langauge (Rust, TypeScript, Swift, Objective-C) this project orchestrated by Rust cargo.
 - You **MUST** not set timeout when execute testing.
 
 ## User Experience Rules

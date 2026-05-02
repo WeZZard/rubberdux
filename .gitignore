@@ -10,3 +10,8 @@ crates/zed-md-testing/grammars/
 Cargo.lock
 
 .opencode/plans
+
+# Xcode
+apps/macos/*.xcodeproj/xcuserdata/
+apps/macos/*.xcodeproj/project.xcworkspace/xcuserdata/
+apps/macos/.build/

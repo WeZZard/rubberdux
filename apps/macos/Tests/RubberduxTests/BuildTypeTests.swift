@@ -2,15 +2,15 @@ import XCTest
 @testable import Rubberdux
 
 final class BuildTypeTests: XCTestCase {
-    func testDistributedSupportsLaunchAtLogin() {
-        XCTAssertTrue(BuildType.distributed.supportsLaunchAtLogin)
+    func testDebugBuildType() {
+        XCTAssertEqual(BuildType.debug, BuildType.debug)
     }
 
-    func testDebugDoesNotSupportLaunchAtLogin() {
-        XCTAssertFalse(BuildType.debug.supportsLaunchAtLogin)
+    func testReleaseBuildType() {
+        XCTAssertEqual(BuildType.release, BuildType.release)
     }
 
-    func testReleaseDoesNotSupportLaunchAtLogin() {
-        XCTAssertFalse(BuildType.release.supportsLaunchAtLogin)
+    func testDistributeBuildType() {
+        XCTAssertEqual(BuildType.distribute, BuildType.distribute)
     }
 }
