@@ -1,6 +1,22 @@
 use crate::provider::moonshot::Message;
 use serde::{Deserialize, Serialize};
 
+/// Identifies who produced an entry in the conversation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EntryOrigin {
+    System,
+    Assistant,
+    ToolCall,
+    User { channel: String },
+}
+
+impl Default for EntryOrigin {
+    fn default() -> Self {
+        EntryOrigin::System
+    }
+}
+
 /// A message with its lineage in the conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
@@ -8,6 +24,10 @@ pub struct Entry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<usize>,
     pub message: Message,
+    #[serde(default)]
+    pub origin: EntryOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_metadata: Option<serde_json::Value>,
 }
 
 /// Tracked message history with parent-linked entries.
@@ -46,10 +66,18 @@ impl EntryHistory {
                         }
                     }
                 };
+                let origin = match &message {
+                    Message::System { .. } => EntryOrigin::System,
+                    Message::User { .. } => EntryOrigin::User { channel: "unknown".into() },
+                    Message::Assistant { .. } => EntryOrigin::Assistant,
+                    Message::Tool { .. } => EntryOrigin::ToolCall,
+                };
                 Entry {
                     id: i,
                     parent_id,
                     message,
+                    origin,
+                    channel_metadata: None,
                 }
             })
             .collect();
@@ -57,12 +85,33 @@ impl EntryHistory {
         Self { entries, next_id }
     }
 
-    fn push(&mut self, parent_id: Option<usize>, message: Message) -> usize {
+    fn push(&mut self, parent_id: Option<usize>, message: Message, origin: EntryOrigin) -> usize {
         let id = self.next_id;
         self.entries.push(Entry {
             id,
             parent_id,
             message,
+            origin,
+            channel_metadata: None,
+        });
+        self.next_id += 1;
+        id
+    }
+
+    /// Push a user message with channel metadata attached.
+    pub fn push_user_with_metadata(
+        &mut self,
+        message: Message,
+        origin: EntryOrigin,
+        channel_metadata: Option<serde_json::Value>,
+    ) -> usize {
+        let id = self.next_id;
+        self.entries.push(Entry {
+            id,
+            parent_id: None,
+            message,
+            origin,
+            channel_metadata,
         });
         self.next_id += 1;
         id
@@ -70,22 +119,22 @@ impl EntryHistory {
 
     /// Push a system message (no parent).
     pub fn push_system(&mut self, message: Message) -> usize {
-        self.push(None, message)
+        self.push(None, message, EntryOrigin::System)
     }
 
     /// Push a user message (root of a conversation turn, no parent).
     pub fn push_user(&mut self, message: Message) -> usize {
-        self.push(None, message)
+        self.push(None, message, EntryOrigin::User { channel: "unknown".into() })
     }
 
     /// Push an assistant message (parent = immediate predecessor).
     pub fn push_assistant(&mut self, parent_id: usize, message: Message) -> usize {
-        self.push(Some(parent_id), message)
+        self.push(Some(parent_id), message, EntryOrigin::Assistant)
     }
 
     /// Push a tool result (parent = assistant that requested it).
     pub fn push_tool(&mut self, parent_id: usize, message: Message) -> usize {
-        self.push(Some(parent_id), message)
+        self.push(Some(parent_id), message, EntryOrigin::ToolCall)
     }
 
     /// Project to API messages (strips tracking).
@@ -170,12 +219,15 @@ mod tests {
             message: Message::User {
                 content: UserContent::Text("hello".into()),
             },
+            origin: EntryOrigin::User { channel: "telegram".into() },
+            channel_metadata: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let restored: Entry = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.id, 5);
         assert_eq!(restored.parent_id, Some(3));
         assert_eq!(restored.message.content_text(), "hello");
+        assert_eq!(restored.origin, EntryOrigin::User { channel: "telegram".into() });
 
         // None parent_id case
         let entry_no_parent = Entry {
@@ -184,6 +236,8 @@ mod tests {
             message: Message::System {
                 content: "sys".into(),
             },
+            origin: EntryOrigin::System,
+            channel_metadata: None,
         };
         let json = serde_json::to_string(&entry_no_parent).unwrap();
         assert!(!json.contains("parent_id")); // skip_serializing_if
@@ -355,5 +409,64 @@ mod tests {
         assert_eq!(h.entries()[0].id, 0);
         assert_eq!(h.entries()[0].parent_id, None);
         assert!(matches!(&h.entries()[0].message, Message::System { .. }));
+    }
+
+    #[test]
+    fn test_entry_origin_serialization() {
+        let system = EntryOrigin::System;
+        let json = serde_json::to_value(&system).unwrap();
+        assert_eq!(json, serde_json::json!({"type": "system"}));
+
+        let user = EntryOrigin::User { channel: "telegram".into() };
+        let json = serde_json::to_value(&user).unwrap();
+        assert_eq!(json, serde_json::json!({"type": "user", "channel": "telegram"}));
+
+        let assistant = EntryOrigin::Assistant;
+        let json = serde_json::to_value(&assistant).unwrap();
+        assert_eq!(json, serde_json::json!({"type": "assistant"}));
+
+        let tool_call = EntryOrigin::ToolCall;
+        let json = serde_json::to_value(&tool_call).unwrap();
+        assert_eq!(json, serde_json::json!({"type": "tool_call"}));
+
+        // Round-trip
+        let restored: EntryOrigin = serde_json::from_value(serde_json::json!({"type": "user", "channel": "gateway"})).unwrap();
+        assert_eq!(restored, EntryOrigin::User { channel: "gateway".into() });
+    }
+
+    #[test]
+    fn test_entry_with_origin_serialization() {
+        let entry = Entry {
+            id: 1,
+            parent_id: None,
+            message: Message::User {
+                content: UserContent::Text("hello".into()),
+            },
+            origin: EntryOrigin::User { channel: "telegram".into() },
+            channel_metadata: Some(serde_json::json!({"telegram_message_id": 123})),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"origin\""));
+        assert!(json.contains("\"channel_metadata\""));
+
+        // None channel_metadata is omitted
+        let entry_no_meta = Entry {
+            id: 2,
+            parent_id: None,
+            message: Message::System { content: "sys".into() },
+            origin: EntryOrigin::System,
+            channel_metadata: None,
+        };
+        let json = serde_json::to_string(&entry_no_meta).unwrap();
+        assert!(!json.contains("channel_metadata"));
+    }
+
+    #[test]
+    fn test_entry_backward_compat() {
+        // Legacy JSON without origin field
+        let json = r#"{"id":0,"message":{"role":"system","content":"test"}}"#;
+        let entry: Entry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.origin, EntryOrigin::System);
+        assert_eq!(entry.channel_metadata, None);
     }
 }

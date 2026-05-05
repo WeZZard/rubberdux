@@ -1,15 +1,18 @@
 import AppKit
 import Combine
 
-class ConversationViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
+class ConversationViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     private let tableView = NSTableView()
     private let scrollView = NSScrollView()
+    private let inputField = NSTextField()
     private var entries: [Entry] = []
     private var cancellables = Set<AnyCancellable>()
     private let apiClient: APIClient
+    private let webSocketClient: WebSocketClient
 
-    init(apiClient: APIClient) {
+    init(apiClient: APIClient, webSocketClient: WebSocketClient) {
         self.apiClient = apiClient
+        self.webSocketClient = webSocketClient
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -22,11 +25,21 @@ class ConversationViewController: NSViewController, NSTableViewDataSource, NSTab
         scrollView.hasVerticalScroller = true
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(scrollView)
+
+        inputField.placeholderString = "Type a message..."
+        inputField.translatesAutoresizingMaskIntoConstraints = false
+        inputField.delegate = self
+        view.addSubview(inputField)
+
         NSLayoutConstraint.activate([
             scrollView.topAnchor.constraint(equalTo: view.topAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: inputField.topAnchor, constant: -8),
             scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+
+            inputField.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -8),
+            inputField.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
+            inputField.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
         ])
 
         let roleColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("role"))
@@ -53,6 +66,31 @@ class ConversationViewController: NSViewController, NSTableViewDataSource, NSTab
     override func viewDidLoad() {
         super.viewDidLoad()
         refresh()
+
+        webSocketClient.chatEntrySubject
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                guard let self else { return }
+                if !self.entries.contains(where: { $0.id == notification.entry.id }) {
+                    self.entries.append(notification.entry)
+                    self.tableView.reloadData()
+                    self.tableView.scrollRowToVisible(self.entries.count - 1)
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    // MARK: - NSTextFieldDelegate
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(insertNewline(_:)) {
+            let text = inputField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return true }
+            webSocketClient.sendMessage(text)
+            inputField.stringValue = ""
+            return true
+        }
+        return false
     }
 
     func refresh() {

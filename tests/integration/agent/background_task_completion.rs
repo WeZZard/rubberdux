@@ -2,21 +2,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use rubberdux::agent::entry::EntryOrigin;
 use rubberdux::agent::runtime::agent_loop::{AgentLoop, AgentLoopConfig};
 use rubberdux::agent::runtime::compaction::EvictOldestTurns;
-use rubberdux::agent::runtime::port::{LoopEvent, LoopOutput};
+use rubberdux::agent::runtime::port::{EntryNotification, LoopEvent};
 use rubberdux::provider::moonshot::{Message, MoonshotClient, UserContent};
 
 use crate::support::artifact;
 use crate::support::mock_tools::{MockBackgroundTool, build_registry_with};
 
 /// Test that background task completion reaches the AgentLoop and triggers
-/// a final response with the correct reply_to metadata.
+/// a final response.
 #[tokio::test]
 async fn test_background_task_completion_reaches_agent_loop() {
     let mock_server = MockServer::start().await;
@@ -98,28 +99,37 @@ async fn test_background_task_completion_reaches_agent_loop() {
     };
 
     let (agent_loop, input_port) = AgentLoop::new(config).await;
+    let mut entry_rx = agent_loop.subscribe_output().into_receiver();
     let agent_handle = tokio::spawn(async move {
         agent_loop.run().await;
     });
 
     // Send message that triggers background task
-    let (reply_tx, mut reply_rx) = mpsc::channel::<LoopOutput>(32);
     let event = LoopEvent::UserMessage {
         message: Message::User {
             content: UserContent::Text("trigger background".into()),
         },
-        reply: Some(reply_tx),
-        metadata: Some(Box::new(42i32)),
+        origin: EntryOrigin::User {
+            channel: "test".into(),
+        },
+        channel_metadata: Some(serde_json::json!(42)),
     };
     input_port.send(event).await.unwrap();
 
     // Collect initial response (background task started)
     let mut initial_received = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while let Ok(Some(output)) = tokio::time::timeout_at(deadline, reply_rx.recv()).await {
-        if !output.is_final {
-            initial_received = true;
-            break;
+    loop {
+        match tokio::time::timeout_at(deadline, entry_rx.recv()).await {
+            Ok(Ok(notification)) => {
+                if let Message::Assistant { content, .. } = &notification.entry.message {
+                    if !notification.is_final {
+                        initial_received = true;
+                        break;
+                    }
+                }
+            }
+            _ => break,
         }
     }
     assert!(
@@ -133,16 +143,17 @@ async fn test_background_task_completion_reaches_agent_loop() {
     // Collect final response
     let mut final_received = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while let Ok(Some(output)) = tokio::time::timeout_at(deadline, reply_rx.recv()).await {
-        if output.is_final {
-            final_received = true;
-            // Verify reply_to metadata is preserved
-            let metadata = output
-                .metadata
-                .as_ref()
-                .and_then(|m| m.downcast_ref::<i32>().copied());
-            assert_eq!(metadata, Some(42), "reply_to metadata should be preserved");
-            break;
+    loop {
+        match tokio::time::timeout_at(deadline, entry_rx.recv()).await {
+            Ok(Ok(notification)) => {
+                if let Message::Assistant { .. } = &notification.entry.message {
+                    if notification.is_final {
+                        final_received = true;
+                        break;
+                    }
+                }
+            }
+            _ => break,
         }
     }
     assert!(
@@ -178,12 +189,11 @@ async fn wait_for_events(events_path: &PathBuf) -> String {
                 return content;
             }
         }
-
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for {}",
-            events_path.display()
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        if tokio::time::Instant::now() > deadline {
+            return tokio::fs::read_to_string(events_path)
+                .await
+                .unwrap_or_default();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

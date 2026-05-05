@@ -4,6 +4,7 @@ class MainSplitViewController: NSSplitViewController {
     private let sidebarViewController = SidebarViewController()
     private let apiClient: APIClient
     private let webSocketClient: WebSocketClient
+    private var contentControllers: [SidebarItem: NSViewController] = [:]
 
     init(baseURL: URL) {
         self.apiClient = APIClient(baseURL: baseURL)
@@ -21,7 +22,7 @@ class MainSplitViewController: NSSplitViewController {
         sidebarItem.maximumThickness = 300
         addSplitViewItem(sidebarItem)
 
-        let contentItem = NSSplitViewItem(viewController: ConversationViewController(apiClient: apiClient))
+        let contentItem = NSSplitViewItem(viewController: contentController(for: .conversation))
         addSplitViewItem(contentItem)
 
         let inspectorItem = NSSplitViewItem(inspectorWithViewController: NSViewController())
@@ -42,10 +43,17 @@ class MainSplitViewController: NSSplitViewController {
     }
 
     private func showContent(for item: SidebarItem) {
+        splitViewItems[1].viewController = contentController(for: item)
+    }
+
+    private func contentController(for item: SidebarItem) -> NSViewController {
+        if let cached = contentControllers[item] {
+            return cached
+        }
         let vc: NSViewController
         switch item {
         case .conversation:
-            vc = ConversationViewController(apiClient: apiClient)
+            vc = ConversationViewController(apiClient: apiClient, webSocketClient: webSocketClient)
         case .identityPrompt:
             vc = PromptViewController(kind: .identity, apiClient: apiClient)
         case .soulPrompt:
@@ -57,7 +65,7 @@ class MainSplitViewController: NSSplitViewController {
         case .rawTrajectory:
             vc = EventStreamViewController(webSocketClient: webSocketClient)
         }
-
-        splitViewItems[1].viewController = vc
+        contentControllers[item] = vc
+        return vc
     }
 }

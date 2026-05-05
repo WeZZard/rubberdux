@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::entry::EntryOrigin;
 use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
 use crate::tool::ToolRegistry;
 
@@ -73,15 +74,12 @@ pub fn spawn_subagent(
 
         let (agent_loop, input_port) = AgentLoop::new(config).await;
 
-        // Send the initial prompt as a UserMessage with a reply channel
-        // so the AgentLoop starts a conversation (reply: None would be
-        // treated as a silent injection).
-        let (reply_tx, _reply_rx) = mpsc::channel(8);
+        // Send the initial prompt as a UserMessage so the AgentLoop starts a conversation.
         let initial_msg = Message::User {
             content: UserContent::Text(initial_prompt),
         };
         if input_port
-            .send_user_message(initial_msg, Some(reply_tx))
+            .send_user_message(initial_msg, EntryOrigin::System)
             .await
             .is_err()
         {

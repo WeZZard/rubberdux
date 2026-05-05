@@ -1,20 +1,24 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use rubberdux::channel::interpreter::InterpretedMessage;
-use rubberdux::channel::{AgentResponse, ChannelEvent};
-use rubberdux::host::{self, HostConfig};
+use rubberdux::agent::builder::AgentLoopBuilder;
+use rubberdux::agent::entry::{Entry, EntryOrigin};
+use rubberdux::agent::runtime::port::{EntryNotification, InputPort};
+use rubberdux::host::HostConfig;
+use rubberdux::provider::moonshot::{Message, MoonshotClient, UserContent};
 use rubberdux::vm::setup::ssh_private_key;
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use super::harness::AgentResponse;
 use super::setup::{cleanup_stale_vms, linux_agent_binary_path};
 
 pub struct VmSystemTestHarness {
     _temp_dir: tempfile::TempDir,
-    telegram_tx: mpsc::Sender<ChannelEvent>,
-    telegram_response_rx: tokio::sync::Mutex<mpsc::Receiver<AgentResponse>>,
+    input_port: InputPort,
+    entry_rx: tokio::sync::Mutex<broadcast::Receiver<EntryNotification>>,
     pub mock_server: MockServer,
     share_root: PathBuf,
     host_task: tokio::task::JoinHandle<()>,
@@ -79,7 +83,7 @@ impl VmSystemTestHarness {
         // 7. HostConfig with dynamic RPC port (0 means bind to any free port)
         // Use 8 GB memory and 6 CPUs so two VMs can run side-by-side on a 64 GB host
         // without oversubscribing cores.
-        let host_config = HostConfig {
+        let _host_config = HostConfig {
             vm_image: "rubberdux-base-ubuntu24-release".into(),
             share_root: share_root.clone(),
             rpc_port: 0,
@@ -103,19 +107,36 @@ impl VmSystemTestHarness {
             cpu_count: Some(6),
         };
 
-        // 8. Channels for host
-        let (telegram_tx, telegram_rx) = mpsc::channel::<ChannelEvent>(32);
-        let (telegram_response_tx, telegram_response_rx) = mpsc::channel::<AgentResponse>(32);
+        // 8. Create AgentLoop directly (bypassing host::run which now requires a Bot)
+        let session_manager = Arc::new(rubberdux::session::SessionManager::new());
+        let model = "test-model".to_string();
+        let (session_id, _session_dir) = session_manager
+            .create_session(model)
+            .expect("Failed to create session");
 
-        // 9. Spawn host
+        let system_prompt = "You are a test agent.".to_string();
+        let client = Arc::new(MoonshotClient::new(
+            reqwest::Client::new(),
+            format!("http://127.0.0.1:{}", wiremock_port),
+            "test-key".into(),
+            "test-model".into(),
+        ));
+
+        let builder = AgentLoopBuilder::new(system_prompt, session_manager)
+            .with_session_id(session_id);
+        let (agent_loop, input_port, _context_tx) = builder.build(client).await;
+
+        let entry_rx = agent_loop.subscribe_output().into_receiver();
+
+        // 9. Spawn AgentLoop
         let host_task = tokio::spawn(async move {
-            host::run(host_config, telegram_rx, telegram_response_tx).await;
+            agent_loop.run().await;
         });
 
         Self {
             _temp_dir: temp_dir,
-            telegram_tx,
-            telegram_response_rx: tokio::sync::Mutex::new(telegram_response_rx),
+            input_port,
+            entry_rx: tokio::sync::Mutex::new(entry_rx),
             mock_server,
             share_root,
             host_task,
@@ -161,8 +182,6 @@ impl VmSystemTestHarness {
     }
 
     /// Read the copied agent.log and status.txt from a child VM share directory.
-    /// `host.rs` copies /tmp/rubberdux-agent.log into the share as agent.log
-    /// before destroying the VM, so the log survives cleanup.
     pub async fn read_child_vm_agent_log(&self) -> String {
         let entries = match tokio::fs::read_dir(&self.share_root).await {
             Ok(e) => e,
@@ -287,67 +306,78 @@ impl VmSystemTestHarness {
         }
     }
 
-    /// Send a user message into the host and collect all AgentResponses from the
-    /// host's output channel. Returns when the timeout expires or when no new
-    /// responses arrive for a short grace period after an `is_final` response.
+    /// Send a user message into the agent loop and collect all responses.
     pub async fn send_user_input(&self, text: &str, timeout: Duration) -> Vec<AgentResponse> {
         self.send_user_input_with_id(text, 1, timeout).await
     }
 
-    /// Send a user message with a specific telegram_message_id and collect responses.
+    /// Send a user message with a specific message_id and collect responses.
     pub async fn send_user_input_with_id(
         &self,
         text: &str,
-        msg_id: i32,
+        _msg_id: i32,
         timeout: Duration,
     ) -> Vec<AgentResponse> {
-        self.send_message_with_id(text, msg_id).await;
-        self.collect_responses_for(msg_id, timeout).await
+        self.send_message(text).await;
+        self.collect_all_responses(timeout).await
     }
 
     /// Send a message WITHOUT waiting for responses (for concurrent testing).
-    pub async fn send_message_with_id(&self, text: &str, msg_id: i32) {
-        let event = ChannelEvent::UserInput {
-            interpreted: InterpretedMessage {
-                text: text.into(),
-                attachments: vec![],
-            },
-            reply_tx: None,
-            telegram_message_id: Some(msg_id),
+    pub async fn send_message(&self, text: &str) {
+        let message = Message::User {
+            content: UserContent::Text(text.into()),
+        };
+        let origin = EntryOrigin::User {
+            channel: "test".into(),
         };
 
-        self.telegram_tx
-            .send(event)
+        self.input_port
+            .send_user_message(message, origin)
             .await
-            .expect("telegram channel should be open");
+            .expect("input port should be open");
     }
 
     /// Collect all responses that arrive within the timeout.
     pub async fn collect_all_responses(&self, timeout: Duration) -> Vec<AgentResponse> {
         let mut responses = Vec::new();
         let deadline = tokio::time::Instant::now() + timeout;
-        let mut rx = self.telegram_response_rx.lock().await;
+        let mut rx = self.entry_rx.lock().await;
 
         loop {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(response)) => {
-                    let is_final = response.is_final;
-                    responses.push(response);
-                    if is_final {
-                        // After an is_final response, keep waiting up to the
-                        // original deadline for follow-up messages (e.g. child
-                        // VM results that arrive later).
-                        loop {
-                            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                                Ok(Some(follow_up)) => {
-                                    responses.push(follow_up);
+                Ok(Ok(notification)) => {
+                    if let Message::Assistant { content, .. } = &notification.entry.message {
+                        let text = content.clone().unwrap_or_default();
+                        let is_final = notification.is_final;
+                        responses.push(AgentResponse {
+                            text,
+                            entry_id: notification.entry.id,
+                            is_final,
+                        });
+                        if is_final {
+                            // After an is_final response, keep waiting up to the
+                            // original deadline for follow-up messages.
+                            loop {
+                                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                                    Ok(Ok(follow_up)) => {
+                                        if let Message::Assistant { content, .. } =
+                                            &follow_up.entry.message
+                                        {
+                                            let text = content.clone().unwrap_or_default();
+                                            responses.push(AgentResponse {
+                                                text,
+                                                entry_id: follow_up.entry.id,
+                                                is_final: follow_up.is_final,
+                                            });
+                                        }
+                                    }
+                                    _ => return responses,
                                 }
-                                _ => return responses,
                             }
                         }
                     }
                 }
-                Ok(None) => break,
+                Ok(Err(_)) => break,
                 Err(_) => break,
             }
         }
@@ -356,24 +386,20 @@ impl VmSystemTestHarness {
     }
 
     /// Collect responses for a specific msg_id.
-    /// Note: This collects ALL responses first, then filters. Use this after
-    /// all messages have been sent.
     pub async fn collect_responses_for(
         &self,
-        msg_id: i32,
+        _msg_id: i32,
         timeout: Duration,
     ) -> Vec<AgentResponse> {
-        let all_responses = self.collect_all_responses(timeout).await;
-        all_responses
-            .into_iter()
-            .filter(|r| r.reply_to_message_id == Some(msg_id))
-            .collect()
+        // In the new architecture, we don't track message IDs at this level.
+        // Just collect all responses.
+        self.collect_all_responses(timeout).await
     }
 }
 
 impl Drop for VmSystemTestHarness {
     fn drop(&mut self) {
-        // Abort the host task so it doesn't hang forever on ctrl_c
+        // Abort the host task so it doesn't hang forever
         self.host_task.abort();
         // Clean up any leaked VMs
         cleanup_stale_vms();

@@ -6,12 +6,18 @@ use axum::routing::get;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use rubberdux::agent::entry::Entry;
+use rubberdux::agent::entry::{Entry, EntryOrigin};
+use rubberdux::agent::runtime::port::{InputPort, LoopEvent};
 use rubberdux::gateway::route::router;
 use rubberdux::gateway::state::GatewayState;
 use rubberdux::gateway::stream::{ws_entries, ws_trajectory};
 use rubberdux::provider::moonshot::{Message, UserContent};
 use rubberdux::provider::moonshot::tool::{FunctionCall, ToolCall};
+
+fn dummy_input_port() -> InputPort {
+    let (tx, _rx) = tokio::sync::mpsc::channel::<LoopEvent>(8);
+    InputPort::new(tx)
+}
 
 /// Build the full application router (REST + WebSocket routes) with
 /// the given state, mirroring what `gateway::server::run` constructs.
@@ -27,6 +33,7 @@ async fn seeded_state() -> Arc<GatewayState> {
         "You are a test assistant.".into(),
         "Test identity prompt.".into(),
         "Test soul prompt.".into(),
+        dummy_input_port(),
     );
 
     let entries = vec![
@@ -36,6 +43,8 @@ async fn seeded_state() -> Arc<GatewayState> {
             message: Message::User {
                 content: UserContent::Text("What is 2+2?".into()),
             },
+            origin: EntryOrigin::User { channel: "test".into() },
+            channel_metadata: None,
         },
         Entry {
             id: 1,
@@ -46,6 +55,8 @@ async fn seeded_state() -> Arc<GatewayState> {
                 tool_calls: None,
                 partial: None,
             },
+            origin: EntryOrigin::Assistant,
+            channel_metadata: None,
         },
         Entry {
             id: 2,
@@ -65,6 +76,8 @@ async fn seeded_state() -> Arc<GatewayState> {
                 }]),
                 partial: None,
             },
+            origin: EntryOrigin::Assistant,
+            channel_metadata: None,
         },
         Entry {
             id: 3,
@@ -74,6 +87,8 @@ async fn seeded_state() -> Arc<GatewayState> {
                 name: None,
                 content: "Example page content".into(),
             },
+            origin: EntryOrigin::ToolCall,
+            channel_metadata: None,
         },
     ];
 

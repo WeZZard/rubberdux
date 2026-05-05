@@ -18,6 +18,10 @@ pub async fn run(state: Arc<GatewayState>) -> Result<(), GatewayError> {
             "/api/v1/ws/trajectory",
             axum::routing::get(super::stream::ws_trajectory),
         )
+        .route(
+            "/api/v1/ws/chat",
+            axum::routing::get(super::stream::ws_chat),
+        )
         .with_state(state);
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));

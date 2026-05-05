@@ -13,8 +13,6 @@ mod tool;
 mod trajectory;
 mod vm;
 
-use unicode_segmentation::UnicodeSegmentation;
-
 #[cfg(feature = "host")]
 use teloxide::prelude::*;
 
@@ -46,36 +44,7 @@ async fn run_host() {
         std::process::exit(1);
     });
 
-    let (event_tx, event_rx) = tokio::sync::mpsc::channel(32);
-    let (response_tx, mut response_rx) =
-        tokio::sync::mpsc::channel::<crate::channel::AgentResponse>(32);
-
     let bot = Bot::new(bot_token);
-    let _bot_for_responses = bot.clone();
-
-    // Spawn response handler: AgentResponse → Telegram
-    tokio::spawn(async move {
-        while let Some(response) = response_rx.recv().await {
-            if response.text.is_empty() {
-                continue;
-            }
-            let preview: String = response.text.graphemes(true).take(100).collect();
-            log::info!("Agent response: {}", preview);
-        }
-    });
-
-    // Run Telegram adapter and host concurrently
-    let telegram_task = tokio::spawn(async move {
-        channel::adapter::telegram::run(bot, event_tx).await;
-    });
-
-    let host_task = tokio::spawn(async move {
-        let host_config = host::HostConfig::from_env();
-        host::run(host_config, event_rx, response_tx).await;
-    });
-
-    tokio::select! {
-        _ = telegram_task => log::info!("Telegram adapter stopped"),
-        _ = host_task => log::info!("Host stopped"),
-    }
+    let host_config = host::HostConfig::from_env();
+    host::run(host_config, bot).await;
 }

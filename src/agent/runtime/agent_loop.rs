@@ -4,10 +4,10 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::entry::EntryHistory;
+use crate::agent::entry::{EntryHistory, EntryOrigin};
 use crate::agent::runtime::history_store::{FilesystemStore, HistoryStore, MemoryStore};
 use crate::agent::runtime::port::{
-    EntryNotification, InputPort, InternalMutation, LoopEvent, LoopOutput, OutputPort,
+    EntryNotification, InputPort, InternalMutation, LoopEvent, OutputPort,
 };
 use crate::agent::runtime::task_coordinator::TaskGroupSet;
 use crate::agent::runtime::turn_driver::{TurnDriver, TurnOutcome};
@@ -71,12 +71,10 @@ pub struct AgentLoop {
     agent_id: String,
     recorder: SharedTrajectoryRecorder,
     state: AgentState,
-    pending_messages: Vec<(
-        Message,
-        Option<mpsc::Sender<LoopOutput>>,
-        Option<Box<dyn std::any::Any + Send + Sync>>,
-    )>,
+    pending_messages: Vec<(Message, EntryOrigin, Option<serde_json::Value>)>,
     next_turn_seq: u64,
+    current_origin: EntryOrigin,
+    current_channel_metadata: Option<serde_json::Value>,
 
     // Channels
     input_rx: mpsc::Receiver<LoopEvent>,
@@ -165,6 +163,8 @@ impl AgentLoop {
             state: AgentState::Idle,
             pending_messages: Vec::new(),
             next_turn_seq: 0,
+            current_origin: EntryOrigin::System,
+            current_channel_metadata: None,
             input_rx,
             bg_tx,
             bg_rx,
@@ -215,8 +215,8 @@ impl AgentLoop {
             // If idle and have pending messages, process one immediately
             // without waiting for external events.
             if self.state == AgentState::Idle && !self.pending_messages.is_empty() {
-                let (message, reply, metadata) = self.pending_messages.remove(0);
-                self.process_message(message, reply, metadata).await;
+                let (message, origin, channel_metadata) = self.pending_messages.remove(0);
+                self.process_message(message, origin, channel_metadata).await;
                 continue;
             }
 
@@ -263,8 +263,8 @@ impl AgentLoop {
         loop {
             // Process pending messages when idle
             if self.state == AgentState::Idle && !self.pending_messages.is_empty() {
-                let (message, reply, metadata) = self.pending_messages.remove(0);
-                self.process_message(message, reply, metadata).await;
+                let (message, origin, channel_metadata) = self.pending_messages.remove(0);
+                self.process_message(message, origin, channel_metadata).await;
                 continue;
             }
 
@@ -340,10 +340,11 @@ impl AgentLoop {
         match event {
             LoopEvent::UserMessage {
                 message,
-                reply,
-                metadata,
+                origin,
+                channel_metadata,
             } => {
-                self.handle_user_message(message, reply, metadata).await;
+                self.handle_user_message(message, origin, channel_metadata)
+                    .await;
             }
             LoopEvent::ContextUpdate(message) => {
                 self.record_context_update(message).await;
@@ -357,8 +358,8 @@ impl AgentLoop {
     async fn handle_user_message(
         &mut self,
         message: Message,
-        reply: Option<mpsc::Sender<LoopOutput>>,
-        metadata: Option<Box<dyn std::any::Any + Send + Sync>>,
+        origin: EntryOrigin,
+        channel_metadata: Option<serde_json::Value>,
     ) {
         let _ = self
             .context_tx
@@ -367,7 +368,7 @@ impl AgentLoop {
         match self.state {
             AgentState::Idle => {
                 // Start a new turn immediately.
-                self.process_message(message, reply, metadata).await;
+                self.process_message(message, origin, channel_metadata).await;
             }
             AgentState::WaitingForResponse | AgentState::Processing => {
                 // Queue for later processing.
@@ -380,7 +381,8 @@ impl AgentLoop {
                     },
                     self.pending_messages.len() + 1
                 );
-                self.pending_messages.push((message, reply, metadata));
+                self.pending_messages
+                    .push((message, origin, channel_metadata));
             }
         }
     }
@@ -393,21 +395,21 @@ impl AgentLoop {
     async fn process_message(
         &mut self,
         message: Message,
-        reply: Option<mpsc::Sender<LoopOutput>>,
-        metadata: Option<Box<dyn std::any::Any + Send + Sync>>,
+        origin: EntryOrigin,
+        channel_metadata: Option<serde_json::Value>,
     ) {
-        let entry_id = self.history.push_user(message);
+        self.current_origin = origin.clone();
+        self.current_channel_metadata = channel_metadata.clone();
+
+        let entry_id = self
+            .history
+            .push_user_with_metadata(message, origin, channel_metadata);
         self.persist_entry(entry_id).await;
         self.record_message("message.recorded", entry_id, "user", false);
-
-        let reply_to = metadata
-            .as_ref()
-            .and_then(|m| m.downcast_ref::<i32>().copied());
+        self.notify_entry(entry_id, false);
 
         // Drive turns in a loop until we hit a stopping condition.
         self.state = AgentState::WaitingForResponse;
-        let current_reply = reply;
-        let current_reply_to = reply_to;
 
         loop {
             // Compact history if token budget exceeded before driving a turn.
@@ -445,31 +447,22 @@ impl AgentLoop {
                 TurnOutcome::Failed { .. } => {}
             }
 
-            let should_continue = self
-                .handle_turn_outcome(outcome, &turn_id, &current_reply, current_reply_to)
-                .await;
+            let should_continue = self.handle_turn_outcome(outcome, &turn_id).await;
 
             if !should_continue {
                 break;
             }
 
             // Continue to next turn (all tools were immediate).
-            // Reply channels persist across immediate tool turns.
         }
     }
 
     /// Handle a single turn outcome. Returns true if another turn should be driven
     /// (all tools were immediate), false otherwise.
-    async fn handle_turn_outcome(
-        &mut self,
-        outcome: TurnOutcome,
-        turn_id: &str,
-        reply: &Option<mpsc::Sender<LoopOutput>>,
-        reply_to_message_id: Option<i32>,
-    ) -> bool {
+    async fn handle_turn_outcome(&mut self, outcome: TurnOutcome, turn_id: &str) -> bool {
         match outcome {
             TurnOutcome::Text {
-                text,
+                text: _,
                 entry_id,
                 prompt_tokens,
                 completion_tokens,
@@ -478,17 +471,6 @@ impl AgentLoop {
                 self.record_message("message.recorded", entry_id, "assistant", true);
                 self.notify_entry(entry_id, true);
 
-                let is_final = self.active_groups.is_empty();
-                let text_len = text.len();
-                Self::send_output(reply, text, entry_id, is_final, reply_to_message_id).await;
-                self.record_delivery(
-                    turn_id,
-                    entry_id,
-                    is_final,
-                    reply,
-                    text_len,
-                    reply_to_message_id,
-                );
                 self.record(
                     "turn.completed",
                     Some(turn_id),
@@ -504,7 +486,6 @@ impl AgentLoop {
                 false
             }
             TurnOutcome::Tools {
-                text,
                 entry_id,
                 background_tasks,
                 prompt_tokens,
@@ -514,27 +495,6 @@ impl AgentLoop {
                 self.persist_entry(entry_id).await;
                 self.record_message("message.recorded", entry_id, "assistant", false);
                 self.notify_entry(entry_id, false);
-
-                // Send any text to user immediately.
-                if !text.is_empty() {
-                    let text_len = text.len();
-                    Self::send_output(
-                        reply,
-                        text,
-                        entry_id,
-                        false, // not final, tasks pending
-                        reply_to_message_id,
-                    )
-                    .await;
-                    self.record_delivery(
-                        turn_id,
-                        entry_id,
-                        false,
-                        reply,
-                        text_len,
-                        reply_to_message_id,
-                    );
-                }
 
                 if background_tasks.is_empty() {
                     // All tools were immediate; continue to next turn.
@@ -552,14 +512,11 @@ impl AgentLoop {
                     true
                 } else {
                     // Background tasks dispatched.
-                    // Preserve reply_to metadata so final responses are replies to the correct message.
-                    let metadata = reply_to_message_id
-                        .map(|id| Box::new(id) as Box<dyn std::any::Any + Send + Sync>);
                     self.active_groups.register(
                         entry_id,
                         &background_tasks,
-                        reply.clone(),
-                        metadata,
+                        self.current_origin.clone(),
+                        self.current_channel_metadata.clone(),
                     );
                     self.record(
                         "turn.suspended",
@@ -583,22 +540,16 @@ impl AgentLoop {
                     Some(turn_id),
                     serde_json::json!({ "error": error.to_string() }),
                 );
-                Self::send_output(
-                    reply,
-                    format!("Sorry, I encountered an error: {}", error),
-                    self.history.last_id().unwrap_or(0),
-                    true,
-                    reply_to_message_id,
-                )
-                .await;
-                self.record_delivery(
-                    turn_id,
-                    self.history.last_id().unwrap_or(0),
-                    true,
-                    reply,
-                    error.to_string().len(),
-                    reply_to_message_id,
-                );
+                let error_msg = Message::Assistant {
+                    content: Some(format!("Sorry, I encountered an error: {}", error)),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    partial: None,
+                };
+                let parent_id = self.history.last_id().unwrap_or(0);
+                let entry_id = self.history.push_assistant(parent_id, error_msg);
+                self.persist_entry(entry_id).await;
+                self.notify_entry(entry_id, true);
                 self.state = AgentState::Idle;
                 false
             }
@@ -620,7 +571,11 @@ impl AgentLoop {
                         result.task_id, result.content
                     )),
                 };
-                let entry_id = self.history.push_user(msg);
+                let entry_id = self.history.push_user_with_metadata(
+                    msg,
+                    completed.group.origin.clone(),
+                    completed.group.channel_metadata.clone(),
+                );
                 self.persist_entry(entry_id).await;
                 self.record(
                     "operation.result.injected",
@@ -636,16 +591,10 @@ impl AgentLoop {
 
             // If no more active groups, start a new turn with the completed results.
             if self.active_groups.is_empty() {
-                let reply_to = completed
-                    .group
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.downcast_ref::<i32>().copied());
+                // Restore origin/channel_metadata from the completed group for the continuation turn.
+                self.current_origin = completed.group.origin;
+                self.current_channel_metadata = completed.group.channel_metadata;
                 self.state = AgentState::WaitingForResponse;
-
-                // Drive turns with the reply channel from the completed group.
-                let current_reply = completed.group.reply;
-                let current_reply_to = reply_to;
 
                 loop {
                     let turn_id = self.next_turn_id();
@@ -660,9 +609,7 @@ impl AgentLoop {
                     );
                     self.drain_ready_inputs().await;
                     let outcome = self.turn_driver.drive(&mut self.history, &turn_id).await;
-                    let should_continue = self
-                        .handle_turn_outcome(outcome, &turn_id, &current_reply, current_reply_to)
-                        .await;
+                    let should_continue = self.handle_turn_outcome(outcome, &turn_id).await;
 
                     if !should_continue {
                         break;
@@ -677,7 +624,11 @@ impl AgentLoop {
                     result.task_id, result.content
                 )),
             };
-            let entry_id = self.history.push_user(msg);
+            let entry_id = self.history.push_user_with_metadata(
+                msg,
+                EntryOrigin::System,
+                None,
+            );
             self.persist_entry(entry_id).await;
             self.record(
                 "operation.orphaned",
@@ -710,10 +661,11 @@ impl AgentLoop {
                 Ok(LoopEvent::ContextUpdate(message)) => self.record_context_update(message).await,
                 Ok(LoopEvent::UserMessage {
                     message,
-                    reply,
-                    metadata,
+                    origin,
+                    channel_metadata,
                 }) => {
-                    self.pending_messages.push((message, reply, metadata));
+                    self.pending_messages
+                        .push((message, origin, channel_metadata));
                 }
                 Ok(LoopEvent::Internal(mutation)) => self.handle_internal_mutation(mutation),
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
@@ -738,42 +690,6 @@ impl AgentLoop {
                 entry: entry.clone(),
                 is_final,
             });
-        }
-    }
-
-    async fn send_output(
-        reply: &Option<mpsc::Sender<LoopOutput>>,
-        text: String,
-        entry_id: usize,
-        is_final: bool,
-        reply_to_message_id: Option<i32>,
-    ) {
-        log::info!(
-            "send_output called: text_len={}, entry_id={}, is_final={}, reply_to={:?}, has_reply={}",
-            text.len(),
-            entry_id,
-            is_final,
-            reply_to_message_id,
-            reply.is_some()
-        );
-        if let Some(tx) = reply {
-            if !text.is_empty() || is_final {
-                log::info!("Sending output via reply channel");
-                let metadata = reply_to_message_id
-                    .map(|id| Box::new(id) as Box<dyn std::any::Any + Send + Sync>);
-                let _ = tx
-                    .send(LoopOutput {
-                        text,
-                        entry_id,
-                        is_final,
-                        metadata,
-                    })
-                    .await;
-            } else {
-                log::info!("Skipping output: text empty and not final");
-            }
-        } else {
-            log::warn!("send_output called but reply channel is None");
         }
     }
 
@@ -835,28 +751,6 @@ impl AgentLoop {
                 "role": role,
                 "is_final": is_final,
                 "text_len": text_len,
-            }),
-        );
-    }
-
-    fn record_delivery(
-        &self,
-        turn_id: &str,
-        entry_id: usize,
-        is_final: bool,
-        reply: &Option<mpsc::Sender<LoopOutput>>,
-        text_len: usize,
-        reply_to_message_id: Option<i32>,
-    ) {
-        self.record(
-            "message.delivered",
-            Some(turn_id),
-            serde_json::json!({
-                "entry_id": entry_id,
-                "is_final": is_final,
-                "has_reply": reply.is_some(),
-                "text_len": text_len,
-                "reply_to_message_id": reply_to_message_id,
             }),
         );
     }

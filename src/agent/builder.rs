@@ -19,6 +19,7 @@ use crate::tool::glob::GlobTool;
 use crate::tool::grep::GrepTool;
 use crate::tool::read::ReadFileTool;
 use crate::tool::write::WriteFileTool;
+use crate::trajectory::SharedTrajectoryRecorder;
 
 /// Configuration for building an AgentLoop.
 pub struct AgentLoopBuilder {
@@ -27,6 +28,7 @@ pub struct AgentLoopBuilder {
     pub session_id: Option<crate::session::SessionId>,
     pub token_budget: usize,
     pub with_agent_tool: bool,
+    pub recorder: Option<SharedTrajectoryRecorder>,
 }
 
 impl AgentLoopBuilder {
@@ -37,6 +39,7 @@ impl AgentLoopBuilder {
             session_id: None,
             token_budget: 153_600,
             with_agent_tool: true,
+            recorder: None,
         }
     }
 
@@ -52,6 +55,11 @@ impl AgentLoopBuilder {
 
     pub fn with_agent_tool(mut self, enabled: bool) -> Self {
         self.with_agent_tool = enabled;
+        self
+    }
+
+    pub fn with_recorder(mut self, recorder: SharedTrajectoryRecorder) -> Self {
+        self.recorder = Some(recorder);
         self
     }
 
@@ -104,7 +112,7 @@ impl AgentLoopBuilder {
             session_path: Some(session_path),
             session_id: Some(session_id.to_string()),
             agent_id: Some("main".into()),
-            recorder: None,
+            recorder: self.recorder,
             tool_results_dir: Some(tool_results_dir),
             token_budget: self.token_budget,
             cancel: cancel.clone(),
@@ -217,6 +225,25 @@ mod tests {
 
         let received = rx.try_recv();
         assert!(received.is_ok(), "Should receive context event");
+
+        let _ = std::fs::remove_dir_all(&mgr.home_dir);
+    }
+
+    #[tokio::test]
+    async fn test_builder_with_recorder() {
+        let client = dummy_client();
+        let (mgr, session_id) = temp_manager();
+        let recorder = std::sync::Arc::new(crate::trajectory::MemoryTrajectoryRecorder::new());
+        let shared: crate::trajectory::SharedTrajectoryRecorder = recorder.clone();
+        let builder = AgentLoopBuilder::new("Test".into(), mgr.clone())
+            .with_session_id(session_id)
+            .with_recorder(shared);
+
+        let (_, _, _) = builder.build(client).await;
+
+        let events = recorder.events();
+        assert!(!events.is_empty(), "recorder should have at least one event");
+        assert_eq!(events[0].event_type, "agent.started");
 
         let _ = std::fs::remove_dir_all(&mgr.home_dir);
     }

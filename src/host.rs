@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use teloxide::prelude::Bot;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 
-use crate::channel::{AgentResponse, ChannelEvent};
 use crate::error::Error;
-use crate::protocol::{self, AgentToHost, HostToAgent};
+use crate::protocol::{self, AgentToHost};
 use crate::vm::manager::VMManager;
 
 const DEFAULT_RPC_PORT: u16 = 19384;
@@ -147,15 +147,10 @@ fn shell_quote(s: &str) -> String {
 
 /// Run rubberdux in host mode.
 ///
-/// The host runs the AgentLoop locally and bridges Telegram ↔ AgentLoop.
-pub async fn run(
-    _config: HostConfig,
-    telegram_rx: mpsc::Receiver<ChannelEvent>,
-    telegram_response_tx: mpsc::Sender<AgentResponse>,
-) {
+/// The host runs the AgentLoop locally and bridges Telegram ↔ AgentLoop
+/// via the broadcast-based adapter.
+pub async fn run(_config: HostConfig, bot: Bot) {
     use crate::agent::builder::AgentLoopBuilder;
-    use crate::agent::runtime::port::LoopEvent;
-    use crate::provider::moonshot::{Message, UserContent};
 
     // Initialize session manager and create new session
     let session_manager = Arc::new(crate::session::SessionManager::new());
@@ -169,10 +164,6 @@ pub async fn run(
         session_id.to_string(),
         session_dir.display()
     );
-
-    // Set up logging to session directory
-    let log_path = session_manager.session_log_path(&session_id);
-    // Note: env_logger already initialized in main(), but we can redirect if needed
 
     // Create project root symlink if missing
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -188,16 +179,37 @@ pub async fn run(
 
     let client = Arc::new(crate::provider::moonshot::MoonshotClient::from_env());
 
+    // Create the trajectory broadcast channel and recorder before building the
+    // agent loop so that events flow to both the filesystem log and any
+    // WebSocket subscribers on `/api/v1/ws/trajectory`.
+    let (trajectory_tx, _) = tokio::sync::broadcast::channel(256);
+    let events_path = session_manager
+        .main_agent_dir(&session_id)
+        .join("events.jsonl");
+    let fs_recorder = crate::trajectory::filesystem_recorder(events_path);
+    let broadcast_recorder: crate::trajectory::SharedTrajectoryRecorder = Arc::new(
+        crate::trajectory::BroadcastTrajectoryRecorder::new(
+            fs_recorder,
+            trajectory_tx.clone(),
+        ),
+    );
+
     let gateway_system_prompt = system_prompt.clone();
-    let builder = AgentLoopBuilder::new(system_prompt, session_manager).with_session_id(session_id);
+    let builder = AgentLoopBuilder::new(system_prompt, session_manager)
+        .with_session_id(session_id)
+        .with_recorder(broadcast_recorder);
     let (agent_loop, input_port, _context_tx) = builder.build(client).await;
 
+    // Subscribe to entry broadcasts for the Telegram adapter
+    let entry_rx = agent_loop.subscribe_output().into_receiver();
+
+    // Set up the gateway server
     let _gateway_handle = {
         let output_port = agent_loop.subscribe_output();
         let identity = std::fs::read_to_string(prompt_dir.join("IDENTITY.md")).unwrap_or_default();
         let soul = std::fs::read_to_string(prompt_dir.join("SOUL.md")).unwrap_or_default();
-        let gateway_state = Arc::new(crate::gateway::state::GatewayState::new(
-            gateway_system_prompt, identity, soul,
+        let gateway_state = Arc::new(crate::gateway::state::GatewayState::with_trajectory_tx(
+            gateway_system_prompt, identity, soul, trajectory_tx, input_port.clone(),
         ));
         let state_clone = gateway_state.clone();
         tokio::spawn(crate::gateway::stream::mirror_entries(output_port, state_clone));
@@ -209,90 +221,8 @@ pub async fn run(
         agent_loop.run().await;
     });
 
-    // Track reply channels from Telegram adapter
-    let reply_senders: Arc<Mutex<HashMap<Option<i32>, mpsc::Sender<AgentResponse>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-
-    // Bridge: Telegram → AgentLoop
-    let reply_senders_for_telegram = reply_senders.clone();
-    let mut telegram_rx = telegram_rx;
-    tokio::spawn(async move {
-        while let Some(event) = telegram_rx.recv().await {
-            match event {
-                ChannelEvent::UserInput {
-                    interpreted,
-                    telegram_message_id,
-                    reply_tx,
-                } => {
-                    if let Some(tx) = reply_tx {
-                        reply_senders_for_telegram
-                            .lock()
-                            .await
-                            .insert(telegram_message_id, tx);
-                    }
-
-                    log::info!(
-                        "Received message: msg_id={:?}, text_len={}",
-                        telegram_message_id,
-                        interpreted.text.len()
-                    );
-
-                    let (loop_reply_tx, mut loop_reply_rx) =
-                        mpsc::channel::<crate::agent::runtime::port::LoopOutput>(8);
-
-                    // Spawn response handler → Telegram
-                    let reply_senders_clone = reply_senders_for_telegram.clone();
-                    let telegram_response_tx = telegram_response_tx.clone();
-                    let telegram_message_id = telegram_message_id;
-                    tokio::spawn(async move {
-                        while let Some(output) = loop_reply_rx.recv().await {
-                            let response = AgentResponse {
-                                text: output.text,
-                                entry_id: output.entry_id,
-                                is_final: output.is_final,
-                                reply_to_message_id: telegram_message_id,
-                            };
-                            if let Some(tx) =
-                                reply_senders_clone.lock().await.get(&telegram_message_id)
-                            {
-                                let _ = tx.send(response.clone()).await;
-                            }
-                            if telegram_response_tx.send(response).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-
-                    let message = Message::User {
-                        content: UserContent::Text(interpreted.text),
-                    };
-                    let metadata: Option<Box<dyn std::any::Any + Send + Sync>> =
-                        telegram_message_id.map(|id| Box::new(id) as _);
-
-                    let event = LoopEvent::UserMessage {
-                        message,
-                        reply: Some(loop_reply_tx),
-                        metadata,
-                    };
-                    if input_port.send(event).await.is_err() {
-                        log::warn!("AgentLoop input closed");
-                        break;
-                    }
-                }
-                ChannelEvent::ContextUpdate { text } => {
-                    log::info!("ContextUpdate received on host: text_len={}", text.len());
-                    // Optionally inject as context update
-                }
-                ChannelEvent::InternalEvent(_) => {
-                    // Internal events stay on the host side
-                }
-            }
-        }
-    });
-
-    // Keep the host alive until shutdown
-    log::info!("Host running. Press Ctrl+C to stop.");
-    tokio::signal::ctrl_c().await.ok();
+    // Run Telegram adapter (blocks until dispatcher shuts down)
+    crate::channel::adapter::telegram::run(bot, input_port, entry_rx).await;
 
     log::info!("Host shutdown complete.");
 }

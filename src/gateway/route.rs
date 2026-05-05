@@ -213,14 +213,22 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    use crate::agent::entry::EntryOrigin;
+    use crate::agent::runtime::port::{InputPort, LoopEvent};
     use crate::provider::moonshot::UserContent;
     use crate::provider::moonshot::tool::FunctionCall;
+
+    fn dummy_input_port() -> InputPort {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<LoopEvent>(8);
+        InputPort::new(tx)
+    }
 
     async fn test_state() -> Arc<GatewayState> {
         let state = GatewayState::new(
             "You are helpful.".into(),
             "You are an AI assistant.".into(),
             "Be kind and thoughtful.".into(),
+            dummy_input_port(),
         );
 
         let entries = vec![
@@ -230,6 +238,8 @@ mod tests {
                 message: Message::System {
                     content: "You are helpful.".into(),
                 },
+                origin: EntryOrigin::System,
+                channel_metadata: None,
             },
             Entry {
                 id: 1,
@@ -237,6 +247,8 @@ mod tests {
                 message: Message::User {
                     content: UserContent::Text("Hello".into()),
                 },
+                origin: EntryOrigin::User { channel: "test".into() },
+                channel_metadata: None,
             },
             Entry {
                 id: 2,
@@ -256,6 +268,8 @@ mod tests {
                     }]),
                     partial: None,
                 },
+                origin: EntryOrigin::Assistant,
+                channel_metadata: None,
             },
             Entry {
                 id: 3,
@@ -265,6 +279,8 @@ mod tests {
                     name: None,
                     content: "Example Domain page content".into(),
                 },
+                origin: EntryOrigin::ToolCall,
+                channel_metadata: None,
             },
         ];
 
@@ -297,6 +313,7 @@ mod tests {
             "sys".into(),
             "id".into(),
             "soul".into(),
+            dummy_input_port(),
         ));
         router().with_state(state)
     }

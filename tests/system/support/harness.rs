@@ -2,11 +2,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rubberdux::channel::interpreter::InterpretedMessage;
-use rubberdux::channel::{AgentResponse, ChannelEvent};
+use rubberdux::agent::entry::{Entry, EntryOrigin};
+use rubberdux::agent::runtime::port::{EntryNotification, InputPort, LoopEvent};
 use rubberdux::hardened_prompts;
-use rubberdux::provider::moonshot::MoonshotClient;
-use tokio::sync::mpsc;
+use rubberdux::provider::moonshot::{Message, MoonshotClient, UserContent};
+
+/// A collected response from the agent loop, matching the shape tests expect.
+#[derive(Debug, Clone)]
+pub struct AgentResponse {
+    pub text: String,
+    pub entry_id: usize,
+    pub is_final: bool,
+}
 
 /// Complete record of a channel-level agent run.
 pub struct Trajectory {
@@ -43,14 +50,13 @@ impl md_testing::Evaluatable for Trajectory {
         // Channel delivery summary
         s.push_str("---\n\n");
         s.push_str("## Channel Delivery\n\n");
-        s.push_str("Messages delivered to Telegram:\n\n");
+        s.push_str("Messages delivered:\n\n");
         for (i, response) in self.responses.iter().enumerate() {
             s.push_str(&format!(
-                "{}. `is_final={}` `entry_id={}` `reply_to={:?}`\n\n",
+                "{}. `is_final={}` `entry_id={}`\n\n",
                 i + 1,
                 response.is_final,
                 response.entry_id,
-                response.reply_to_message_id,
             ));
             s.push_str(&response.text);
             s.push('\n');
@@ -72,9 +78,10 @@ impl Trajectory {
     }
 }
 
-/// Test harness that drives `chat::run_with_session()` at the channel boundary.
+/// Test harness that drives `chat::run_with_session()` at the InputPort boundary.
 pub struct ChannelHarness {
-    tx: mpsc::Sender<ChannelEvent>,
+    input_port: InputPort,
+    output_rx: tokio::sync::Mutex<tokio::sync::broadcast::Receiver<EntryNotification>>,
     session_path: PathBuf,
     _join: tokio::task::JoinHandle<()>,
 }
@@ -87,16 +94,21 @@ pub struct MessageExchange {
 impl ChannelHarness {
     pub async fn new(system_prompt: &str, session_path: PathBuf) -> Self {
         let client = Arc::new(MoonshotClient::from_env());
-        let (tx, rx) = mpsc::channel::<ChannelEvent>(32);
         let system_prompt = system_prompt.to_string();
         let sp = session_path.clone();
 
+        let (agent_loop, input_port) =
+            rubberdux::agent::runtime::chat::run_with_session(client, system_prompt, sp).await;
+
+        let output_rx = agent_loop.subscribe_output().into_receiver();
+
         let join = tokio::spawn(async move {
-            rubberdux::agent::runtime::chat::run_with_session(rx, client, system_prompt, sp).await;
+            agent_loop.run().await;
         });
 
         Self {
-            tx,
+            input_port,
+            output_rx: tokio::sync::Mutex::new(output_rx),
             session_path,
             _join: join,
         }
@@ -106,40 +118,48 @@ impl ChannelHarness {
         &self.session_path
     }
 
-    /// Send a user message and collect all `AgentResponse` messages
+    /// Send a user message and collect all assistant `EntryNotification` messages
     /// until `is_final == true` or the timeout expires.
     pub async fn send_message(&self, text: &str, timeout: Duration) -> MessageExchange {
-        let (reply_tx, mut reply_rx) = mpsc::channel::<AgentResponse>(32);
-
-        let interpreted = InterpretedMessage {
-            text: text.to_string(),
-            attachments: vec![],
+        let message = Message::User {
+            content: UserContent::Text(text.to_string()),
         };
 
-        let event = ChannelEvent::UserInput {
-            interpreted,
-            reply_tx: Some(reply_tx),
-            telegram_message_id: Some(1),
+        let origin = EntryOrigin::User {
+            channel: "test".into(),
         };
 
-        self.tx.send(event).await.expect("channel should be open");
+        if let Err(e) = self.input_port.send_user_message(message, origin).await {
+            return MessageExchange {
+                responses: vec![],
+                failure_reason: Some(format!("Failed to send message: {}", e)),
+            };
+        }
 
         let mut responses = Vec::new();
         let deadline = tokio::time::Instant::now() + timeout;
         let mut failure_reason = None;
+        let mut rx = self.output_rx.lock().await;
 
         loop {
-            match tokio::time::timeout_at(deadline, reply_rx.recv()).await {
-                Ok(Some(response)) => {
-                    let is_final = response.is_final;
-                    responses.push(response);
-                    if is_final {
-                        break;
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(notification)) => {
+                    // Only collect assistant entries
+                    if let Message::Assistant { content, .. } = &notification.entry.message {
+                        let text = content.clone().unwrap_or_default();
+                        responses.push(AgentResponse {
+                            text,
+                            entry_id: notification.entry.id,
+                            is_final: notification.is_final,
+                        });
+                        if notification.is_final {
+                            break;
+                        }
                     }
                 }
-                Ok(None) => {
+                Ok(Err(_recv_err)) => {
                     failure_reason =
-                        Some("Reply channel closed before a final assistant response".to_string());
+                        Some("Broadcast channel closed before a final assistant response".into());
                     break;
                 }
                 Err(_) => {
@@ -158,9 +178,9 @@ impl ChannelHarness {
         }
     }
 
-    /// Send multiple user messages as a batch.  All but the last message are
+    /// Send multiple user messages as a batch. All but the last message are
     /// injected as `ContextUpdate` (added to history without triggering LLM
-    /// processing).  The last message is sent as a normal `UserInput` which
+    /// processing). The last message is sent as a normal user message which
     /// triggers the LLM response.
     pub async fn send_messages_batch(
         &self,
@@ -174,8 +194,15 @@ impl ChannelHarness {
 
         // Send all but the last as context updates.
         for text in &messages[..messages.len() - 1] {
-            let event = ChannelEvent::ContextUpdate { text: text.clone() };
-            self.tx.send(event).await.expect("channel should be open");
+            let message = Message::User {
+                content: UserContent::Text(text.clone()),
+            };
+            if let Err(e) = self.input_port.send_context_update(message).await {
+                return MessageExchange {
+                    responses: vec![],
+                    failure_reason: Some(format!("Failed to send context update: {}", e)),
+                };
+            }
         }
 
         // Send the last message as a normal user input to trigger LLM.

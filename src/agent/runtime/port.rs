@@ -1,46 +1,20 @@
 use tokio::sync::{broadcast, mpsc};
 
-use crate::agent::entry::Entry;
+use crate::agent::entry::{Entry, EntryOrigin};
 use crate::provider::moonshot::Message;
-
-use crate::tool::BackgroundTaskResult;
 
 /// An event injected into the agent loop from any input source.
 pub enum LoopEvent {
     /// A message to process via LLM.
     UserMessage {
         message: Message,
-        /// Where to send the response. None = silent injection (no response expected).
-        reply: Option<mpsc::Sender<LoopOutput>>,
-        /// Opaque metadata from the input source (e.g. telegram_message_id).
-        metadata: Option<Box<dyn std::any::Any + Send + Sync>>,
+        origin: EntryOrigin,
+        channel_metadata: Option<serde_json::Value>,
     },
     /// Context update to inject into history without triggering LLM processing.
     ContextUpdate(Message),
     /// Internal history/prompt mutation.
     Internal(InternalMutation),
-}
-
-/// Event types for the refactored AgentLoop event router.
-pub enum AgentEvent {
-    /// A message from the user.
-    UserMessage {
-        message: Message,
-        reply: Option<mpsc::Sender<LoopOutput>>,
-    },
-    /// A background task completed.
-    TaskCompletion(BackgroundTaskResult),
-    /// Cancellation signal.
-    Cancel,
-}
-
-/// An output emitted by the agent loop for a conversation response.
-pub struct LoopOutput {
-    pub text: String,
-    pub entry_id: usize,
-    pub is_final: bool,
-    /// Opaque metadata forwarded from the input event.
-    pub metadata: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 /// History mutations that don't trigger LLM processing.
@@ -75,12 +49,26 @@ impl InputPort {
     pub async fn send_user_message(
         &self,
         message: Message,
-        reply: Option<mpsc::Sender<LoopOutput>>,
+        origin: EntryOrigin,
     ) -> Result<(), crate::error::Error> {
         self.send(LoopEvent::UserMessage {
             message,
-            reply,
-            metadata: None,
+            origin,
+            channel_metadata: None,
+        })
+        .await
+    }
+
+    pub async fn send_user_message_with_metadata(
+        &self,
+        message: Message,
+        origin: EntryOrigin,
+        channel_metadata: Option<serde_json::Value>,
+    ) -> Result<(), crate::error::Error> {
+        self.send(LoopEvent::UserMessage {
+            message,
+            origin,
+            channel_metadata,
         })
         .await
     }
@@ -107,7 +95,37 @@ impl OutputPort {
         Self { rx }
     }
 
+    pub fn into_receiver(self) -> broadcast::Receiver<EntryNotification> {
+        self.rx
+    }
+
     pub async fn recv(&mut self) -> Option<EntryNotification> {
         self.rx.recv().await.ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::entry::EntryOrigin;
+    use crate::provider::moonshot::{Message, UserContent};
+
+    #[tokio::test]
+    async fn test_input_port_send_user_message_with_origin() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let port = InputPort::new(tx);
+
+        port.send_user_message(
+            Message::User { content: UserContent::Text("hello".into()) },
+            EntryOrigin::User { channel: "test".into() },
+        ).await.unwrap();
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            LoopEvent::UserMessage { origin, .. } => {
+                assert_eq!(origin, EntryOrigin::User { channel: "test".into() });
+            }
+            _ => panic!("Expected UserMessage"),
+        }
     }
 }

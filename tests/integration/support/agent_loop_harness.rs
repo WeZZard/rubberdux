@@ -2,19 +2,30 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use rubberdux::agent::entry::EntryOrigin;
 use rubberdux::agent::runtime::agent_loop::{AgentLoop, AgentLoopConfig};
 use rubberdux::agent::runtime::compaction::EvictOldestTurns;
-use rubberdux::agent::runtime::port::{LoopEvent, LoopOutput};
+use rubberdux::agent::runtime::port::{EntryNotification, LoopEvent};
 use rubberdux::provider::moonshot::{Message, MoonshotClient, UserContent};
 use rubberdux::tool::ToolRegistry;
+
+/// Collected output from the agent loop broadcast.
+#[derive(Debug, Clone)]
+pub struct LoopOutput {
+    pub text: String,
+    pub entry_id: usize,
+    pub is_final: bool,
+    pub channel_metadata: Option<serde_json::Value>,
+}
 
 /// Test harness that drives `AgentLoop` directly, bypassing the Telegram channel layer.
 /// Uses real LLM calls (MoonshotClient::from_env) and the full tool registry.
 pub struct AgentLoopHarness {
     input_port: rubberdux::agent::runtime::port::InputPort,
+    entry_rx: tokio::sync::Mutex<broadcast::Receiver<EntryNotification>>,
     session_path: PathBuf,
     _handle: tokio::task::JoinHandle<()>,
 }
@@ -56,12 +67,14 @@ impl AgentLoopHarness {
         };
 
         let (agent_loop, input_port) = AgentLoop::new(config).await;
+        let entry_rx = agent_loop.subscribe_output().into_receiver();
         let handle = tokio::spawn(async move {
             agent_loop.run().await;
         });
 
         Self {
             input_port,
+            entry_rx: tokio::sync::Mutex::new(entry_rx),
             session_path,
             _handle: handle,
         }
@@ -71,17 +84,30 @@ impl AgentLoopHarness {
         &self.session_path
     }
 
-    /// Send a user message and collect all `LoopOutput` responses
+    /// Send a user message and collect all assistant `EntryNotification` responses
     /// until `is_final == true` or the timeout expires.
     pub async fn send_message(&self, text: &str, timeout: Duration) -> MessageExchange {
-        let (reply_tx, mut reply_rx) = mpsc::channel::<LoopOutput>(32);
+        self.send_message_with_metadata(text, None, timeout).await
+    }
+
+    /// Send a user message with channel metadata and collect responses.
+    pub async fn send_message_with_metadata(
+        &self,
+        text: &str,
+        channel_metadata: Option<serde_json::Value>,
+        timeout: Duration,
+    ) -> MessageExchange {
+        let message = Message::User {
+            content: UserContent::Text(text.to_string()),
+        };
+        let origin = EntryOrigin::User {
+            channel: "test".into(),
+        };
 
         let event = LoopEvent::UserMessage {
-            message: Message::User {
-                content: UserContent::Text(text.to_string()),
-            },
-            reply: Some(reply_tx),
-            metadata: Some(Box::new(1i32)),
+            message,
+            origin,
+            channel_metadata,
         };
 
         self.input_port
@@ -89,22 +115,30 @@ impl AgentLoopHarness {
             .await
             .expect("input port should be open");
 
-        let mut responses = Vec::new();
+        let mut outputs = Vec::new();
         let deadline = tokio::time::Instant::now() + timeout;
         let mut failure_reason = None;
+        let mut rx = self.entry_rx.lock().await;
 
         loop {
-            match tokio::time::timeout_at(deadline, reply_rx.recv()).await {
-                Ok(Some(output)) => {
-                    let is_final = output.is_final;
-                    responses.push(output);
-                    if is_final {
-                        break;
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(notification)) => {
+                    if let Message::Assistant { content, .. } = &notification.entry.message {
+                        let text = content.clone().unwrap_or_default();
+                        outputs.push(LoopOutput {
+                            text,
+                            entry_id: notification.entry.id,
+                            is_final: notification.is_final,
+                            channel_metadata: notification.entry.channel_metadata.clone(),
+                        });
+                        if notification.is_final {
+                            break;
+                        }
                     }
                 }
-                Ok(None) => {
+                Ok(Err(_)) => {
                     failure_reason =
-                        Some("Reply channel closed before a final assistant response".to_string());
+                        Some("Broadcast channel closed before a final assistant response".into());
                     break;
                 }
                 Err(_) => {
@@ -118,7 +152,7 @@ impl AgentLoopHarness {
         }
 
         MessageExchange {
-            outputs: responses,
+            outputs,
             failure_reason,
         }
     }

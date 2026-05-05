@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 
-use tokio::sync::mpsc;
-
-use crate::agent::runtime::port::LoopOutput;
+use crate::agent::entry::EntryOrigin;
 use crate::tool::BackgroundTaskResult;
 
 // ---------------------------------------------------------------------------
@@ -10,11 +8,11 @@ use crate::tool::BackgroundTaskResult;
 // ---------------------------------------------------------------------------
 
 pub struct TaskGroup {
-    pub reply: Option<mpsc::Sender<LoopOutput>>,
+    pub origin: EntryOrigin,
     pub asst_entry_id: usize,
     pub remaining: usize,
     pub completed_results: Vec<BackgroundTaskResult>,
-    pub metadata: Option<Box<dyn std::any::Any + Send + Sync>>,
+    pub channel_metadata: Option<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -38,8 +36,8 @@ impl TaskGroupSet {
         &mut self,
         asst_entry_id: usize,
         task_ids: &[String],
-        reply: Option<mpsc::Sender<LoopOutput>>,
-        metadata: Option<Box<dyn std::any::Any + Send + Sync>>,
+        origin: EntryOrigin,
+        channel_metadata: Option<serde_json::Value>,
     ) {
         for tid in task_ids {
             self.task_to_group.insert(tid.clone(), asst_entry_id);
@@ -49,20 +47,17 @@ impl TaskGroupSet {
             self.groups.insert(
                 asst_entry_id,
                 TaskGroup {
-                    reply,
+                    origin,
                     asst_entry_id,
                     remaining: task_ids.len(),
                     completed_results: Vec::new(),
-                    metadata,
+                    channel_metadata,
                 },
             );
         } else if let Some(group) = self.groups.get_mut(&asst_entry_id) {
             group.remaining += task_ids.len();
-            if group.reply.is_none() {
-                group.reply = reply;
-            }
-            if group.metadata.is_none() {
-                group.metadata = metadata;
+            if group.channel_metadata.is_none() {
+                group.channel_metadata = channel_metadata;
             }
         }
     }

@@ -1,55 +1,25 @@
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::channel::{AgentResponse, ChannelEvent, InternalEvent};
-use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
+use crate::provider::moonshot::MoonshotClient;
 use crate::tool::ToolRegistry;
 
 use super::agent_loop::{AgentLoop, AgentLoopConfig};
 use super::compaction::EvictOldestTurns;
-use super::port::{InternalMutation, LoopEvent, LoopOutput};
-use super::session::session_path;
+use super::port::InputPort;
 
 const DEFAULT_BEST_PERFORMANCE_TOKENS: usize = 153_600;
 
-/// Bridge a `LoopOutput` reply channel into the channel-specific `AgentResponse` sender.
-fn bridge_reply(original_tx: mpsc::Sender<AgentResponse>) -> mpsc::Sender<LoopOutput> {
-    let (loop_tx, mut loop_rx) = mpsc::channel::<LoopOutput>(8);
-    tokio::spawn(async move {
-        while let Some(output) = loop_rx.recv().await {
-            let reply_to = output
-                .metadata
-                .and_then(|m| m.downcast::<i32>().ok())
-                .map(|m| *m);
-            let _ = original_tx
-                .send(AgentResponse {
-                    text: output.text,
-                    entry_id: output.entry_id,
-                    is_final: output.is_final,
-                    reply_to_message_id: reply_to,
-                })
-                .await;
-        }
-    });
-    loop_tx
-}
-
-pub async fn run(
-    rx: mpsc::Receiver<ChannelEvent>,
-    client: Arc<MoonshotClient>,
-    system_prompt: String,
-) {
-    run_with_session(rx, client, system_prompt, session_path()).await;
-}
-
+/// Create an AgentLoop configured for standalone chat mode.
+///
+/// Returns the loop and its input port. The caller is responsible for
+/// sending `LoopEvent`s through the `InputPort` and calling `agent_loop.run()`.
 pub async fn run_with_session(
-    mut rx: mpsc::Receiver<ChannelEvent>,
     client: Arc<MoonshotClient>,
     system_prompt: String,
     session_path: std::path::PathBuf,
-) {
+) -> (AgentLoop, InputPort) {
     let best_perf_tokens: usize = std::env::var("RUBBERDUX_LLM_BEST_PERFORMANCE_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -118,96 +88,7 @@ pub async fn run_with_session(
         context_tx: Some(context_tx),
     };
 
-    let (agent_loop, input_port) = AgentLoop::new(config).await;
-
-    // Telegram adapter: convert ChannelEvent -> LoopEvent
-    tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            match event {
-                ChannelEvent::UserInput {
-                    interpreted,
-                    reply_tx,
-                    telegram_message_id,
-                } => {
-                    let has_attachments = !interpreted.attachments.is_empty();
-                    let text = if has_attachments {
-                        format!(
-                            "{} [with {} attachment(s)]",
-                            interpreted.text,
-                            interpreted.attachments.len()
-                        )
-                    } else {
-                        interpreted.text.clone()
-                    };
-
-                    let message = Message::User {
-                        content: UserContent::Text(text),
-                    };
-
-                    let reply = reply_tx.map(bridge_reply);
-
-                    let metadata: Option<Box<dyn std::any::Any + Send + Sync>> =
-                        telegram_message_id.map(|id| Box::new(id) as _);
-
-                    let event = LoopEvent::UserMessage {
-                        message,
-                        reply,
-                        metadata,
-                    };
-
-                    if input_port.send(event).await.is_err() {
-                        log::warn!("AgentLoop input channel closed");
-                        break;
-                    }
-                }
-                ChannelEvent::ContextUpdate { text } => {
-                    let message = Message::User {
-                        content: UserContent::Text(text),
-                    };
-
-                    let event = LoopEvent::ContextUpdate(message);
-
-                    if input_port.send(event).await.is_err() {
-                        log::warn!("AgentLoop input channel closed");
-                        break;
-                    }
-                }
-                ChannelEvent::InternalEvent(internal) => {
-                    let loop_event = match internal {
-                        InternalEvent::UpdateAssistantMessageId {
-                            entry_id,
-                            message_id,
-                        } => LoopEvent::Internal(InternalMutation::UpdateEntryContent {
-                            entry_id,
-                            mutator: Box::new(move |entry| {
-                                if let Message::Assistant {
-                                    content: Some(text),
-                                    ..
-                                } = &mut entry.message
-                                {
-                                    crate::channel::adapter::telegram::inject_assistant_message_id(
-                                        text, message_id,
-                                    );
-                                }
-                            }),
-                        }),
-                        InternalEvent::UpdateAvailableReactions { reaction_section } => {
-                            LoopEvent::Internal(InternalMutation::UpdateSystemPrompt {
-                                content: reaction_section,
-                            })
-                        }
-                    };
-
-                    if input_port.send(loop_event).await.is_err() {
-                        log::warn!("AgentLoop input channel closed");
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    agent_loop.run().await;
+    AgentLoop::new(config).await
 }
 
 #[cfg(test)]
@@ -216,7 +97,7 @@ mod tests {
     use std::pin::Pin;
 
     use crate::agent::entry::EntryHistory;
-    use crate::provider::moonshot::UserContent;
+    use crate::provider::moonshot::{Message, UserContent};
 
     #[test]
     fn test_eviction_removes_oldest_pairs() {

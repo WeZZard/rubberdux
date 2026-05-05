@@ -1,14 +1,18 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use teloxide::prelude::*;
 use teloxide::types::{MessageReactionUpdated, ReactionType, Recipient};
-use tokio::sync::mpsc;
+use tokio::sync::Mutex;
+use tokio::sync::broadcast;
 
 use super::markup::{self, Document, MessageElement, Node};
 use super::parser::{self, Segment};
+use crate::agent::entry::{Entry, EntryOrigin};
+use crate::agent::runtime::port::{EntryNotification, InputPort, InternalMutation, LoopEvent};
 use crate::channel::interpreter;
-use crate::channel::{AgentResponse, ChannelEvent, InternalEvent};
+use crate::provider::moonshot::{Message, UserContent};
 
 const TELEGRAM_PROMPT: &str = include_str!("TELEGRAM.md");
 
@@ -113,262 +117,6 @@ pub fn format_reaction_section(emojis: &[String]) -> String {
     )
 }
 
-/// Fetches available reactions for a chat and sends an UpdateAvailableReactions event.
-async fn fetch_and_send_reactions(bot: &Bot, chat_id: ChatId, tx: &mpsc::Sender<ChannelEvent>) {
-    match bot.get_chat(chat_id).await {
-        Ok(chat) => {
-            let emojis: Vec<String> = match chat.available_reactions {
-                Some(reactions) => reactions
-                    .into_iter()
-                    .filter_map(|r| match r {
-                        ReactionType::Emoji { emoji } => Some(emoji),
-                        _ => None,
-                    })
-                    .collect(),
-                None => {
-                    // None means all emoji reactions are allowed — use defaults
-                    DEFAULT_REACTIONS.iter().map(|s| s.to_string()).collect()
-                }
-            };
-            let section = format_reaction_section(&emojis);
-            log::info!(
-                "Fetched {} available reactions for chat {}",
-                emojis.len(),
-                chat_id
-            );
-            let _ = tx
-                .send(ChannelEvent::InternalEvent(
-                    InternalEvent::UpdateAvailableReactions {
-                        reaction_section: section,
-                    },
-                ))
-                .await;
-        }
-        Err(e) => {
-            log::warn!("Failed to fetch chat info for reactions: {}", e);
-            // Fall back to defaults
-            let emojis: Vec<String> = DEFAULT_REACTIONS.iter().map(|s| s.to_string()).collect();
-            let section = format_reaction_section(&emojis);
-            let _ = tx
-                .send(ChannelEvent::InternalEvent(
-                    InternalEvent::UpdateAvailableReactions {
-                        reaction_section: section,
-                    },
-                ))
-                .await;
-        }
-    }
-}
-
-async fn handle_message(
-    bot: Bot,
-    msg: Message,
-    tx: mpsc::Sender<ChannelEvent>,
-    reactions_fetched: Arc<AtomicBool>,
-) -> Result<(), teloxide::RequestError> {
-    // Fetch available reactions on first message
-    if !reactions_fetched.swap(true, Ordering::Relaxed) {
-        fetch_and_send_reactions(&bot, msg.chat.id, &tx).await;
-    }
-
-    let interpreted = match interpreter::interpret(&bot, &msg).await {
-        Some(m) => m,
-        None => return Ok(()),
-    };
-
-    log::info!(
-        "Received: {} (attachments: {})",
-        interpreted.text,
-        interpreted.attachments.len()
-    );
-
-    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<AgentResponse>(16);
-
-    let event = ChannelEvent::UserInput {
-        interpreted,
-        reply_tx: Some(reply_tx),
-        telegram_message_id: Some(msg.id.0),
-    };
-
-    if tx.send(event).await.is_err() {
-        log::error!("Agent loop channel closed");
-        bot.send_message(msg.chat.id, "Sorry, the agent is unavailable.")
-            .await?;
-        return Ok(());
-    }
-
-    let _ = bot
-        .send_chat_action(msg.chat.id, teloxide::types::ChatAction::Typing)
-        .await;
-
-    // Spawn reply handling so this function returns immediately,
-    // freeing the Telegram dispatcher to process new messages.
-    let chat_id = msg.chat.id;
-    tokio::spawn(async move {
-        while let Some(response) = reply_rx.recv().await {
-            let segments = parser::parse_model_output(&response.text);
-
-            let mut has_reply = false;
-
-            for segment in &segments {
-                match segment {
-                    Segment::TelegramReaction { emoji, message_id } => {
-                        let reaction = ReactionType::Emoji {
-                            emoji: emoji.clone(),
-                        };
-                        let result = bot
-                            .set_message_reaction(
-                                Recipient::Id(chat_id),
-                                teloxide::types::MessageId(*message_id),
-                            )
-                            .reaction(vec![reaction])
-                            .await;
-
-                        if let Err(e) = result {
-                            log::warn!("Failed to set reaction: {}", e);
-                        }
-                    }
-                    Segment::TelegramMessage { content } => {
-                        has_reply = true;
-                        let formatted = super::markdown::format(content);
-                        log::debug!("Raw model reply:\n{}", content);
-                        log::debug!("Formatted for Telegram:\n{}", formatted);
-
-                        let mut req = bot
-                            .send_message(chat_id, &formatted)
-                            .parse_mode(teloxide::types::ParseMode::MarkdownV2);
-                        if let Some(reply_id) = response.reply_to_message_id {
-                            req = req.reply_parameters(teloxide::types::ReplyParameters::new(
-                                teloxide::types::MessageId(reply_id),
-                            ));
-                        }
-                        let sent_msg = req.await;
-
-                        let sent_msg = match sent_msg {
-                            Ok(m) => Some(m),
-                            Err(e) => {
-                                log::warn!(
-                                    "MarkdownV2 send failed ({}), retrying without parse_mode",
-                                    e
-                                );
-                                let mut fallback_req = bot.send_message(chat_id, content);
-                                if let Some(reply_id) = response.reply_to_message_id {
-                                    fallback_req = fallback_req.reply_parameters(
-                                        teloxide::types::ReplyParameters::new(
-                                            teloxide::types::MessageId(reply_id),
-                                        ),
-                                    );
-                                }
-                                fallback_req.await.ok()
-                            }
-                        };
-
-                        if let Some(sent) = sent_msg {
-                            let _ = tx
-                                .send(ChannelEvent::InternalEvent(
-                                    InternalEvent::UpdateAssistantMessageId {
-                                        entry_id: response.entry_id,
-                                        message_id: sent.id.0,
-                                    },
-                                ))
-                                .await;
-                        }
-                    }
-                    Segment::Internal(_) => {}
-                }
-            }
-
-            if !has_reply
-                && segments
-                    .iter()
-                    .all(|s| !matches!(s, Segment::TelegramReaction { .. }))
-            {
-                if !response.text.is_empty() {
-                    let formatted = super::markdown::format(&response.text);
-                    log::debug!("Raw LLM response (no tags):\n{}", response.text);
-
-                    let mut req = bot
-                        .send_message(chat_id, &formatted)
-                        .parse_mode(teloxide::types::ParseMode::MarkdownV2);
-                    if let Some(reply_id) = response.reply_to_message_id {
-                        req = req.reply_parameters(teloxide::types::ReplyParameters::new(
-                            teloxide::types::MessageId(reply_id),
-                        ));
-                    }
-                    let sent_msg = req.await;
-
-                    match sent_msg {
-                        Ok(_) => {}
-                        Err(e) => {
-                            log::warn!(
-                                "MarkdownV2 send failed ({}), retrying without parse_mode",
-                                e
-                            );
-                            let mut fallback_req = bot.send_message(chat_id, &response.text);
-                            if let Some(reply_id) = response.reply_to_message_id {
-                                fallback_req = fallback_req.reply_parameters(
-                                    teloxide::types::ReplyParameters::new(
-                                        teloxide::types::MessageId(reply_id),
-                                    ),
-                                );
-                            }
-                            let _ = fallback_req.await;
-                        }
-                    }
-                }
-            }
-
-            if response.is_final {
-                break;
-            }
-
-            let _ = bot
-                .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
-                .await;
-        }
-    });
-
-    Ok(())
-}
-
-async fn handle_reaction(
-    reaction: MessageReactionUpdated,
-    tx: mpsc::Sender<ChannelEvent>,
-) -> Result<(), teloxide::RequestError> {
-    let interpreted_messages = interpreter::interpret_reaction(&reaction);
-
-    for interpreted in interpreted_messages {
-        log::info!("Reaction event: {}", interpreted.text);
-
-        let event = ChannelEvent::UserInput {
-            interpreted,
-            reply_tx: None,
-            telegram_message_id: None,
-        };
-
-        if tx.send(event).await.is_err() {
-            log::error!("Agent loop channel closed (reaction)");
-        }
-    }
-
-    Ok(())
-}
-
-pub async fn run(bot: Bot, tx: mpsc::Sender<ChannelEvent>) {
-    let reactions_fetched = Arc::new(AtomicBool::new(false));
-
-    let handler = dptree::entry()
-        .branch(Update::filter_message().endpoint(handle_message))
-        .branch(Update::filter_message_reaction_updated().endpoint(handle_reaction));
-
-    Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![tx, reactions_fetched])
-        .enable_ctrlc_handler()
-        .build()
-        .dispatch()
-        .await;
-}
-
 /// Injects a Telegram message ID into an assistant message's content.
 /// If the content already has a `<telegram-message from="assistant" to="user">` tag,
 /// the `id` attribute is inserted into the existing tag.
@@ -406,6 +154,360 @@ pub fn inject_assistant_message_id(text: &mut String, msg_id: i32) {
         };
         *text = markup::serialize(&wrapped);
     }
+}
+
+/// Run the Telegram adapter.
+pub async fn run(
+    bot: Bot,
+    input_port: InputPort,
+    entry_rx: broadcast::Receiver<EntryNotification>,
+) {
+    let reactions_fetched = Arc::new(AtomicBool::new(false));
+    let entry_cache: Arc<Mutex<HashMap<usize, Entry>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // Spawn broadcast listener
+    let bot_for_broadcast = bot.clone();
+    let input_port_for_broadcast = input_port.clone();
+    let cache_for_broadcast = entry_cache.clone();
+    tokio::spawn(broadcast_listener(
+        bot_for_broadcast,
+        input_port_for_broadcast,
+        entry_rx,
+        cache_for_broadcast,
+    ));
+
+    // Run teloxide dispatcher
+    let handler = dptree::entry()
+        .branch(Update::filter_message().endpoint(handle_message))
+        .branch(Update::filter_message_reaction_updated().endpoint(handle_reaction));
+
+    Dispatcher::builder(bot, handler)
+        .dependencies(dptree::deps![input_port, reactions_fetched, entry_cache])
+        .enable_ctrlc_handler()
+        .build()
+        .dispatch()
+        .await;
+}
+
+async fn broadcast_listener(
+    bot: Bot,
+    input_port: InputPort,
+    mut entry_rx: broadcast::Receiver<EntryNotification>,
+    cache: Arc<Mutex<HashMap<usize, Entry>>>,
+) {
+    loop {
+        match entry_rx.recv().await {
+            Ok(notification) => {
+                // Cache every entry we see
+                {
+                    let mut c = cache.lock().await;
+                    c.insert(notification.entry.id, notification.entry.clone());
+                }
+
+                // Only process assistant entries
+                if notification.entry.origin != EntryOrigin::Assistant {
+                    continue;
+                }
+
+                // Walk parent chain to find root user entry
+                let (chat_id, reply_to_msg_id) = {
+                    let c = cache.lock().await;
+                    find_telegram_context(&c, &notification.entry)
+                };
+
+                let Some(chat_id) = chat_id else { continue };
+
+                // Render the assistant message to Telegram
+                let text = notification.entry.message.content_text();
+                if text.is_empty() {
+                    continue;
+                }
+
+                let segments = parser::parse_model_output(text);
+                let mut has_reply = false;
+
+                for segment in &segments {
+                    match segment {
+                        Segment::TelegramReaction { emoji, message_id } => {
+                            let reaction = ReactionType::Emoji {
+                                emoji: emoji.clone(),
+                            };
+                            let _ = bot
+                                .set_message_reaction(
+                                    Recipient::Id(ChatId(chat_id)),
+                                    teloxide::types::MessageId(*message_id),
+                                )
+                                .reaction(vec![reaction])
+                                .await;
+                        }
+                        Segment::TelegramMessage { content } => {
+                            has_reply = true;
+                            let formatted = super::markdown::format(content);
+
+                            let mut req = bot
+                                .send_message(ChatId(chat_id), &formatted)
+                                .parse_mode(teloxide::types::ParseMode::MarkdownV2);
+                            if let Some(reply_id) = reply_to_msg_id {
+                                req = req.reply_parameters(
+                                    teloxide::types::ReplyParameters::new(
+                                        teloxide::types::MessageId(reply_id),
+                                    ),
+                                );
+                            }
+                            let sent_msg = req.await;
+
+                            let sent_msg = match sent_msg {
+                                Ok(m) => Some(m),
+                                Err(e) => {
+                                    log::warn!(
+                                        "MarkdownV2 send failed ({}), retrying plain",
+                                        e
+                                    );
+                                    let mut fallback =
+                                        bot.send_message(ChatId(chat_id), content);
+                                    if let Some(reply_id) = reply_to_msg_id {
+                                        fallback = fallback.reply_parameters(
+                                            teloxide::types::ReplyParameters::new(
+                                                teloxide::types::MessageId(reply_id),
+                                            ),
+                                        );
+                                    }
+                                    fallback.await.ok()
+                                }
+                            };
+
+                            // Inject Telegram message ID into the assistant entry
+                            if let Some(sent) = sent_msg {
+                                let entry_id = notification.entry.id;
+                                let msg_id = sent.id.0;
+                                let _ = input_port
+                                    .send(LoopEvent::Internal(
+                                        InternalMutation::UpdateEntryContent {
+                                            entry_id,
+                                            mutator: Box::new(move |entry| {
+                                                if let Message::Assistant {
+                                                    content: Some(text),
+                                                    ..
+                                                } = &mut entry.message
+                                                {
+                                                    inject_assistant_message_id(text, msg_id);
+                                                }
+                                            }),
+                                        },
+                                    ))
+                                    .await;
+                            }
+                        }
+                        Segment::Internal(_) => {}
+                    }
+                }
+
+                // Fallback: if no parsed segments produced a reply, send raw text
+                if !has_reply
+                    && segments
+                        .iter()
+                        .all(|s| !matches!(s, Segment::TelegramReaction { .. }))
+                {
+                    if !text.is_empty() {
+                        let formatted = super::markdown::format(text);
+                        let mut req = bot
+                            .send_message(ChatId(chat_id), &formatted)
+                            .parse_mode(teloxide::types::ParseMode::MarkdownV2);
+                        if let Some(reply_id) = reply_to_msg_id {
+                            req = req.reply_parameters(
+                                teloxide::types::ReplyParameters::new(
+                                    teloxide::types::MessageId(reply_id),
+                                ),
+                            );
+                        }
+                        match req.await {
+                            Ok(_) => {}
+                            Err(e) => {
+                                log::warn!(
+                                    "MarkdownV2 fallback failed ({}), retrying plain",
+                                    e
+                                );
+                                let mut fallback =
+                                    bot.send_message(ChatId(chat_id), text);
+                                if let Some(reply_id) = reply_to_msg_id {
+                                    fallback = fallback.reply_parameters(
+                                        teloxide::types::ReplyParameters::new(
+                                            teloxide::types::MessageId(reply_id),
+                                        ),
+                                    );
+                                }
+                                let _ = fallback.await;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                log::warn!("Telegram broadcast listener lagged by {} messages", n);
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+fn find_telegram_context(
+    cache: &HashMap<usize, Entry>,
+    entry: &Entry,
+) -> (Option<i64>, Option<i32>) {
+    // Walk parent chain to find the root user entry from Telegram
+    let mut current = entry;
+    loop {
+        match current.parent_id {
+            Some(parent_id) => {
+                if let Some(parent) = cache.get(&parent_id) {
+                    current = parent;
+                } else {
+                    return (None, None);
+                }
+            }
+            None => break,
+        }
+    }
+
+    // current is now the root entry
+    if let EntryOrigin::User { ref channel } = current.origin {
+        if channel == "telegram" {
+            if let Some(ref meta) = current.channel_metadata {
+                let chat_id = meta.get("telegram_chat_id").and_then(|v| v.as_i64());
+                let msg_id = meta
+                    .get("telegram_message_id")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32);
+                return (chat_id, msg_id);
+            }
+        }
+    }
+
+    (None, None)
+}
+
+async fn handle_message(
+    bot: Bot,
+    msg: teloxide::types::Message,
+    input_port: InputPort,
+    reactions_fetched: Arc<AtomicBool>,
+    _entry_cache: Arc<Mutex<HashMap<usize, Entry>>>,
+) -> Result<(), teloxide::RequestError> {
+    // Fetch available reactions on first message
+    if !reactions_fetched.swap(true, Ordering::Relaxed) {
+        fetch_and_send_reactions(&bot, msg.chat.id, &input_port).await;
+    }
+
+    let interpreted = match interpreter::interpret(&bot, &msg).await {
+        Some(m) => m,
+        None => return Ok(()),
+    };
+
+    log::info!(
+        "Received: {} (attachments: {})",
+        interpreted.text,
+        interpreted.attachments.len()
+    );
+
+    let message = Message::User {
+        content: UserContent::Text(interpreted.text),
+    };
+
+    let channel_metadata = Some(serde_json::json!({
+        "telegram_message_id": msg.id.0,
+        "telegram_chat_id": msg.chat.id.0,
+    }));
+
+    if input_port
+        .send(LoopEvent::UserMessage {
+            message,
+            origin: EntryOrigin::User {
+                channel: "telegram".into(),
+            },
+            channel_metadata,
+        })
+        .await
+        .is_err()
+    {
+        log::error!("AgentLoop input closed");
+        bot.send_message(msg.chat.id, "Sorry, the agent is unavailable.")
+            .await?;
+        return Ok(());
+    }
+
+    let _ = bot
+        .send_chat_action(msg.chat.id, teloxide::types::ChatAction::Typing)
+        .await;
+
+    Ok(())
+}
+
+async fn handle_reaction(
+    reaction: MessageReactionUpdated,
+    input_port: InputPort,
+) -> Result<(), teloxide::RequestError> {
+    let interpreted_messages = interpreter::interpret_reaction(&reaction);
+
+    let channel_metadata = Some(serde_json::json!({
+        "telegram_chat_id": reaction.chat.id.0,
+        "telegram_message_id": reaction.message_id.0,
+    }));
+
+    for interpreted in interpreted_messages {
+        log::info!("Reaction event: {}", interpreted.text);
+
+        let message = Message::User {
+            content: UserContent::Text(interpreted.text),
+        };
+
+        if input_port
+            .send(LoopEvent::UserMessage {
+                message,
+                origin: EntryOrigin::User {
+                    channel: "telegram".into(),
+                },
+                channel_metadata: channel_metadata.clone(),
+            })
+            .await
+            .is_err()
+        {
+            log::error!("AgentLoop input closed (reaction)");
+        }
+    }
+
+    Ok(())
+}
+
+async fn fetch_and_send_reactions(bot: &Bot, chat_id: ChatId, input_port: &InputPort) {
+    let emojis: Vec<String> = match bot.get_chat(chat_id).await {
+        Ok(chat) => match chat.available_reactions {
+            Some(reactions) => reactions
+                .into_iter()
+                .filter_map(|r| match r {
+                    ReactionType::Emoji { emoji } => Some(emoji),
+                    _ => None,
+                })
+                .collect(),
+            None => DEFAULT_REACTIONS.iter().map(|s| s.to_string()).collect(),
+        },
+        Err(e) => {
+            log::warn!("Failed to fetch chat info for reactions: {}", e);
+            DEFAULT_REACTIONS.iter().map(|s| s.to_string()).collect()
+        }
+    };
+
+    let section = format_reaction_section(&emojis);
+    log::info!(
+        "Fetched {} available reactions for chat {}",
+        emojis.len(),
+        chat_id
+    );
+
+    let _ = input_port
+        .send(LoopEvent::Internal(InternalMutation::UpdateSystemPrompt {
+            content: section,
+        }))
+        .await;
 }
 
 #[cfg(test)]
@@ -505,5 +607,103 @@ mod tests {
         assert_eq!(asst_content.matches("<telegram-message").count(), 1);
 
         assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn test_find_telegram_context_simple_chain() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            0,
+            Entry {
+                id: 0,
+                parent_id: None,
+                message: Message::User {
+                    content: UserContent::Text("hi".into()),
+                },
+                origin: EntryOrigin::User {
+                    channel: "telegram".into(),
+                },
+                channel_metadata: Some(serde_json::json!({
+                    "telegram_chat_id": 12345_i64,
+                    "telegram_message_id": 99,
+                })),
+            },
+        );
+        cache.insert(
+            1,
+            Entry {
+                id: 1,
+                parent_id: Some(0),
+                message: Message::Assistant {
+                    content: Some("hello".into()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    partial: None,
+                },
+                origin: EntryOrigin::Assistant,
+                channel_metadata: None,
+            },
+        );
+
+        let (chat_id, msg_id) = find_telegram_context(&cache, cache.get(&1).unwrap());
+        assert_eq!(chat_id, Some(12345));
+        assert_eq!(msg_id, Some(99));
+    }
+
+    #[test]
+    fn test_find_telegram_context_no_parent() {
+        let cache = HashMap::new();
+        let entry = Entry {
+            id: 5,
+            parent_id: Some(999),
+            message: Message::Assistant {
+                content: Some("lost".into()),
+                reasoning_content: None,
+                tool_calls: None,
+                partial: None,
+            },
+            origin: EntryOrigin::Assistant,
+            channel_metadata: None,
+        };
+        let (chat_id, msg_id) = find_telegram_context(&cache, &entry);
+        assert_eq!(chat_id, None);
+        assert_eq!(msg_id, None);
+    }
+
+    #[test]
+    fn test_find_telegram_context_non_telegram_origin() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            0,
+            Entry {
+                id: 0,
+                parent_id: None,
+                message: Message::User {
+                    content: UserContent::Text("hi".into()),
+                },
+                origin: EntryOrigin::User {
+                    channel: "gateway".into(),
+                },
+                channel_metadata: None,
+            },
+        );
+        cache.insert(
+            1,
+            Entry {
+                id: 1,
+                parent_id: Some(0),
+                message: Message::Assistant {
+                    content: Some("hello".into()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    partial: None,
+                },
+                origin: EntryOrigin::Assistant,
+                channel_metadata: None,
+            },
+        );
+
+        let (chat_id, _) = find_telegram_context(&cache, cache.get(&1).unwrap());
+        assert_eq!(chat_id, None);
     }
 }
