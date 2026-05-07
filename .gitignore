@@ -11,6 +11,10 @@ Cargo.lock
 
 .opencode/plans
 
+*.profraw
+
+.claude/settings.local.json
+
 # Xcode
 apps/macos/*.xcodeproj/xcuserdata/
 apps/macos/*.xcodeproj/project.xcworkspace/xcuserdata/

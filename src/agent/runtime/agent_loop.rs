@@ -211,6 +211,26 @@ impl AgentLoop {
             self.history.len(),
         );
 
+        // Replay loaded session history through the entry broadcast so all
+        // subscribers (gateway mirror, Telegram adapter, future channels) see
+        // the persisted state before any live event is processed. Without
+        // this, only entries created during the current run reach
+        // subscribers, leaving the macOS Conversation tab and the Telegram
+        // parent-chain cache missing every entry that was loaded from
+        // session.jsonl. is_final is false because these are recovered
+        // mid-conversation events, not turn boundaries.
+        let history_ids: Vec<usize> =
+            self.history.entries().iter().map(|e| e.id).collect();
+        for (i, entry_id) in history_ids.iter().enumerate() {
+            self.notify_entry(*entry_id, false);
+            // Yield periodically so subscriber tasks can drain their
+            // broadcast queue (capacity 256) before it overflows on
+            // long sessions.
+            if i > 0 && i.is_multiple_of(64) {
+                tokio::task::yield_now().await;
+            }
+        }
+
         loop {
             // If idle and have pending messages, process one immediately
             // without waiting for external events.

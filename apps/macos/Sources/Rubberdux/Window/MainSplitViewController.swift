@@ -5,6 +5,7 @@ class MainSplitViewController: NSSplitViewController {
     private let apiClient: APIClient
     private let webSocketClient: WebSocketClient
     private var contentControllers: [SidebarItem: NSViewController] = [:]
+    private let contentContainer = ContentContainerViewController()
 
     init(baseURL: URL) {
         self.apiClient = APIClient(baseURL: baseURL)
@@ -22,7 +23,8 @@ class MainSplitViewController: NSSplitViewController {
         sidebarItem.maximumThickness = 300
         addSplitViewItem(sidebarItem)
 
-        let contentItem = NSSplitViewItem(viewController: contentController(for: .conversation))
+        contentContainer.show(contentController(for: .conversation))
+        let contentItem = NSSplitViewItem(viewController: contentContainer)
         addSplitViewItem(contentItem)
 
         let inspectorItem = NSSplitViewItem(inspectorWithViewController: NSViewController())
@@ -43,7 +45,7 @@ class MainSplitViewController: NSSplitViewController {
     }
 
     private func showContent(for item: SidebarItem) {
-        splitViewItems[1].viewController = contentController(for: item)
+        contentContainer.show(contentController(for: item))
     }
 
     private func contentController(for item: SidebarItem) -> NSViewController {
@@ -67,5 +69,36 @@ class MainSplitViewController: NSSplitViewController {
         }
         contentControllers[item] = vc
         return vc
+    }
+}
+
+/// Hosts a single child view controller and swaps it in place. NSSplitViewItem
+/// disallows replacing its viewController once added to a SplitViewController,
+/// so we keep the SplitViewItem stable and swap the child here.
+private final class ContentContainerViewController: NSViewController {
+    private weak var currentChild: NSViewController?
+
+    override func loadView() {
+        view = NSView()
+    }
+
+    func show(_ child: NSViewController) {
+        if currentChild === child { return }
+
+        if let previous = currentChild {
+            previous.view.removeFromSuperview()
+            previous.removeFromParent()
+        }
+
+        addChild(child)
+        child.view.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(child.view)
+        NSLayoutConstraint.activate([
+            child.view.topAnchor.constraint(equalTo: view.topAnchor),
+            child.view.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            child.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            child.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+        ])
+        currentChild = child
     }
 }
