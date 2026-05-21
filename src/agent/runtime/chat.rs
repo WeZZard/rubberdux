@@ -86,6 +86,7 @@ pub async fn run_with_session(
         cancel: CancellationToken::new(),
         compaction: Box::new(EvictOldestTurns),
         context_tx: Some(context_tx),
+        channel_processors: std::collections::HashMap::new(),
     };
 
     AgentLoop::new(config).await

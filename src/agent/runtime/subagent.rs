@@ -70,6 +70,7 @@ pub fn spawn_subagent(
             cancel: cancel_clone.clone(),
             compaction: Box::new(EvictOldestTurns),
             context_tx: None,
+            channel_processors: std::collections::HashMap::new(),
         };
 
         let (agent_loop, input_port) = AgentLoop::new(config).await;

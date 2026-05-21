@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -51,6 +52,7 @@ pub struct AgentLoopConfig {
     pub cancel: CancellationToken,
     pub compaction: Box<dyn CompactionStrategy>,
     pub context_tx: Option<broadcast::Sender<ContextEvent>>,
+    pub channel_processors: HashMap<String, Arc<dyn crate::channel::processor::ChannelProcessor>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +91,9 @@ pub struct AgentLoop {
 
     // Task tracking
     active_groups: TaskGroupSet,
+
+    // Channel processors
+    channel_processors: HashMap<String, Arc<dyn crate::channel::processor::ChannelProcessor>>,
 
     // Compaction
     compaction: Box<dyn CompactionStrategy>,
@@ -173,6 +178,7 @@ impl AgentLoop {
             context_tx,
             entry_notify_tx,
             active_groups: TaskGroupSet::new(),
+            channel_processors: config.channel_processors,
             compaction: config.compaction,
             cancel: config.cancel,
         };
@@ -487,6 +493,17 @@ impl AgentLoop {
                 prompt_tokens,
                 completion_tokens,
             } => {
+                if let EntryOrigin::User { ref channel } = self.current_origin {
+                    if let Some(processor) = self.channel_processors.get(channel) {
+                        if let Some(ref metadata) = self.current_channel_metadata {
+                            if let Some(entry) = self.history.get_mut(entry_id) {
+                                if let Err(e) = processor.process_outbound(entry, metadata).await {
+                                    log::warn!("Channel processor failed for {}: {}", channel, e);
+                                }
+                            }
+                        }
+                    }
+                }
                 self.persist_entry(entry_id).await;
                 self.record_message("message.recorded", entry_id, "assistant", true);
                 self.notify_entry(entry_id, true);
@@ -513,6 +530,17 @@ impl AgentLoop {
                 prompt_tokens,
                 completion_tokens,
             } => {
+                if let EntryOrigin::User { ref channel } = self.current_origin {
+                    if let Some(processor) = self.channel_processors.get(channel) {
+                        if let Some(ref metadata) = self.current_channel_metadata {
+                            if let Some(entry) = self.history.get_mut(entry_id) {
+                                if let Err(e) = processor.process_outbound(entry, metadata).await {
+                                    log::warn!("Channel processor failed for {}: {}", channel, e);
+                                }
+                            }
+                        }
+                    }
+                }
                 self.persist_entry(entry_id).await;
                 self.record_message("message.recorded", entry_id, "assistant", false);
                 self.notify_entry(entry_id, false);

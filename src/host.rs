@@ -180,7 +180,9 @@ pub async fn run(_config: HostConfig, bot: Bot) {
 
     let prompt_dir = crate::hardened_prompts::prompt_dir();
     let prompt_parts = crate::hardened_prompts::load_prompt_parts(&prompt_dir);
-    let system_prompt = crate::hardened_prompts::compose_system_prompt(&prompt_parts, None);
+    let channel_partial = Some(crate::channel::adapter::telegram::channel_prompt());
+    let system_prompt =
+        crate::hardened_prompts::compose_system_prompt(&prompt_parts, channel_partial);
 
     let client = Arc::new(crate::provider::moonshot::MoonshotClient::from_env());
 
@@ -200,9 +202,13 @@ pub async fn run(_config: HostConfig, bot: Bot) {
     );
 
     let gateway_system_prompt = system_prompt.clone();
+    let telegram_processor = std::sync::Arc::new(
+        crate::channel::adapter::telegram::TelegramChannelProcessor::new(bot.clone()),
+    );
     let builder = AgentLoopBuilder::new(system_prompt, session_manager)
         .with_session_id(session_id)
         .with_workspace(workspace)
+        .with_channel_processor("telegram", telegram_processor)
         .with_recorder(broadcast_recorder);
     let (agent_loop, input_port, _context_tx) = builder.build(client).await;
 

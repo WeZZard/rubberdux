@@ -30,6 +30,7 @@ pub struct AgentLoopBuilder {
     pub with_agent_tool: bool,
     pub recorder: Option<SharedTrajectoryRecorder>,
     pub workspace: Option<Arc<crate::workspace::Workspace>>,
+    pub channel_processors: std::collections::HashMap<String, std::sync::Arc<dyn crate::channel::processor::ChannelProcessor>>,
 }
 
 impl AgentLoopBuilder {
@@ -42,6 +43,7 @@ impl AgentLoopBuilder {
             with_agent_tool: true,
             recorder: None,
             workspace: None,
+            channel_processors: std::collections::HashMap::new(),
         }
     }
 
@@ -67,6 +69,15 @@ impl AgentLoopBuilder {
 
     pub fn with_workspace(mut self, workspace: Arc<crate::workspace::Workspace>) -> Self {
         self.workspace = Some(workspace);
+        self
+    }
+
+    pub fn with_channel_processor(
+        mut self,
+        name: impl Into<String>,
+        processor: std::sync::Arc<dyn crate::channel::processor::ChannelProcessor>,
+    ) -> Self {
+        self.channel_processors.insert(name.into(), processor);
         self
     }
 
@@ -129,6 +140,7 @@ impl AgentLoopBuilder {
             cancel: cancel.clone(),
             compaction: Box::new(EvictOldestTurns),
             context_tx: Some(context_tx.clone()),
+            channel_processors: self.channel_processors,
         };
 
         let (agent_loop, input_port) = AgentLoop::new(config).await;
