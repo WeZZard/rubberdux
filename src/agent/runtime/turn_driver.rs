@@ -29,6 +29,7 @@ pub enum TurnOutcome {
     Tools {
         text: String,
         entry_id: usize,
+        tool_entry_ids: Vec<usize>,
         background_tasks: Vec<String>,
         prompt_tokens: usize,
         completion_tokens: usize,
@@ -200,6 +201,7 @@ impl TurnDriver {
         let mut background_tasks = Vec::new();
         let mut tool_error_count = 0usize;
 
+        let mut tool_entry_ids = Vec::new();
         for (call, outcome) in tool_results {
             let formatted = crate::tool::format_tool_outcome(&outcome);
 
@@ -297,7 +299,8 @@ impl TurnDriver {
                 name: None,
                 content: formatted,
             };
-            history.push_tool(asst_entry_id, tool_msg);
+            let tool_id = history.push_tool(asst_entry_id, tool_msg);
+            tool_entry_ids.push(tool_id);
         }
 
         self.record_with_task(
@@ -316,6 +319,7 @@ impl TurnDriver {
         TurnOutcome::Tools {
             text,
             entry_id: asst_entry_id,
+            tool_entry_ids,
             background_tasks,
             prompt_tokens,
             completion_tokens,

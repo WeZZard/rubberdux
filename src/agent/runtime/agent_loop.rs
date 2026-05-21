@@ -460,11 +460,11 @@ impl AgentLoop {
 
             // Update token count from the LLM response.
             match &outcome {
-                TurnOutcome::Text { prompt_tokens, .. }
-                | TurnOutcome::Tools { prompt_tokens, .. } => {
+                TurnOutcome::Text { text: _, entry_id: _, prompt_tokens, completion_tokens: _ }
+                | TurnOutcome::Tools { text: _, entry_id: _, tool_entry_ids: _, background_tasks: _, prompt_tokens, completion_tokens: _ } => {
                     self.current_tokens = *prompt_tokens;
                 }
-                TurnOutcome::Failed { .. } => {}
+                TurnOutcome::Failed { error: _ } => {}
             }
 
             let should_continue = self.handle_turn_outcome(outcome, &turn_id).await;
@@ -506,15 +506,22 @@ impl AgentLoop {
                 false
             }
             TurnOutcome::Tools {
+                text: _,
                 entry_id,
+                tool_entry_ids,
                 background_tasks,
                 prompt_tokens,
                 completion_tokens,
-                ..
             } => {
                 self.persist_entry(entry_id).await;
                 self.record_message("message.recorded", entry_id, "assistant", false);
                 self.notify_entry(entry_id, false);
+
+                for tool_id in &tool_entry_ids {
+                    self.persist_entry(*tool_id).await;
+                    self.record_message("message.recorded", *tool_id, "tool", false);
+                    self.notify_entry(*tool_id, false);
+                }
 
                 if background_tasks.is_empty() {
                     // All tools were immediate; continue to next turn.
