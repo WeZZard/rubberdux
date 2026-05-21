@@ -29,6 +29,7 @@ pub struct AgentLoopBuilder {
     pub token_budget: usize,
     pub with_agent_tool: bool,
     pub recorder: Option<SharedTrajectoryRecorder>,
+    pub workspace: Option<Arc<crate::workspace::Workspace>>,
 }
 
 impl AgentLoopBuilder {
@@ -40,6 +41,7 @@ impl AgentLoopBuilder {
             token_budget: 153_600,
             with_agent_tool: true,
             recorder: None,
+            workspace: None,
         }
     }
 
@@ -60,6 +62,11 @@ impl AgentLoopBuilder {
 
     pub fn with_recorder(mut self, recorder: SharedTrajectoryRecorder) -> Self {
         self.recorder = Some(recorder);
+        self
+    }
+
+    pub fn with_workspace(mut self, workspace: Arc<crate::workspace::Workspace>) -> Self {
+        self.workspace = Some(workspace);
         self
     }
 
@@ -90,8 +97,12 @@ impl AgentLoopBuilder {
             r.register(Box::new(GrepTool));
             r.register(Box::new(WebSearchTool::new(client.clone())));
 
+            if let Some(ref ws) = self.workspace {
+                r.register(Box::new(crate::tool::workspace::WorkspaceTool::new(ws.clone())));
+            }
+
             if self.with_agent_tool {
-                let subagent_registries = build_subagent_registries(&client);
+                let subagent_registries = build_subagent_registries(&client, &self.workspace);
                 r.register(Box::new(AgentTool::new(
                     client.clone(),
                     subagent_registries,

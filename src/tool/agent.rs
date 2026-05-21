@@ -22,6 +22,7 @@ use super::ToolOutcome;
 /// GeneralPurpose and ComputerUse get a full registry (no recursive `agent`).
 pub fn build_subagent_registries(
     client: &Arc<MoonshotClient>,
+    workspace: &Option<Arc<crate::workspace::Workspace>>,
 ) -> HashMap<SubagentType, Arc<ToolRegistry>> {
     use crate::provider::moonshot::tool::web_fetch::MoonshotWebFetchTool;
     use crate::provider::moonshot::tool::web_search::WebSearchTool;
@@ -53,6 +54,11 @@ pub fn build_subagent_registries(
         r.register(Box::new(GlobTool));
         r.register(Box::new(GrepTool));
         r.register(Box::new(WebSearchTool::new(client.clone())));
+
+        if let Some(ws) = workspace {
+            r.register(Box::new(crate::tool::workspace::WorkspaceTool::new(ws.clone())));
+        }
+
         r
     });
 
@@ -265,7 +271,7 @@ mod tests {
 
     fn dummy_registries() -> HashMap<SubagentType, Arc<ToolRegistry>> {
         let client = dummy_client();
-        build_subagent_registries(&client)
+        build_subagent_registries(&client, &None)
     }
 
     fn dummy_agent_tool() -> AgentTool {

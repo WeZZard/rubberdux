@@ -1,0 +1,32 @@
+{
+  "type": "function",
+  "function": {
+    "name": "workspace",
+    "description": "Manage workspace entities: responsibilities (ongoing areas of work) and projects (deadline-bound work). Use the entity and action parameters to perform CRUD operations.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "entity": {
+          "type": "string",
+          "description": "The type of workspace entity to operate on.",
+          "enum": ["responsibility", "project", "thread", "artifact", "resource"]
+        },
+        "action": {
+          "type": "string",
+          "description": "The CRUD action to perform.",
+          "enum": ["list", "create", "retrieve", "update", "deactivate"]
+        },
+        "name": {
+          "type": "string",
+          "description": "Name/identifier of the entity. Required for create, retrieve, update, deactivate."
+        },
+        "fields": {
+          "type": "object",
+          "description": "Key-value pairs to set on the entity. Used with create and update. Responsibility fields: description. Project fields: description, deadline (YYYY-MM-DD), status (active/paused/completed).",
+          "additionalProperties": { "type": "string" }
+        }
+      },
+      "required": ["entity", "action"]
+    }
+  }
+}

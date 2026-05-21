@@ -202,6 +202,7 @@ pub async fn run(_config: HostConfig, bot: Bot) {
     let gateway_system_prompt = system_prompt.clone();
     let builder = AgentLoopBuilder::new(system_prompt, session_manager)
         .with_session_id(session_id)
+        .with_workspace(workspace)
         .with_recorder(broadcast_recorder);
     let (agent_loop, input_port, _context_tx) = builder.build(client).await;
 

@@ -62,6 +62,22 @@ impl Workspace {
     }
 }
 
+pub fn parse_yaml_front_matter<T: serde::de::DeserializeOwned>(content: &str) -> Result<T, Error> {
+    let parts: Vec<&str> = content.splitn(3, "---").collect();
+    if parts.len() < 3 {
+        return Err(Error::Workspace("Invalid front matter: missing --- delimiters".into()));
+    }
+    let yaml = parts[1].trim();
+    serde_yaml::from_str(yaml)
+        .map_err(|e| Error::Workspace(format!("Failed to parse YAML front matter: {}", e)))
+}
+
+pub fn format_yaml_front_matter<T: serde::Serialize>(data: &T, body: &str) -> Result<String, Error> {
+    let yaml = serde_yaml::to_string(data)
+        .map_err(|e| Error::Workspace(format!("Failed to serialize YAML: {}", e)))?;
+    Ok(format!("---\n{}---\n{}", yaml, body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +163,47 @@ mod tests {
                 env::set_var("RUBBERDUX_WORKSPACE_DIR", v);
             }
         }
+    }
+
+    #[test]
+    fn test_parse_yaml_front_matter_valid() {
+        let content = "---\nitems:\n  - title: Test\n    description: Desc\n---\nbody";
+        let doc: entity::ResponsibilitiesDoc = super::parse_yaml_front_matter(content).unwrap();
+        assert_eq!(doc.items.len(), 1);
+        assert_eq!(doc.items[0].title, "Test");
+    }
+
+    #[test]
+    fn test_parse_yaml_front_matter_missing_delimiters() {
+        let result = super::parse_yaml_front_matter::<entity::ResponsibilitiesDoc>("no delimiters");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_format_yaml_front_matter_roundtrip() {
+        let doc = entity::ResponsibilitiesDoc {
+            items: vec![entity::Responsibility {
+                title: "Roundtrip".into(),
+                description: "Test roundtrip".into(),
+                active: true,
+            }],
+        };
+        let formatted = super::format_yaml_front_matter(&doc, "body").unwrap();
+        let parsed: entity::ResponsibilitiesDoc = super::parse_yaml_front_matter(&formatted).unwrap();
+        assert_eq!(doc, parsed);
+    }
+
+    #[test]
+    fn test_format_yaml_front_matter_preserves_body() {
+        let doc = entity::ResponsibilitiesDoc {
+            items: vec![entity::Responsibility {
+                title: "X".into(),
+                description: "Y".into(),
+                active: true,
+            }],
+        };
+        let body = "# Notes\nSome text";
+        let output = super::format_yaml_front_matter(&doc, body).unwrap();
+        assert!(output.contains("# Notes\nSome text"));
     }
 }

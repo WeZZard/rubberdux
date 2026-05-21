@@ -5,6 +5,7 @@ pub mod glob;
 pub mod grep;
 pub mod read;
 pub mod web_fetch;
+pub mod workspace;
 pub mod write;
 
 use std::future::Future;
