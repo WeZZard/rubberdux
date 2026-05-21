@@ -11,6 +11,7 @@ mod provider;
 mod session;
 mod tool;
 mod trajectory;
+mod workspace;
 mod vm;
 
 #[cfg(feature = "host")]

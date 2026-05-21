@@ -30,4 +30,7 @@ pub enum Error {
 
     #[error("VM error: {0}")]
     Vm(String),
+
+    #[error("workspace error: {0}")]
+    Workspace(String),
 }

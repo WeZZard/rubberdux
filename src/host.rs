@@ -173,6 +173,11 @@ pub async fn run(_config: HostConfig, bot: Bot) {
         }
     }
 
+    let workspace = Arc::new(crate::workspace::Workspace::new());
+    workspace.ensure_dirs().expect("Failed to initialize workspace");
+
+    log::info!("Workspace root: {}", workspace.root.display());
+
     let prompt_dir = crate::hardened_prompts::prompt_dir();
     let prompt_parts = crate::hardened_prompts::load_prompt_parts(&prompt_dir);
     let system_prompt = crate::hardened_prompts::compose_system_prompt(&prompt_parts, None);
