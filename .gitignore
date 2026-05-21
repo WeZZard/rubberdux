@@ -19,3 +19,7 @@ Cargo.lock
 apps/macos/*.xcodeproj/xcuserdata/
 apps/macos/*.xcodeproj/project.xcworkspace/xcuserdata/
 apps/macos/.build/
+
+# Agent's Artifacts
+.review/**/*
+.plans/**/*
