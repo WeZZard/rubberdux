@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod app;
 mod distribute;
 mod launch;
 mod provision;
@@ -30,12 +31,33 @@ enum Commands {
     Launch,
     /// Stop running rubberdux process and VMs
     Stop,
+    /// Build or run the macOS app (builds Rust backend first)
+    App {
+        #[command(subcommand)]
+        action: AppCommands,
+    },
     /// Build and package the macOS app for distribution
     Distribute,
     /// Manage sessions
     Sessions {
         #[command(subcommand)]
         action: SessionCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum AppCommands {
+    /// Build Rust backend + macOS app
+    Build {
+        /// Build in release mode
+        #[arg(long)]
+        release: bool,
+    },
+    /// Build and launch the macOS app
+    Run {
+        /// Build in release mode
+        #[arg(long)]
+        release: bool,
     },
 }
 
@@ -73,6 +95,20 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::App { action } => match action {
+            AppCommands::Build { release } => {
+                if let Err(e) = app::build(release) {
+                    eprintln!("App build failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            AppCommands::Run { release } => {
+                if let Err(e) = app::run(release) {
+                    eprintln!("App run failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        },
         Commands::Distribute => {
             if let Err(e) = distribute_app().await {
                 eprintln!("Distribute failed: {}", e);
