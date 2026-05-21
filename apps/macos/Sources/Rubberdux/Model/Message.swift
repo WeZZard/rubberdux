@@ -39,8 +39,15 @@ enum Message: Codable {
                 }
                 return ""
             }
-        case .assistant(let content, _, _, _):
-            return content ?? ""
+        case .assistant(let content, _, let toolCalls, _):
+            if let text = content, !text.isEmpty {
+                return text
+            }
+            if let calls = toolCalls, !calls.isEmpty {
+                let names = calls.map { $0.function.name }.joined(separator: ", ")
+                return "[tool calls: \(names)]"
+            }
+            return ""
         case .tool(_, _, let content):
             return content
         }

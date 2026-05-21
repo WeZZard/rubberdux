@@ -1,11 +1,13 @@
 import AppKit
 
-class MainSplitViewController: NSSplitViewController {
+class MainSplitViewController: NSSplitViewController, ConversationViewDelegate {
     private let sidebarViewController = SidebarViewController()
     private let apiClient: APIClient
     private let webSocketClient: WebSocketClient
     private var contentControllers: [SidebarItem: NSViewController] = [:]
     private let contentContainer = ContentContainerViewController()
+    private let entryDetailViewController = EntryDetailViewController()
+    private var inspectorItem: NSSplitViewItem!
 
     init(baseURL: URL) {
         self.apiClient = APIClient(baseURL: baseURL)
@@ -27,7 +29,7 @@ class MainSplitViewController: NSSplitViewController {
         let contentItem = NSSplitViewItem(viewController: contentContainer)
         addSplitViewItem(contentItem)
 
-        let inspectorItem = NSSplitViewItem(inspectorWithViewController: NSViewController())
+        inspectorItem = NSSplitViewItem(inspectorWithViewController: entryDetailViewController)
         inspectorItem.minimumThickness = 200
         inspectorItem.maximumThickness = 400
         inspectorItem.isCollapsed = true
@@ -55,7 +57,9 @@ class MainSplitViewController: NSSplitViewController {
         let vc: NSViewController
         switch item {
         case .conversation:
-            vc = ConversationViewController(apiClient: apiClient, webSocketClient: webSocketClient)
+            let conversationVC = ConversationViewController(apiClient: apiClient, webSocketClient: webSocketClient)
+            conversationVC.delegate = self
+            vc = conversationVC
         case .identityPrompt:
             vc = PromptViewController(kind: .identity, apiClient: apiClient)
         case .soulPrompt:
@@ -69,6 +73,13 @@ class MainSplitViewController: NSSplitViewController {
         }
         contentControllers[item] = vc
         return vc
+    }
+
+    // MARK: - ConversationViewDelegate
+
+    func conversationView(_ controller: ConversationViewController, didSelectEntry entry: Entry, entries: [Entry]) {
+        entryDetailViewController.display(entry, entries: entries)
+        inspectorItem.animator().isCollapsed = false
     }
 }
 

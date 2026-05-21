@@ -1,11 +1,16 @@
 import AppKit
 import Combine
 
+protocol ConversationViewDelegate: AnyObject {
+    func conversationView(_ controller: ConversationViewController, didSelectEntry entry: Entry, entries: [Entry])
+}
+
 class ConversationViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     private let tableView = NSTableView()
     private let scrollView = NSScrollView()
     private let inputField = NSTextField()
     private var entries: [Entry] = []
+    weak var delegate: ConversationViewDelegate?
     private var cancellables = Set<AnyCancellable>()
     private let apiClient: APIClient
     private let webSocketClient: WebSocketClient
@@ -42,6 +47,11 @@ class ConversationViewController: NSViewController, NSTableViewDataSource, NSTab
             inputField.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
         ])
 
+        let idColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("id"))
+        idColumn.title = "ID"
+        idColumn.width = 40
+        tableView.addTableColumn(idColumn)
+
         let roleColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("role"))
         roleColumn.title = "Role"
         roleColumn.width = 80
@@ -50,11 +60,6 @@ class ConversationViewController: NSViewController, NSTableViewDataSource, NSTab
         let contentColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("content"))
         contentColumn.title = "Content"
         tableView.addTableColumn(contentColumn)
-
-        let idColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("id"))
-        idColumn.title = "ID"
-        idColumn.width = 40
-        tableView.addTableColumn(idColumn)
 
         tableView.dataSource = self
         tableView.delegate = self
@@ -121,6 +126,7 @@ class ConversationViewController: NSViewController, NSTableViewDataSource, NSTab
         let textField = NSTextField(labelWithString: "")
         textField.translatesAutoresizingMaskIntoConstraints = false
         textField.lineBreakMode = .byTruncatingTail
+        textField.maximumNumberOfLines = 1
         cellView.addSubview(textField)
         cellView.textField = textField
         NSLayoutConstraint.activate([
@@ -143,7 +149,7 @@ class ConversationViewController: NSViewController, NSTableViewDataSource, NSTab
             default: break
             }
         case "content":
-            textField.stringValue = entry.message.contentText
+            textField.stringValue = entry.message.contentText.replacingOccurrences(of: "\n", with: "\\n")
         case "id":
             textField.stringValue = "\(entry.id)"
             textField.alignment = .center
@@ -152,5 +158,11 @@ class ConversationViewController: NSViewController, NSTableViewDataSource, NSTab
         }
 
         return cellView
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        let row = tableView.selectedRow
+        guard row >= 0, row < entries.count else { return }
+        delegate?.conversationView(self, didSelectEntry: entries[row], entries: entries)
     }
 }
