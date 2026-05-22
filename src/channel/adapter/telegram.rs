@@ -267,9 +267,7 @@ async fn handle_message(
         interpreted.attachments.len()
     );
 
-    let message = Message::User {
-        content: UserContent::Text(interpreted.text),
-    };
+    let message = Message::from_interpreted(&interpreted);
 
     let channel_metadata = Some(serde_json::json!({
         "telegram_message_id": msg.id.0,
