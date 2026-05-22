@@ -407,33 +407,45 @@ impl ChannelProcessor for TelegramChannelProcessor {
         channel_metadata: &'a serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
         Box::pin(async move {
+            log::info!("Channel processor: processing entry {} (origin: {:?})", entry.id, entry.origin);
+
             // Only process assistant entries
             if entry.origin != EntryOrigin::Assistant {
+                log::info!("Channel processor: skipping non-assistant entry {}", entry.id);
                 return Ok(());
             }
 
             // Extract telegram_chat_id; if missing, this is not a Telegram conversation
             let chat_id = match channel_metadata.get("telegram_chat_id").and_then(|v| v.as_i64()) {
                 Some(id) => id,
-                None => return Ok(()),
+                None => {
+                    log::warn!("Channel processor: no telegram_chat_id in metadata for entry {}", entry.id);
+                    return Ok(());
+                }
             };
 
             // Get the content text from the entry
             let text = entry.message.content_text().to_owned();
             if text.is_empty() {
+                log::info!("Channel processor: empty content for entry {}", entry.id);
                 return Ok(());
             }
 
+            log::info!("Channel processor: parsing entry {} (text_len={})", entry.id, text.len());
+
             // Parse content to find Telegram message segments
             let segments = parser::parse_model_output(&text);
+            log::info!("Channel processor: {} segments parsed for entry {}", segments.len(), entry.id);
 
             let reply_to_msg_id = channel_metadata
                 .get("telegram_message_id")
                 .and_then(|v| v.as_i64())
                 .map(|v| v as i32);
 
-            for segment in &segments {
+            for (i, segment) in segments.iter().enumerate() {
+                log::info!("Channel processor: segment {} = {:?}", i, std::mem::discriminant(segment));
                 if let Segment::TelegramMessage { content } = segment {
+                    log::info!("Channel processor: sending message to chat_id={} (content_len={})", chat_id, content.len());
                     let formatted = super::markdown::format(content);
 
                     let mut req = self
@@ -461,12 +473,22 @@ impl ChannelProcessor for TelegramChannelProcessor {
                                     ),
                                 );
                             }
-                            fallback.await.ok()
+                            match fallback.await {
+                                Ok(m) => {
+                                    log::info!("Channel processor: plain text fallback succeeded for entry {}", entry.id);
+                                    Some(m)
+                                }
+                                Err(e2) => {
+                                    log::error!("Channel processor: plain text fallback ALSO failed for entry {}: {}", entry.id, e2);
+                                    None
+                                }
+                            }
                         }
                     };
 
                     // Inject Telegram message ID into the entry content
                     if let Some(sent) = sent_msg {
+                        log::info!("Channel processor: sent message, telegram_msg_id={}", sent.id.0);
                         let msg_id = sent.id.0;
                         if let Message::Assistant {
                             content: Some(text),
