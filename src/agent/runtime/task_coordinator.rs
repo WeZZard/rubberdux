@@ -16,6 +16,16 @@ pub struct TaskGroup {
 }
 
 // ---------------------------------------------------------------------------
+// CompleteResult — outcome of completing a single background task
+// ---------------------------------------------------------------------------
+
+pub enum CompleteResult {
+    GroupCompleted(CompletedGroup),
+    Pending,
+    Unknown(BackgroundTaskResult),
+}
+
+// ---------------------------------------------------------------------------
 // TaskGroupSet — tracks all active task groups
 // ---------------------------------------------------------------------------
 
@@ -38,7 +48,14 @@ impl TaskGroupSet {
         task_ids: &[String],
         origin: EntryOrigin,
         channel_metadata: Option<serde_json::Value>,
-    ) {
+    ) -> Result<(), String> {
+        // Check for duplicate task IDs before inserting any.
+        for tid in task_ids {
+            if self.task_to_group.contains_key(tid) {
+                return Err(format!("Duplicate task ID: {}", tid));
+            }
+        }
+
         for tid in task_ids {
             self.task_to_group.insert(tid.clone(), asst_entry_id);
         }
@@ -60,15 +77,17 @@ impl TaskGroupSet {
                 group.channel_metadata = channel_metadata;
             }
         }
+
+        Ok(())
     }
 
     /// Record a completed task. Returns the group if all tasks in the group are done.
-    pub fn complete(&mut self, result: BackgroundTaskResult) -> Option<CompletedGroup> {
+    pub fn complete(&mut self, result: BackgroundTaskResult) -> CompleteResult {
         let group_key = match self.task_to_group.remove(&result.task_id) {
             Some(k) => k,
             None => {
                 log::warn!("Received result for unknown task: {}", result.task_id);
-                return None;
+                return CompleteResult::Unknown(result);
             }
         };
 
@@ -76,7 +95,7 @@ impl TaskGroupSet {
             Some(g) => g,
             None => {
                 log::warn!("No active group for key {}", group_key);
-                return None;
+                return CompleteResult::Unknown(result);
             }
         };
 
@@ -93,9 +112,9 @@ impl TaskGroupSet {
 
         if group.remaining == 0 {
             let group = self.groups.remove(&group_key).unwrap();
-            Some(CompletedGroup { group })
+            CompleteResult::GroupCompleted(CompletedGroup { group })
         } else {
-            None
+            CompleteResult::Pending
         }
     }
 
@@ -105,6 +124,62 @@ impl TaskGroupSet {
 
     pub fn get_mut(&mut self, asst_entry_id: usize) -> Option<&mut TaskGroup> {
         self.groups.get_mut(&asst_entry_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_result(task_id: &str) -> BackgroundTaskResult {
+        BackgroundTaskResult {
+            task_id: task_id.into(),
+            content: format!("result for {}", task_id),
+        }
+    }
+
+    #[test]
+    fn test_complete_returns_pending_then_completed() {
+        let mut set = TaskGroupSet::new();
+        let tasks = vec!["t1".to_string(), "t2".to_string(), "t3".to_string()];
+        set.register(1, &tasks, EntryOrigin::System, None).unwrap();
+
+        match set.complete(make_result("t1")) {
+            CompleteResult::Pending => {}
+            other => panic!("Expected Pending, got {:?}", std::mem::discriminant(&other)),
+        }
+
+        match set.complete(make_result("t2")) {
+            CompleteResult::Pending => {}
+            other => panic!("Expected Pending, got {:?}", std::mem::discriminant(&other)),
+        }
+
+        match set.complete(make_result("t3")) {
+            CompleteResult::GroupCompleted(completed) => {
+                assert_eq!(completed.group.completed_results.len(), 3);
+            }
+            other => panic!("Expected GroupCompleted, got {:?}", std::mem::discriminant(&other)),
+        }
+
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn test_complete_unknown_task() {
+        let mut set = TaskGroupSet::new();
+
+        match set.complete(make_result("unknown")) {
+            CompleteResult::Unknown(_) => {}
+            other => panic!("Expected Unknown, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn test_register_duplicate_task_id() {
+        let mut set = TaskGroupSet::new();
+        let tasks = vec!["t1".to_string()];
+        assert!(set.register(1, &tasks, EntryOrigin::System, None).is_ok());
+        assert!(set.register(2, &tasks, EntryOrigin::System, None).is_err());
     }
 }
 

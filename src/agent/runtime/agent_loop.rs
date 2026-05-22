@@ -10,7 +10,7 @@ use crate::agent::runtime::history_store::{FilesystemStore, HistoryStore, Memory
 use crate::agent::runtime::port::{
     EntryNotification, InputPort, InternalMutation, LoopEvent, OutputPort,
 };
-use crate::agent::runtime::task_coordinator::TaskGroupSet;
+use crate::agent::runtime::task_coordinator::{CompleteResult, TaskGroupSet};
 use crate::agent::runtime::turn_driver::{TurnDriver, TurnOutcome};
 use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
 use crate::tool::BackgroundTaskResult;
@@ -33,6 +33,13 @@ pub enum AgentState {
     WaitingForResponse,
     /// Processing a response (tool calls, background tasks).
     Processing,
+}
+
+#[derive(Debug)]
+enum TaskResultOutcome {
+    GroupCompleted,
+    Pending,
+    Orphaned,
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +267,8 @@ impl AgentLoop {
                 }
 
                 Some(bg_result) = self.bg_rx.recv() => {
-                    self.handle_task_result(bg_result).await;
+                    let outcome = self.handle_task_result(bg_result).await;
+                    log::info!("Background task result: {:?}", outcome);
                 }
 
                 Some(agent_result) = self.child_agent_rx.recv() => {
@@ -268,7 +276,8 @@ impl AgentLoop {
                         task_id: agent_result.task_id,
                         content: agent_result.summary,
                     };
-                    self.handle_task_result(bg_result).await;
+                    let outcome = self.handle_task_result(bg_result).await;
+                    log::info!("Child agent task result: {:?}", outcome);
                 }
 
                 else => break,
@@ -307,7 +316,8 @@ impl AgentLoop {
                 }
 
                 Some(bg_result) = self.bg_rx.recv() => {
-                    self.handle_task_result(bg_result).await;
+                    let outcome = self.handle_task_result(bg_result).await;
+                    log::info!("Background task result: {:?}", outcome);
                 }
 
                 Some(agent_result) = self.child_agent_rx.recv() => {
@@ -315,7 +325,8 @@ impl AgentLoop {
                         task_id: agent_result.task_id,
                         content: agent_result.summary,
                     };
-                    self.handle_task_result(bg_result).await;
+                    let outcome = self.handle_task_result(bg_result).await;
+                    log::info!("Child agent task result: {:?}", outcome);
                 }
 
                 else => break,
@@ -493,15 +504,19 @@ impl AgentLoop {
                 prompt_tokens,
                 completion_tokens,
             } => {
+                log::info!("handle_turn_outcome: Text entry_id={} origin={:?} has_metadata={}", entry_id, self.current_origin, self.current_channel_metadata.is_some());
                 if let EntryOrigin::User { ref channel } = self.current_origin {
                     if let Some(processor) = self.channel_processors.get(channel) {
                         if let Some(ref metadata) = self.current_channel_metadata {
                             if let Some(entry) = self.history.get_mut(entry_id) {
+                                log::info!("handle_turn_outcome: calling channel processor for entry {}", entry_id);
                                 if let Err(e) = processor.process_outbound(entry, metadata).await {
                                     log::warn!("Channel processor failed for {}: {}", channel, e);
                                 }
                             }
                         }
+                    } else {
+                        log::warn!("handle_turn_outcome: no processor for channel '{}'", channel);
                     }
                 }
                 self.persist_entry(entry_id).await;
@@ -567,12 +582,14 @@ impl AgentLoop {
                     true
                 } else {
                     // Background tasks dispatched.
-                    self.active_groups.register(
+                    if let Err(e) = self.active_groups.register(
                         entry_id,
                         &background_tasks,
                         self.current_origin.clone(),
                         self.current_channel_metadata.clone(),
-                    );
+                    ) {
+                        log::error!("Failed to register background tasks: {}", e);
+                    }
                     self.record(
                         "turn.suspended",
                         Some(turn_id),
@@ -615,11 +632,71 @@ impl AgentLoop {
     // Task result handling
     // -----------------------------------------------------------------------
 
-    async fn handle_task_result(&mut self, result: BackgroundTaskResult) {
-        // Check if this is an orphaned result (no matching group).
-        if let Some(completed) = self.active_groups.complete(result.clone()) {
-            // Group completed — inject all results into history.
-            for result in &completed.group.completed_results {
+    async fn handle_task_result(&mut self, result: BackgroundTaskResult) -> TaskResultOutcome {
+        match self.active_groups.complete(result) {
+            CompleteResult::GroupCompleted(completed) => {
+                // Group completed — inject all results into history.
+                for result in &completed.group.completed_results {
+                    let msg = Message::User {
+                        content: UserContent::Text(format!(
+                            "[Subagent {} completed. This is a subagent result — the user has not seen this content. Decide whether and how to present it based on the original request.]\n{}",
+                            result.task_id, result.content
+                        )),
+                    };
+                    let entry_id = self.history.push_user_with_metadata(
+                        msg,
+                        completed.group.origin.clone(),
+                        completed.group.channel_metadata.clone(),
+                    );
+                    self.persist_entry(entry_id).await;
+                    self.record(
+                        "operation.result.injected",
+                        None,
+                        serde_json::json!({
+                            "operation_id": result.task_id.clone(),
+                            "entry_id": entry_id,
+                        }),
+                    );
+                    self.record_message("message.recorded", entry_id, "user", false);
+                    self.notify_entry(entry_id, false);
+                }
+
+                // If no more active groups, start a new turn with the completed results.
+                if self.active_groups.is_empty() {
+                    // Restore origin/channel_metadata from the completed group for the continuation turn.
+                    self.current_origin = completed.group.origin;
+                    self.current_channel_metadata = completed.group.channel_metadata;
+                    self.state = AgentState::WaitingForResponse;
+
+                    loop {
+                        let turn_id = self.next_turn_id();
+                        self.record(
+                            "turn.started",
+                            Some(&turn_id),
+                            serde_json::json!({
+                                "reason": "background_work_completed",
+                                "history_entries": self.history.len(),
+                                "parent_entry_id": self.history.last_id(),
+                            }),
+                        );
+                        self.drain_ready_inputs().await;
+                        let outcome = self.turn_driver.drive(&mut self.history, &turn_id).await;
+                        let should_continue = self.handle_turn_outcome(outcome, &turn_id).await;
+
+                        if !should_continue {
+                            break;
+                        }
+                    }
+                }
+
+                TaskResultOutcome::GroupCompleted
+            }
+            CompleteResult::Pending => {
+                log::info!("Task result stored, group not yet complete");
+                TaskResultOutcome::Pending
+            }
+            CompleteResult::Unknown(result) => {
+                // Orphaned result — inject directly.
                 let msg = Message::User {
                     content: UserContent::Text(format!(
                         "[Subagent {} completed. This is a subagent result — the user has not seen this content. Decide whether and how to present it based on the original request.]\n{}",
@@ -628,12 +705,12 @@ impl AgentLoop {
                 };
                 let entry_id = self.history.push_user_with_metadata(
                     msg,
-                    completed.group.origin.clone(),
-                    completed.group.channel_metadata.clone(),
+                    EntryOrigin::System,
+                    None,
                 );
                 self.persist_entry(entry_id).await;
                 self.record(
-                    "operation.result.injected",
+                    "operation.orphaned",
                     None,
                     serde_json::json!({
                         "operation_id": result.task_id.clone(),
@@ -642,59 +719,9 @@ impl AgentLoop {
                 );
                 self.record_message("message.recorded", entry_id, "user", false);
                 self.notify_entry(entry_id, false);
+
+                TaskResultOutcome::Orphaned
             }
-
-            // If no more active groups, start a new turn with the completed results.
-            if self.active_groups.is_empty() {
-                // Restore origin/channel_metadata from the completed group for the continuation turn.
-                self.current_origin = completed.group.origin;
-                self.current_channel_metadata = completed.group.channel_metadata;
-                self.state = AgentState::WaitingForResponse;
-
-                loop {
-                    let turn_id = self.next_turn_id();
-                    self.record(
-                        "turn.started",
-                        Some(&turn_id),
-                        serde_json::json!({
-                            "reason": "background_work_completed",
-                            "history_entries": self.history.len(),
-                            "parent_entry_id": self.history.last_id(),
-                        }),
-                    );
-                    self.drain_ready_inputs().await;
-                    let outcome = self.turn_driver.drive(&mut self.history, &turn_id).await;
-                    let should_continue = self.handle_turn_outcome(outcome, &turn_id).await;
-
-                    if !should_continue {
-                        break;
-                    }
-                }
-            }
-        } else {
-            // Orphaned result — inject directly.
-            let msg = Message::User {
-                content: UserContent::Text(format!(
-                    "[Subagent {} completed. This is a subagent result — the user has not seen this content. Decide whether and how to present it based on the original request.]\n{}",
-                    result.task_id, result.content
-                )),
-            };
-            let entry_id = self.history.push_user_with_metadata(
-                msg,
-                EntryOrigin::System,
-                None,
-            );
-            self.persist_entry(entry_id).await;
-            self.record(
-                "operation.orphaned",
-                None,
-                serde_json::json!({
-                    "operation_id": result.task_id.clone(),
-                    "entry_id": entry_id,
-                }),
-            );
-            self.record_message("message.recorded", entry_id, "user", false);
-            self.notify_entry(entry_id, false);
         }
     }
 

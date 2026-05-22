@@ -99,10 +99,12 @@ pub fn spawn_subagent(
         let summary = agent_loop.run_to_completion().await;
 
         log::info!("Subagent {} completed", task_id_clone);
-        let _ = result_tx.send(SubagentResult {
-            task_id: task_id_clone,
+        if result_tx.send(SubagentResult {
+            task_id: task_id_clone.clone(),
             summary,
-        });
+        }).is_err() {
+            log::warn!("Subagent {} result receiver dropped", task_id_clone);
+        }
     });
 
     SubagentHandle {
