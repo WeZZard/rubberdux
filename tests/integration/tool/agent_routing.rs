@@ -23,7 +23,7 @@ fn make_registry_with_agent_with_rpc(
     client: Arc<MoonshotClient>,
     rpc_writer: Option<Arc<tokio::sync::Mutex<OwnedWriteHalf>>>,
 ) -> ToolRegistry {
-    let registries = build_subagent_registries(&client);
+    let registries = build_subagent_registries(&client, &None);
     let (context_tx, _) = tokio::sync::broadcast::channel(4);
 
     let agent_tool = AgentTool::new(

@@ -62,6 +62,7 @@ async fn setup_agent_loop(
         cancel: CancellationToken::new(),
         compaction: Box::new(EvictOldestTurns),
         context_tx: None,
+        channel_processors: std::collections::HashMap::new(),
     };
 
     let (agent_loop, input_port) = AgentLoop::new(config).await;

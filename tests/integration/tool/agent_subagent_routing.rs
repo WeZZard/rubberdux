@@ -22,7 +22,7 @@ fn setup() -> (Arc<MoonshotClient>, ToolRegistry) {
         "test-model".into(),
     ));
 
-    let registries = build_subagent_registries(&client);
+    let registries = build_subagent_registries(&client, &None);
     let (context_tx, _) = broadcast::channel(4);
 
     let agent_tool = AgentTool::new(
@@ -148,7 +148,7 @@ async fn test_explore_subagent_happy_path() {
         "test-model".into(),
     ));
 
-    let registries = build_subagent_registries(&client);
+    let registries = build_subagent_registries(&client, &None);
     let registry = registries.get(&SubagentType::Explore).unwrap().clone();
 
     let preamble = subagent_preamble(SubagentType::Explore);
@@ -249,7 +249,7 @@ async fn test_plan_subagent_happy_path() {
         "test-model".into(),
     ));
 
-    let registries = build_subagent_registries(&client);
+    let registries = build_subagent_registries(&client, &None);
     let registry = registries.get(&SubagentType::Plan).unwrap().clone();
 
     let preamble = subagent_preamble(SubagentType::Plan);
@@ -355,7 +355,7 @@ async fn test_gp_subagent_happy_path() {
         "test-model".into(),
     ));
 
-    let registries = build_subagent_registries(&client);
+    let registries = build_subagent_registries(&client, &None);
     let registry = registries
         .get(&SubagentType::GeneralPurpose)
         .unwrap()
@@ -460,7 +460,7 @@ async fn test_computer_use_subagent_happy_path() {
         "test-model".into(),
     ));
 
-    let registries = build_subagent_registries(&client);
+    let registries = build_subagent_registries(&client, &None);
     let registry = registries.get(&SubagentType::ComputerUse).unwrap().clone();
 
     let preamble = subagent_preamble(SubagentType::ComputerUse);

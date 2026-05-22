@@ -64,6 +64,7 @@ impl AgentLoopHarness {
             cancel: CancellationToken::new(),
             compaction: Box::new(EvictOldestTurns),
             context_tx: None,
+            channel_processors: std::collections::HashMap::new(),
         };
 
         let (agent_loop, input_port) = AgentLoop::new(config).await;
@@ -210,7 +211,7 @@ fn build_tool_registry(client: Arc<MoonshotClient>) -> ToolRegistry {
     r.register(Box::new(GrepTool));
     r.register(Box::new(WebSearchTool::new(client.clone())));
 
-    let subagent_registries = build_subagent_registries(&client);
+    let subagent_registries = build_subagent_registries(&client, &None);
     r.register(Box::new(AgentTool::new(
         client.clone(),
         subagent_registries,
