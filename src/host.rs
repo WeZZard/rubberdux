@@ -203,8 +203,13 @@ pub async fn run(_config: HostConfig, bot: Bot) {
     );
 
     let gateway_system_prompt = system_prompt.clone();
+    let telegram_chat_id: std::sync::Arc<tokio::sync::Mutex<Option<i64>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(None));
     let telegram_processor = std::sync::Arc::new(
-        crate::channel::adapter::telegram::TelegramChannelProcessor::new(bot.clone()),
+        crate::channel::adapter::telegram::TelegramChannelProcessor::new(
+            bot.clone(),
+            telegram_chat_id.clone(),
+        ),
     );
     let builder = AgentLoopBuilder::new(system_prompt, session_manager)
         .with_session_id(session_id)
@@ -236,7 +241,7 @@ pub async fn run(_config: HostConfig, bot: Bot) {
     });
 
     // Run Telegram adapter (blocks until dispatcher shuts down)
-    crate::channel::adapter::telegram::run(bot, input_port, entry_rx).await;
+    crate::channel::adapter::telegram::run(bot, input_port, entry_rx, telegram_chat_id).await;
 
     log::info!("Host shutdown complete.");
 }

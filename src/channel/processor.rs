@@ -12,4 +12,8 @@ pub trait ChannelProcessor: Send + Sync {
         entry: &'a mut Entry,
         channel_metadata: &'a serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
+
+    fn tools(&self) -> Vec<Box<dyn crate::tool::Tool>> {
+        vec![]
+    }
 }

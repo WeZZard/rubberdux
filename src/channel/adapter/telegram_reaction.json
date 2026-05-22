@@ -1,0 +1,26 @@
+{
+  "type": "function",
+  "function": {
+    "name": "telegram_reaction",
+    "description": "Set or unset a reaction emoji on a Telegram message.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "description": "Whether to set or unset the reaction.",
+          "enum": ["set", "unset"]
+        },
+        "emoji": {
+          "type": "string",
+          "description": "The emoji to react with."
+        },
+        "message_id": {
+          "type": "integer",
+          "description": "The Telegram message ID to react to."
+        }
+      },
+      "required": ["action", "emoji", "message_id"]
+    }
+  }
+}

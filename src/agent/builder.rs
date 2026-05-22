@@ -112,6 +112,12 @@ impl AgentLoopBuilder {
                 r.register(Box::new(crate::tool::workspace::WorkspaceTool::new(ws.clone())));
             }
 
+            for (_, processor) in &self.channel_processors {
+                for tool in processor.tools() {
+                    r.register(tool);
+                }
+            }
+
             if self.with_agent_tool {
                 let subagent_registries = build_subagent_registries(&client, &self.workspace);
                 r.register(Box::new(AgentTool::new(

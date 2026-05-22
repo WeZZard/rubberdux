@@ -165,6 +165,7 @@ pub async fn run(
     bot: Bot,
     input_port: InputPort,
     entry_rx: broadcast::Receiver<EntryNotification>,
+    chat_id: Arc<Mutex<Option<i64>>>,
 ) {
     let reactions_fetched = Arc::new(AtomicBool::new(false));
     let entry_cache: Arc<Mutex<HashMap<usize, Entry>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -182,7 +183,7 @@ pub async fn run(
         .branch(Update::filter_message_reaction_updated().endpoint(handle_reaction));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![input_port, reactions_fetched, entry_cache])
+        .dependencies(dptree::deps![input_port, reactions_fetched, entry_cache, chat_id])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
@@ -250,7 +251,16 @@ async fn handle_message(
     input_port: InputPort,
     reactions_fetched: Arc<AtomicBool>,
     _entry_cache: Arc<Mutex<HashMap<usize, Entry>>>,
+    chat_id: Arc<Mutex<Option<i64>>>,
 ) -> Result<(), teloxide::RequestError> {
+    // Set chat_id for the reaction tool
+    {
+        let mut guard = chat_id.lock().await;
+        if guard.is_none() {
+            *guard = Some(msg.chat.id.0);
+        }
+    }
+
     // Fetch available reactions on first message
     if !reactions_fetched.swap(true, Ordering::Relaxed) {
         fetch_and_send_reactions(&bot, msg.chat.id, &input_port).await;
@@ -368,17 +378,27 @@ async fn fetch_and_send_reactions(bot: &Bot, chat_id: ChatId, input_port: &Input
 
 pub struct TelegramChannelProcessor {
     bot: Bot,
+    chat_id: Arc<Mutex<Option<i64>>>,
 }
 
 impl TelegramChannelProcessor {
-    pub fn new(bot: Bot) -> Self {
-        Self { bot }
+    pub fn new(bot: Bot, chat_id: Arc<Mutex<Option<i64>>>) -> Self {
+        Self { bot, chat_id }
     }
 }
 
 impl ChannelProcessor for TelegramChannelProcessor {
     fn channel_name(&self) -> &str {
         "telegram"
+    }
+
+    fn tools(&self) -> Vec<Box<dyn crate::tool::Tool>> {
+        vec![Box::new(
+            super::telegram_reaction_tool::TelegramReactionTool::new(
+                self.bot.clone(),
+                self.chat_id.clone(),
+            ),
+        )]
     }
 
     fn process_outbound<'a>(
