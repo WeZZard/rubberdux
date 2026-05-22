@@ -141,12 +141,10 @@ pub async fn execute(arguments: &str, context: Option<WebSearchContext>) -> Tool
 }
 
 fn generate_task_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    format!("{:x}", ts & 0xFFFF_FFFF)
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}", id)
 }
 
 fn query_from_arguments(arguments: &str) -> Option<String> {
