@@ -6,9 +6,11 @@ class EventStreamViewController: NSViewController, NSTableViewDataSource, NSTabl
     private let scrollView = NSScrollView()
     private var events: [TrajectoryEvent] = []
     private var cancellables = Set<AnyCancellable>()
+    private let apiClient: APIClient
     private let webSocketClient: WebSocketClient
 
-    init(webSocketClient: WebSocketClient) {
+    init(apiClient: APIClient, webSocketClient: WebSocketClient) {
+        self.apiClient = apiClient
         self.webSocketClient = webSocketClient
         super.init(nibName: nil, bundle: nil)
     }
@@ -52,6 +54,20 @@ class EventStreamViewController: NSViewController, NSTableViewDataSource, NSTabl
     override func viewDidLoad() {
         super.viewDidLoad()
 
+        // Fetch history from REST (cold source - events.jsonl)
+        Task {
+            do {
+                let fetched = try await apiClient.trajectoryEvents()
+                await MainActor.run {
+                    self.events = fetched
+                    self.tableView.reloadData()
+                }
+            } catch {
+                // REST failed, will rely on WebSocket only
+            }
+        }
+
+        // Subscribe for live updates (hot signal)
         webSocketClient.trajectorySubject
             .receive(on: DispatchQueue.main)
             .sink { [weak self] event in

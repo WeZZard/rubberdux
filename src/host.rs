@@ -193,6 +193,7 @@ pub async fn run(_config: HostConfig, bot: Bot) {
     let events_path = session_manager
         .main_agent_dir(&session_id)
         .join("events.jsonl");
+    let gateway_events_path = events_path.clone();
     let fs_recorder = crate::trajectory::filesystem_recorder(events_path);
     let broadcast_recorder: crate::trajectory::SharedTrajectoryRecorder = Arc::new(
         crate::trajectory::BroadcastTrajectoryRecorder::new(
@@ -222,6 +223,7 @@ pub async fn run(_config: HostConfig, bot: Bot) {
         let soul = std::fs::read_to_string(prompt_dir.join("SOUL.md")).unwrap_or_default();
         let gateway_state = Arc::new(crate::gateway::state::GatewayState::with_trajectory_tx(
             gateway_system_prompt, identity, soul, trajectory_tx, input_port.clone(),
+            Some(gateway_events_path),
         ));
         let state_clone = gateway_state.clone();
         tokio::spawn(crate::gateway::stream::mirror_entries(output_port, state_clone));

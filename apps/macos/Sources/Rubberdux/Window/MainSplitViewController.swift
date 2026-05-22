@@ -67,9 +67,9 @@ class MainSplitViewController: NSSplitViewController, ConversationViewDelegate {
         case .systemPrompts:
             vc = PromptViewController(kind: .system, apiClient: apiClient)
         case .liveEvents:
-            vc = EventStreamViewController(webSocketClient: webSocketClient)
+            vc = EventStreamViewController(apiClient: apiClient, webSocketClient: webSocketClient)
         case .rawTrajectory:
-            vc = EventStreamViewController(webSocketClient: webSocketClient)
+            vc = EventStreamViewController(apiClient: apiClient, webSocketClient: webSocketClient)
         }
         contentControllers[item] = vc
         return vc

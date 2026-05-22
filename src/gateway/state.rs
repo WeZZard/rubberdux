@@ -12,6 +12,7 @@ pub struct GatewayState {
     pub entry_tx: broadcast::Sender<EntryNotification>,
     pub trajectory_tx: broadcast::Sender<TrajectoryEvent>,
     pub input_port: InputPort,
+    pub events_path: Option<std::path::PathBuf>,
 }
 
 impl GatewayState {
@@ -31,6 +32,7 @@ impl GatewayState {
             entry_tx,
             trajectory_tx,
             input_port,
+            events_path: None,
         }
     }
 
@@ -40,6 +42,7 @@ impl GatewayState {
         soul_prompt: String,
         trajectory_tx: broadcast::Sender<TrajectoryEvent>,
         input_port: InputPort,
+        events_path: Option<std::path::PathBuf>,
     ) -> Self {
         let (entry_tx, _) = broadcast::channel(256);
         Self {
@@ -50,6 +53,7 @@ impl GatewayState {
             entry_tx,
             trajectory_tx,
             input_port,
+            events_path,
         }
     }
 }

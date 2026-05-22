@@ -57,6 +57,14 @@ final class APIClient {
         try await fetchPrompt(path: "/api/v1/prompts/soul")
     }
 
+    // MARK: - Trajectory
+
+    func trajectoryEvents() async throws -> [TrajectoryEvent] {
+        let url = baseURL.appendingPathComponent("/api/v1/trajectory")
+        let (data, _) = try await session.data(from: url)
+        return try decoder.decode([TrajectoryEvent].self, from: data)
+    }
+
     // MARK: - Health
 
     func health() async throws -> Bool {

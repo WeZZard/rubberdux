@@ -71,6 +71,7 @@ pub fn router() -> axum::Router<Arc<GatewayState>> {
         .route("/api/v1/entries", get(list_entries))
         .route("/api/v1/entries/{id}", get(get_entry))
         .route("/api/v1/tool-calls", get(list_tool_calls))
+        .route("/api/v1/trajectory", get(list_trajectory))
         .route("/api/v1/prompts/system", get(get_system_prompt))
         .route("/api/v1/prompts/identity", get(get_identity_prompt))
         .route("/api/v1/prompts/soul", get(get_soul_prompt))
@@ -160,6 +161,23 @@ async fn list_tool_calls(
     }
 
     Ok(Json(ToolCallsResponse { tool_calls: pairs }))
+}
+
+async fn list_trajectory(
+    State(state): State<Arc<GatewayState>>,
+) -> Json<Vec<crate::trajectory::TrajectoryEvent>> {
+    let Some(ref path) = state.events_path else {
+        return Json(vec![]);
+    };
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Json(vec![]),
+    };
+    let events: Vec<crate::trajectory::TrajectoryEvent> = content
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    Json(events)
 }
 
 async fn get_system_prompt(
@@ -434,5 +452,57 @@ mod tests {
         assert_eq!(result["entry_id"], 3);
         assert_eq!(result["tool_call_id"], "call_abc");
         assert_eq!(result["content"], "Example Domain page content");
+    }
+
+    #[tokio::test]
+    async fn test_list_trajectory_empty() {
+        // events_path is None by default in GatewayState::new()
+        let (status, json) = response_json(empty_app(), "/api/v1/trajectory").await;
+        assert_eq!(status, StatusCode::OK);
+        let events = json.as_array().unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_trajectory_reads_file() {
+        use crate::trajectory::event::{TrajectoryEvent, TrajectoryEventDraft};
+
+        let tmp_dir = std::env::temp_dir().join(format!("rubberdux-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let events_file = tmp_dir.join("events.jsonl");
+
+        let mut lines = Vec::new();
+        for i in 0..3u64 {
+            let event = TrajectoryEvent::from_draft(
+                i,
+                TrajectoryEventDraft::new("agent.started", "test", "main")
+                    .with_payload(serde_json::json!({"index": i})),
+            );
+            lines.push(serde_json::to_string(&event).unwrap());
+        }
+        std::fs::write(&events_file, lines.join("\n")).unwrap();
+
+        let state = Arc::new({
+            let mut s = GatewayState::new(
+                "sys".into(),
+                "id".into(),
+                "soul".into(),
+                dummy_input_port(),
+            );
+            s.events_path = Some(events_file.clone());
+            s
+        });
+        let app = router().with_state(state);
+
+        let (status, json) = response_json(app, "/api/v1/trajectory").await;
+        assert_eq!(status, StatusCode::OK);
+        let events = json.as_array().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["seq"], 0);
+        assert_eq!(events[1]["seq"], 1);
+        assert_eq!(events[2]["seq"], 2);
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
