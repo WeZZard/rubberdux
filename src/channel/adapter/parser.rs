@@ -1,16 +1,10 @@
-#[derive(Debug, Clone, PartialEq)]
-pub enum ReactionAction {
-    Set,
-    Unset,
-}
-
 /// Parsed segments from model output.
 #[derive(Debug, PartialEq)]
 pub enum Segment {
     /// Text content to send to the user via Telegram.
     TelegramMessage { content: String },
-    /// Reaction to set or unset on a user message.
-    TelegramReaction { action: ReactionAction, emoji: String, message_id: i32 },
+    /// Reaction to add to a user message.
+    TelegramReaction { emoji: String, message_id: i32 },
     /// Internal reasoning or other text (not sent to user).
     Internal(String),
 }
@@ -40,13 +34,7 @@ pub fn parse_model_output(input: &str) -> Vec<Segment> {
             Node::Reaction(el) if el.from == "assistant" => {
                 flush_internal(&mut internal_buf, &mut segments);
                 if let Ok(message_id) = el.message_id.parse::<i32>() {
-                    let action = if el.action == "unset" {
-                        ReactionAction::Unset
-                    } else {
-                        ReactionAction::Set
-                    };
                     segments.push(Segment::TelegramReaction {
-                        action,
                         emoji: el.emoji.clone(),
                         message_id,
                     });
@@ -127,12 +115,11 @@ mod tests {
 
     #[test]
     fn test_telegram_reaction_parsed() {
-        let input = "<telegram-reaction from=\"assistant\" action=\"set\" emoji=\"👍\" message-id=\"42\" />";
+        let input = "<telegram-reaction from=\"assistant\" action=\"add\" emoji=\"👍\" message-id=\"42\" />";
         let segments = parse_model_output(input);
         assert_eq!(
             segments,
             vec![Segment::TelegramReaction {
-                action: ReactionAction::Set,
                 emoji: "👍".into(),
                 message_id: 42
             }]
@@ -141,13 +128,12 @@ mod tests {
 
     #[test]
     fn test_message_and_reaction_together() {
-        let input = "<telegram-reaction from=\"assistant\" action=\"set\" emoji=\"❤️\" message-id=\"10\" />\n<telegram-message from=\"assistant\" to=\"user\">Great question!</telegram-message>";
+        let input = "<telegram-reaction from=\"assistant\" action=\"add\" emoji=\"❤️\" message-id=\"10\" />\n<telegram-message from=\"assistant\" to=\"user\">Great question!</telegram-message>";
         let segments = parse_model_output(input);
         assert_eq!(segments.len(), 2);
         assert_eq!(
             segments[0],
             Segment::TelegramReaction {
-                action: ReactionAction::Set,
                 emoji: "❤️".into(),
                 message_id: 10
             }

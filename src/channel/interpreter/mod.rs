@@ -121,7 +121,7 @@ pub fn interpret_reaction(
             let doc = Document {
                 nodes: vec![Node::Reaction(ReactionElement {
                     from: "user".into(),
-                    action: "set".into(),
+                    action: "add".into(),
                     emoji: emoji.to_string(),
                     message_id: message_id.to_string(),
                     date: Some(date.clone()),
@@ -141,7 +141,7 @@ pub fn interpret_reaction(
             let doc = Document {
                 nodes: vec![Node::Reaction(ReactionElement {
                     from: "user".into(),
-                    action: "unset".into(),
+                    action: "remove".into(),
                     emoji: emoji.to_string(),
                     message_id: message_id.to_string(),
                     date: Some(date.clone()),

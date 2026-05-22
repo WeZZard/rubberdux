@@ -457,22 +457,6 @@ impl ChannelProcessor for TelegramChannelProcessor {
                         }
                     }
                 }
-                if let Segment::TelegramReaction { action, emoji, message_id } = segment {
-                    let reactions = match action {
-                        parser::ReactionAction::Set => vec![ReactionType::Emoji {
-                            emoji: emoji.clone(),
-                        }],
-                        parser::ReactionAction::Unset => vec![],
-                    };
-                    let _ = self
-                        .bot
-                        .set_message_reaction(
-                            ChatId(chat_id),
-                            teloxide::types::MessageId(*message_id),
-                        )
-                        .reaction(reactions)
-                        .await;
-                }
             }
 
             Ok(())
