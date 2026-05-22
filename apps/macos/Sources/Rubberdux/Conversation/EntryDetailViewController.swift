@@ -30,57 +30,85 @@ final class EntryDetailViewController: NSViewController {
     }
 
     func display(_ entry: Entry, entries: [Entry]) {
-        var lines: [String] = []
+        let defaultFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let defaultAttrs: [NSAttributedString.Key: Any] = [.font: defaultFont]
+        let output = NSMutableAttributedString()
+
+        func appendLine(_ text: String) {
+            output.append(NSAttributedString(string: text + "\n", attributes: defaultAttrs))
+        }
+
+        func appendImage(from url: String) {
+            if url.hasPrefix("data:"),
+               let commaIndex = url.firstIndex(of: ","),
+               let data = Data(base64Encoded: String(url[url.index(after: commaIndex)...])),
+               let image = NSImage(data: data)
+            {
+                let attachment = NSTextAttachment()
+                attachment.image = image
+                let maxWidth: CGFloat = 400
+                let scale = min(1.0, maxWidth / image.size.width)
+                attachment.bounds = CGRect(
+                    x: 0, y: 0,
+                    width: image.size.width * scale,
+                    height: image.size.height * scale
+                )
+                output.append(NSAttributedString(attachment: attachment))
+                output.append(NSAttributedString(string: "\n", attributes: defaultAttrs))
+            } else {
+                appendLine("[Image: \(url)]")
+            }
+        }
 
         switch entry.message {
         case .system(let content):
-            lines.append("--- System ---")
-            lines.append(content)
+            appendLine("--- System ---")
+            appendLine(content)
 
         case .user(let content):
-            lines.append("--- User ---")
+            appendLine("--- User ---")
             switch content {
             case .text(let text):
-                lines.append(text)
+                appendLine(text)
             case .parts(let parts):
                 for part in parts {
                     switch part {
                     case .text(let text):
-                        lines.append(text)
+                        appendLine(text)
                     case .imageUrl(let url):
-                        lines.append("[Image: \(url)]")
+                        appendImage(from: url)
                     case .videoUrl(let url):
-                        lines.append("[Video: \(url)]")
+                        appendLine("[Video: \(url)]")
                     }
                 }
             }
 
         case .assistant(let content, let reasoning, let toolCalls, let partial):
-            lines.append("--- Assistant\(partial == true ? " (partial)" : "") ---")
+            appendLine("--- Assistant\(partial == true ? " (partial)" : "") ---")
             if let content, !content.isEmpty {
-                lines.append(content)
+                appendLine(content)
             }
             if let reasoning, !reasoning.isEmpty {
-                lines.append("")
-                lines.append("[Reasoning]")
-                lines.append(reasoning)
+                appendLine("")
+                appendLine("[Reasoning]")
+                appendLine(reasoning)
             }
             if let toolCalls, !toolCalls.isEmpty {
                 for call in toolCalls {
-                    lines.append("")
-                    lines.append("[Tool Call] \(call.function.name)")
-                    lines.append("Call ID: \(call.id)")
-                    lines.append("Arguments:")
-                    lines.append(Self.prettyPrintJSON(call.function.arguments))
+                    appendLine("")
+                    appendLine("[Tool Call] \(call.function.name)")
+                    appendLine("Call ID: \(call.id)")
+                    appendLine("Arguments:")
+                    appendLine(Self.prettyPrintJSON(call.function.arguments))
                 }
             }
 
         case .tool(let toolCallId, let name, let content):
-            lines.append("--- Tool Result ---")
+            appendLine("--- Tool Result ---")
             if let name {
-                lines.append("Name: \(name)")
+                appendLine("Name: \(name)")
             }
-            lines.append("Call ID: \(toolCallId)")
+            appendLine("Call ID: \(toolCallId)")
 
             // Cross-reference: find the parent assistant entry and the matching tool call
             if let parentId = entry.parentId,
@@ -89,18 +117,18 @@ final class EntryDetailViewController: NSViewController {
                let toolCalls,
                let matchingCall = toolCalls.first(where: { $0.id == toolCallId })
             {
-                lines.append("")
-                lines.append("[Original Tool Call] \(matchingCall.function.name)")
-                lines.append("Arguments:")
-                lines.append(Self.prettyPrintJSON(matchingCall.function.arguments))
+                appendLine("")
+                appendLine("[Original Tool Call] \(matchingCall.function.name)")
+                appendLine("Arguments:")
+                appendLine(Self.prettyPrintJSON(matchingCall.function.arguments))
             }
 
-            lines.append("")
-            lines.append("[Result]")
-            lines.append(content)
+            appendLine("")
+            appendLine("[Result]")
+            appendLine(content)
         }
 
-        textView.string = lines.joined(separator: "\n")
+        textView.textStorage?.setAttributedString(output)
     }
 
     private static func prettyPrintJSON(_ jsonString: String) -> String {

@@ -1,7 +1,8 @@
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use super::super::tool::{FunctionDefinition, ToolDefinition};
-use super::super::{Message, MoonshotClient, UserContent};
+use super::super::{ContentPart, Message, MoonshotClient, UserContent};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatRequest {
@@ -52,11 +53,77 @@ pub struct Usage {
 }
 
 impl MoonshotClient {
+    /// Uploads inline base64 images via the file API and replaces data URIs
+    /// with `ms://{file_id}` references. On upload failure, the original data
+    /// URI is kept (the API still accepts inline base64, just slower).
+    async fn upload_inline_images(&self, messages: &mut [Message]) {
+        for msg in messages.iter_mut() {
+            if let Message::User {
+                content: UserContent::Parts(parts),
+            } = msg
+            {
+                for part in parts.iter_mut() {
+                    if let ContentPart::ImageUrl { image_url } = part {
+                        if image_url.url.starts_with("data:") {
+                            if let Some(comma_pos) = image_url.url.find(',') {
+                                let header = &image_url.url[5..comma_pos]; // after "data:"
+                                let mime = header.split(';').next().unwrap_or("image/jpeg");
+                                let ext = match mime {
+                                    "image/png" => "png",
+                                    "image/gif" => "gif",
+                                    "image/webp" => "webp",
+                                    _ => "jpg",
+                                };
+                                let filename = format!("image.{}", ext);
+
+                                let base64_data = &image_url.url[comma_pos + 1..];
+                                let decoded = match base64::engine::general_purpose::STANDARD
+                                    .decode(base64_data)
+                                {
+                                    Ok(d) => d,
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Failed to decode inline image base64: {}; \
+                                             keeping data URI",
+                                            e
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                match self.upload_file(&filename, decoded, "image").await {
+                                    Ok(file_info) => {
+                                        log::info!(
+                                            "Uploaded inline image as file {}, replacing data URI",
+                                            file_info.id
+                                        );
+                                        image_url.url = format!("ms://{}", file_info.id);
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Failed to upload inline image: {}; keeping data URI",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn chat(
         &self,
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<ChatResponse, crate::error::Error> {
+        // Upload inline base64 images via the file API, working on a clone
+        // so the original session history keeps the data URIs intact.
+        let mut messages = messages;
+        self.upload_inline_images(&mut messages).await;
+
         // Tool definitions are assembled by the provider's tool_definitions() method.
         // The caller passes the complete tool list — no internal merging needed.
         let tools = tools.filter(|t| !t.is_empty());

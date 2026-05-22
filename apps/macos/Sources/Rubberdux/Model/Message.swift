@@ -32,12 +32,23 @@ enum Message: Codable {
             case .text(let text):
                 return text
             case .parts(let parts):
+                var texts: [String] = []
+                var hasImage = false
                 for part in parts {
-                    if case .text(let text) = part {
-                        return text
+                    switch part {
+                    case .text(let text):
+                        texts.append(text)
+                    case .imageUrl:
+                        hasImage = true
+                    case .videoUrl:
+                        hasImage = true
                     }
                 }
-                return ""
+                let textContent = texts.joined(separator: " ")
+                if hasImage {
+                    return textContent.isEmpty ? "[Image]" : "\(textContent) [Image]"
+                }
+                return textContent.isEmpty ? "" : textContent
             }
         case .assistant(let content, _, let toolCalls, _):
             if let text = content, !text.isEmpty {
