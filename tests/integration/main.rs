@@ -1,4 +1,5 @@
 mod agent;
+mod channel;
 mod gateway_api;
 mod host;
 mod testcase_runner;

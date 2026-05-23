@@ -2,7 +2,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use super::super::tool::{FunctionDefinition, ToolDefinition};
-use super::super::{ContentPart, Message, MoonshotClient, UserContent};
+use super::super::{ContentPart, MediaUrl, Message, MoonshotClient, UserContent};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatRequest {
@@ -199,6 +199,139 @@ impl MoonshotClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+
+    #[tokio::test]
+    async fn test_upload_skips_non_data_urls() {
+        let client = MoonshotClient::new(
+            reqwest::Client::new(),
+            "http://localhost:0".into(), // won't be called
+            "key".into(),
+            "model".into(),
+        );
+        let mut messages = vec![Message::User {
+            content: UserContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: MediaUrl {
+                    url: "ms://already_uploaded".into(),
+                },
+            }]),
+        }];
+        client.upload_inline_images(&mut messages).await;
+        if let Message::User {
+            content: UserContent::Parts(parts),
+        } = &messages[0]
+        {
+            if let ContentPart::ImageUrl { image_url } = &parts[0] {
+                assert_eq!(image_url.url, "ms://already_uploaded");
+            } else {
+                panic!("expected ImageUrl part");
+            }
+        } else {
+            panic!("expected User message with Parts");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upload_transforms_data_uri() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "file_test_123",
+                "filename": "image.jpg",
+                "bytes": 100,
+                "purpose": "image",
+                "created_at": 1234567890u64
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = MoonshotClient::new(
+            reqwest::Client::new(),
+            mock_server.uri(),
+            "test-key".into(),
+            "test-model".into(),
+        );
+
+        let fake_b64 =
+            base64::engine::general_purpose::STANDARD.encode(b"fake_image_data");
+        let mut messages = vec![Message::User {
+            content: UserContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: MediaUrl {
+                    url: format!("data:image/jpeg;base64,{}", fake_b64),
+                },
+            }]),
+        }];
+
+        client.upload_inline_images(&mut messages).await;
+
+        if let Message::User {
+            content: UserContent::Parts(parts),
+        } = &messages[0]
+        {
+            if let ContentPart::ImageUrl { image_url } = &parts[0] {
+                assert_eq!(image_url.url, "ms://file_test_123");
+            } else {
+                panic!("expected ImageUrl part");
+            }
+        } else {
+            panic!("expected User message with Parts");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upload_keeps_data_uri_on_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/files"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let client = MoonshotClient::new(
+            reqwest::Client::new(),
+            mock_server.uri(),
+            "test-key".into(),
+            "test-model".into(),
+        );
+
+        let fake_b64 =
+            base64::engine::general_purpose::STANDARD.encode(b"fake_image_data");
+        let original_url = format!("data:image/jpeg;base64,{}", fake_b64);
+        let mut messages = vec![Message::User {
+            content: UserContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: MediaUrl {
+                    url: original_url.clone(),
+                },
+            }]),
+        }];
+
+        client.upload_inline_images(&mut messages).await;
+
+        if let Message::User {
+            content: UserContent::Parts(parts),
+        } = &messages[0]
+        {
+            if let ContentPart::ImageUrl { image_url } = &parts[0] {
+                assert_eq!(
+                    image_url.url, original_url,
+                    "URL should remain unchanged on upload failure"
+                );
+            } else {
+                panic!("expected ImageUrl part");
+            }
+        } else {
+            panic!("expected User message with Parts");
+        }
+    }
 
     #[test]
     fn test_chat_request_serialization() {

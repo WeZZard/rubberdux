@@ -111,3 +111,71 @@ impl Tool for TelegramReactionTool {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool::{Tool, ToolOutcome};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn make_tool(chat_id: Option<i64>) -> TelegramReactionTool {
+        TelegramReactionTool::new(
+            teloxide::Bot::new("dummy_token"),
+            Arc::new(Mutex::new(chat_id)),
+        )
+    }
+
+    #[test]
+    fn test_reaction_tool_definition_valid() {
+        let tool = make_tool(None);
+        assert_eq!(tool.name(), "telegram_reaction");
+        let definition = tool.definition();
+        assert_eq!(definition.function.name, "telegram_reaction");
+    }
+
+    #[test]
+    fn test_reaction_tool_rejects_missing_emoji() {
+        let tool = make_tool(None);
+        let outcome = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(r#"{"action": "set", "message_id": 42}"#));
+        match outcome {
+            ToolOutcome::Immediate { is_error, .. } => assert!(is_error),
+            _ => panic!("Expected Immediate outcome"),
+        }
+    }
+
+    #[test]
+    fn test_reaction_tool_rejects_missing_message_id() {
+        let tool = make_tool(None);
+        let outcome = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(r#"{"action": "set", "emoji": "👍"}"#));
+        match outcome {
+            ToolOutcome::Immediate { is_error, .. } => assert!(is_error),
+            _ => panic!("Expected Immediate outcome"),
+        }
+    }
+
+    #[test]
+    fn test_reaction_tool_rejects_no_chat_id() {
+        let tool = make_tool(None);
+        let outcome = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(
+                r#"{"action": "set", "emoji": "👍", "message_id": 42}"#,
+            ));
+        match outcome {
+            ToolOutcome::Immediate { content, is_error } => {
+                assert!(is_error);
+                assert!(
+                    content.contains("No active Telegram chat"),
+                    "Expected 'No active Telegram chat' in: {}",
+                    content
+                );
+            }
+            _ => panic!("Expected Immediate outcome"),
+        }
+    }
+}
