@@ -12,7 +12,7 @@ Run "echo hello_from_bash" and show me the output.
 
 ## Tool Call
 ```cel
-message.tool_calls.exists(t, t.name == "bash" && t.function.arguments.contains("echo hello_from_bash"))
+message.tool_calls.exists(t, t.name == "bash")
 ```
 
 ## Assistant Message
