@@ -1,15 +1,15 @@
 {
   "type": "function",
   "function": {
-    "name": "workspace",
-    "description": "Manage workspace entities: projects (deadline-bound work), artifacts, and resources. Use the entity and action parameters to perform CRUD operations.",
+    "name": "mindset",
+    "description": "Manage agent mindset: responsibilities (ongoing areas of work the agent is accountable for).",
     "parameters": {
       "type": "object",
       "properties": {
         "entity": {
           "type": "string",
-          "description": "The type of workspace entity to operate on.",
-          "enum": ["project", "artifact", "resource"]
+          "description": "The type of mindset entity to operate on.",
+          "enum": ["responsibility"]
         },
         "action": {
           "type": "string",
@@ -22,7 +22,7 @@
         },
         "fields": {
           "type": "object",
-          "description": "Key-value pairs to set on the entity. Used with create and update. Project fields: description, deadline (YYYY-MM-DD), status (active/paused/completed).",
+          "description": "Key-value pairs to set on the entity. Used with create and update. Responsibility fields: description.",
           "additionalProperties": { "type": "string" }
         }
       },

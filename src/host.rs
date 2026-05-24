@@ -173,13 +173,17 @@ pub async fn run(_config: HostConfig, bot: Bot) {
         }
     }
 
+    let mindset = Arc::new(crate::mindset::Mindset::new());
+    mindset.ensure_dirs().expect("Failed to initialize mindset");
+    mindset.seed_defaults_if_empty(&project_root.join("prompts"));
+    log::info!("Mindset root: {}", mindset.root.display());
+
     let workspace = Arc::new(crate::workspace::Workspace::new());
     workspace.ensure_dirs().expect("Failed to initialize workspace");
 
     log::info!("Workspace root: {}", workspace.root.display());
 
-    let prompt_dir = crate::hardened_prompts::prompt_dir();
-    let prompt_parts = crate::hardened_prompts::load_prompt_parts(&prompt_dir);
+    let prompt_parts = crate::hardened_prompts::load_prompt_parts(&mindset.root);
     let channel_partial = Some(crate::channel::adapter::telegram::channel_prompt());
     let system_prompt =
         crate::hardened_prompts::compose_system_prompt(&prompt_parts, channel_partial);
@@ -214,6 +218,7 @@ pub async fn run(_config: HostConfig, bot: Bot) {
     let builder = AgentLoopBuilder::new(system_prompt, session_manager)
         .with_session_id(session_id)
         .with_workspace(workspace)
+        .with_mindset(mindset.clone())
         .with_channel_processor("telegram", telegram_processor)
         .with_recorder(broadcast_recorder);
     let (agent_loop, input_port, _context_tx) = builder.build(client).await;
@@ -224,8 +229,8 @@ pub async fn run(_config: HostConfig, bot: Bot) {
     // Set up the gateway server
     let _gateway_handle = {
         let output_port = agent_loop.subscribe_output();
-        let identity = std::fs::read_to_string(prompt_dir.join("IDENTITY.md")).unwrap_or_default();
-        let soul = std::fs::read_to_string(prompt_dir.join("SOUL.md")).unwrap_or_default();
+        let identity = std::fs::read_to_string(mindset.identity_path()).unwrap_or_default();
+        let soul = std::fs::read_to_string(mindset.soul_path()).unwrap_or_default();
         let gateway_state = Arc::new(crate::gateway::state::GatewayState::with_trajectory_tx(
             gateway_system_prompt, identity, soul, trajectory_tx, input_port.clone(),
             Some(gateway_events_path),

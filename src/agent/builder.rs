@@ -30,6 +30,7 @@ pub struct AgentLoopBuilder {
     pub with_agent_tool: bool,
     pub recorder: Option<SharedTrajectoryRecorder>,
     pub workspace: Option<Arc<crate::workspace::Workspace>>,
+    pub mindset: Option<Arc<crate::mindset::Mindset>>,
     pub channel_processors: std::collections::HashMap<String, std::sync::Arc<dyn crate::channel::processor::ChannelProcessor>>,
 }
 
@@ -43,6 +44,7 @@ impl AgentLoopBuilder {
             with_agent_tool: true,
             recorder: None,
             workspace: None,
+            mindset: None,
             channel_processors: std::collections::HashMap::new(),
         }
     }
@@ -69,6 +71,11 @@ impl AgentLoopBuilder {
 
     pub fn with_workspace(mut self, workspace: Arc<crate::workspace::Workspace>) -> Self {
         self.workspace = Some(workspace);
+        self
+    }
+
+    pub fn with_mindset(mut self, mindset: Arc<crate::mindset::Mindset>) -> Self {
+        self.mindset = Some(mindset);
         self
     }
 
@@ -112,6 +119,10 @@ impl AgentLoopBuilder {
                 r.register(Box::new(crate::tool::workspace::WorkspaceTool::new(ws.clone())));
             }
 
+            if let Some(ref ms) = self.mindset {
+                r.register(Box::new(crate::tool::mindset::MindsetTool::new(ms.clone())));
+            }
+
             for (_, processor) in &self.channel_processors {
                 for tool in processor.tools() {
                     r.register(tool);
@@ -119,7 +130,7 @@ impl AgentLoopBuilder {
             }
 
             if self.with_agent_tool {
-                let subagent_registries = build_subagent_registries(&client, &self.workspace);
+                let subagent_registries = build_subagent_registries(&client, &self.workspace, &self.mindset);
                 r.register(Box::new(AgentTool::new(
                     client.clone(),
                     subagent_registries,

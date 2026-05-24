@@ -33,4 +33,10 @@ pub enum Error {
 
     #[error("workspace error: {0}")]
     Workspace(String),
+
+    #[error("front matter error: {0}")]
+    FrontMatter(String),
+
+    #[error("mindset error: {0}")]
+    Mindset(String),
 }

@@ -11,6 +11,8 @@ pub mod provider;
 pub mod session;
 pub mod tool;
 pub mod workspace;
+pub mod frontmatter;
+pub mod mindset;
 pub mod trajectory;
 #[cfg(feature = "host")]
 pub mod vm;

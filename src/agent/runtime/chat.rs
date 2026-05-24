@@ -54,7 +54,7 @@ pub async fn run_with_session(
         r.register(Box::new(GrepTool));
         r.register(Box::new(WebSearchTool::new(client.clone())));
 
-        let subagent_registries = build_subagent_registries(&client, &None);
+        let subagent_registries = build_subagent_registries(&client, &None, &None);
         r.register(Box::new(AgentTool::new(
             client.clone(),
             subagent_registries,

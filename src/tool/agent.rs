@@ -23,6 +23,7 @@ use super::ToolOutcome;
 pub fn build_subagent_registries(
     client: &Arc<MoonshotClient>,
     workspace: &Option<Arc<crate::workspace::Workspace>>,
+    mindset: &Option<Arc<crate::mindset::Mindset>>,
 ) -> HashMap<SubagentType, Arc<ToolRegistry>> {
     use crate::provider::moonshot::tool::web_fetch::MoonshotWebFetchTool;
     use crate::provider::moonshot::tool::web_search::WebSearchTool;
@@ -57,6 +58,10 @@ pub fn build_subagent_registries(
 
         if let Some(ws) = workspace {
             r.register(Box::new(crate::tool::workspace::WorkspaceTool::new(ws.clone())));
+        }
+
+        if let Some(ms) = mindset {
+            r.register(Box::new(crate::tool::mindset::MindsetTool::new(ms.clone())));
         }
 
         r
@@ -271,7 +276,7 @@ mod tests {
 
     fn dummy_registries() -> HashMap<SubagentType, Arc<ToolRegistry>> {
         let client = dummy_client();
-        build_subagent_registries(&client, &None)
+        build_subagent_registries(&client, &None, &None)
     }
 
     fn dummy_agent_tool() -> AgentTool {
@@ -533,6 +538,23 @@ mod tests {
             }
             _ => panic!("Expected Immediate outcome"),
         }
+    }
+
+    #[test]
+    fn test_gp_registry_with_mindset() {
+        let client = dummy_client();
+        let ms = Arc::new(crate::mindset::Mindset {
+            root: std::env::temp_dir().join("rubberdux-mindset-registry-test"),
+        });
+        let registries = build_subagent_registries(&client, &None, &Some(ms));
+        let r = registries.get(&SubagentType::GeneralPurpose).unwrap();
+        let defs: Vec<String> = r
+            .definitions()
+            .iter()
+            .map(|d| d.function.name.clone())
+            .collect();
+        assert_eq!(defs.len(), 9, "gp registry with mindset should have 9 tools, got {:?}", defs);
+        assert!(defs.contains(&"mindset".to_owned()), "gp registry should contain mindset tool");
     }
 
     #[tokio::test]

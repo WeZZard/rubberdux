@@ -11,6 +11,8 @@ mod provider;
 mod session;
 mod tool;
 mod trajectory;
+mod frontmatter;
+mod mindset;
 mod workspace;
 mod vm;
 

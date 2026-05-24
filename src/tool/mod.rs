@@ -3,6 +3,7 @@ pub mod bash;
 pub mod edit;
 pub mod glob;
 pub mod grep;
+pub mod mindset;
 pub mod read;
 pub mod web_fetch;
 pub mod workspace;
