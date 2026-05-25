@@ -69,6 +69,7 @@ serial_test = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 libtest-mimic = "0.8"
+regex = "1"
 
 [[test]]
 name = "telegram_channel_agent"

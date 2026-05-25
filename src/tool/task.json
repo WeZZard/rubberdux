@@ -1,0 +1,27 @@
+{
+  "type": "function",
+  "function": {
+    "name": "task",
+    "description": "Manage tasks (agent-initiated work with stop conditions). Tasks have finer-grained timestamps than projects and can optionally link to a parent project.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "description": "The action to perform.",
+          "enum": ["list", "create", "retrieve", "update", "complete"]
+        },
+        "name": {
+          "type": "string",
+          "description": "Task name. Required for create, retrieve, update, complete."
+        },
+        "fields": {
+          "type": "object",
+          "description": "Key-value pairs. Task fields: description, stop_condition (required for create), project (optional parent project name).",
+          "additionalProperties": { "type": "string" }
+        }
+      },
+      "required": ["action"]
+    }
+  }
+}

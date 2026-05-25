@@ -6,6 +6,7 @@ pub mod grep;
 pub mod mindset;
 pub mod project;
 pub mod read;
+pub mod task;
 pub mod web_fetch;
 pub mod write;
 

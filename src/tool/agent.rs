@@ -58,6 +58,7 @@ pub fn build_subagent_registries(
 
         if let Some(ws) = workspace {
             r.register(Box::new(crate::tool::project::ProjectTool::new(ws.clone())));
+            r.register(Box::new(crate::tool::task::TaskTool::new(ws.clone())));
         }
 
         if let Some(ms) = mindset {
@@ -570,8 +571,9 @@ mod tests {
             .iter()
             .map(|d| d.function.name.clone())
             .collect();
-        assert_eq!(defs.len(), 9, "gp registry with workspace should have 9 tools, got {:?}", defs);
+        assert_eq!(defs.len(), 10, "gp registry with workspace should have 10 tools, got {:?}", defs);
         assert!(defs.contains(&"project".to_owned()), "gp registry should contain project tool");
+        assert!(defs.contains(&"task".to_owned()), "gp registry should contain task tool");
     }
 
     #[tokio::test]

@@ -16,6 +16,18 @@ pub struct ProjectManifest {
     pub completed_tasks: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskManifest {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub stop_condition: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub completed: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +130,53 @@ mod tests {
         let json = serde_json::to_string(&m).unwrap();
         assert!(!json.contains("active_tasks"));
         assert!(!json.contains("completed_tasks"));
+    }
+
+    #[test]
+    fn test_task_manifest_roundtrip() {
+        let m = TaskManifest {
+            name: "Implement feature X".into(),
+            description: "Add the new feature X to the system".into(),
+            stop_condition: "all tests pass and feature is documented".into(),
+            project: Some("parent".into()),
+            completed: false,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: TaskManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(m, back);
+    }
+
+    #[test]
+    fn test_task_manifest_default_completed() {
+        let json = r#"{"name":"T","description":"D","stop_condition":"done when X"}"#;
+        let m: TaskManifest = serde_json::from_str(json).unwrap();
+        assert!(!m.completed);
+    }
+
+    #[test]
+    fn test_task_manifest_without_project() {
+        let m = TaskManifest {
+            name: "Standalone".into(),
+            description: String::new(),
+            stop_condition: "done".into(),
+            project: None,
+            completed: false,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(!json.contains("\"project\""));
+    }
+
+    #[test]
+    fn test_task_manifest_with_project() {
+        let m = TaskManifest {
+            name: "Child task".into(),
+            description: String::new(),
+            stop_condition: "done".into(),
+            project: Some("my-project".into()),
+            completed: false,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: TaskManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.project, Some("my-project".into()));
     }
 }
