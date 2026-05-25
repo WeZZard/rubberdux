@@ -1,27 +1,5 @@
-use chrono::NaiveDate;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-
-fn default_true() -> bool {
-    true
-}
-
-fn is_true(v: &bool) -> bool {
-    *v
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ProjectStatus {
-    Active,
-    Paused,
-    Completed,
-}
-
-impl Default for ProjectStatus {
-    fn default() -> Self {
-        Self::Active
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectManifest {
@@ -29,30 +7,49 @@ pub struct ProjectManifest {
     #[serde(default)]
     pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deadline: Option<NaiveDate>,
+    pub deadline: Option<DateTime<Utc>>,
     #[serde(default)]
-    pub status: ProjectStatus,
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub active: bool,
+    pub completed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_tasks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_tasks: Vec<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDate;
 
     #[test]
     fn test_project_manifest_with_deadline() {
         let m = ProjectManifest {
             name: "Blog Redesign".into(),
             description: "Redesign with Astro".into(),
-            deadline: Some(NaiveDate::from_ymd_opt(2026, 7, 15).unwrap()),
-            status: ProjectStatus::Active,
-            active: true,
+            deadline: Some(DateTime::<Utc>::from_naive_utc_and_offset(
+                NaiveDate::from_ymd_opt(2026, 7, 15)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+                Utc,
+            )),
+            completed: false,
+            active_tasks: vec![],
+            completed_tasks: vec![],
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: ProjectManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(m, back);
-        assert_eq!(back.deadline, Some(NaiveDate::from_ymd_opt(2026, 7, 15).unwrap()));
+        assert_eq!(
+            back.deadline,
+            Some(DateTime::<Utc>::from_naive_utc_and_offset(
+                NaiveDate::from_ymd_opt(2026, 7, 15)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+                Utc,
+            ))
+        );
     }
 
     #[test]
@@ -61,8 +58,9 @@ mod tests {
             name: "Experiment".into(),
             description: "Just exploring".into(),
             deadline: None,
-            status: ProjectStatus::Active,
-            active: true,
+            completed: false,
+            active_tasks: vec![],
+            completed_tasks: vec![],
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: ProjectManifest = serde_json::from_str(&json).unwrap();
@@ -71,22 +69,54 @@ mod tests {
     }
 
     #[test]
-    fn test_project_status_default() {
-        assert_eq!(ProjectStatus::default(), ProjectStatus::Active);
+    fn test_project_manifest_completed() {
+        let m = ProjectManifest {
+            name: "Done Project".into(),
+            description: String::new(),
+            deadline: None,
+            completed: true,
+            active_tasks: vec![],
+            completed_tasks: vec![],
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"completed\":true"));
     }
 
     #[test]
-    fn test_project_status_roundtrip() {
-        let variants = vec![
-            (ProjectStatus::Active, "active"),
-            (ProjectStatus::Paused, "paused"),
-            (ProjectStatus::Completed, "completed"),
-        ];
-        for (variant, expected_str) in variants {
-            let json = serde_json::to_string(&variant).unwrap();
-            assert_eq!(json, format!("\"{}\"", expected_str));
-            let back: ProjectStatus = serde_json::from_str(&json).unwrap();
-            assert_eq!(back, variant);
-        }
+    fn test_project_manifest_with_tasks() {
+        let m = ProjectManifest {
+            name: "Task Project".into(),
+            description: String::new(),
+            deadline: None,
+            completed: false,
+            active_tasks: vec!["task-a".into()],
+            completed_tasks: vec!["task-b".into()],
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: ProjectManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.active_tasks, vec!["task-a".to_string()]);
+        assert_eq!(back.completed_tasks, vec!["task-b".to_string()]);
+    }
+
+    #[test]
+    fn test_project_manifest_default_completed() {
+        let json = r#"{"name":"Minimal","description":""}"#;
+        let m: ProjectManifest = serde_json::from_str(json).unwrap();
+        assert!(!m.completed);
+    }
+
+    #[test]
+    fn test_project_manifest_empty_tasks_not_serialized() {
+        let m = ProjectManifest {
+            name: "No Tasks".into(),
+            description: String::new(),
+            deadline: None,
+            completed: false,
+            active_tasks: vec![],
+            completed_tasks: vec![],
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(!json.contains("active_tasks"));
+        assert!(!json.contains("completed_tasks"));
     }
 }

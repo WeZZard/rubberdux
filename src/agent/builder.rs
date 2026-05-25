@@ -116,7 +116,7 @@ impl AgentLoopBuilder {
             r.register(Box::new(WebSearchTool::new(client.clone())));
 
             if let Some(ref ws) = self.workspace {
-                r.register(Box::new(crate::tool::workspace::WorkspaceTool::new(ws.clone())));
+                r.register(Box::new(crate::tool::project::ProjectTool::new(ws.clone())));
             }
 
             if let Some(ref ms) = self.mindset {

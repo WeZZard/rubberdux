@@ -57,7 +57,7 @@ pub fn build_subagent_registries(
         r.register(Box::new(WebSearchTool::new(client.clone())));
 
         if let Some(ws) = workspace {
-            r.register(Box::new(crate::tool::workspace::WorkspaceTool::new(ws.clone())));
+            r.register(Box::new(crate::tool::project::ProjectTool::new(ws.clone())));
         }
 
         if let Some(ms) = mindset {
@@ -555,6 +555,23 @@ mod tests {
             .collect();
         assert_eq!(defs.len(), 9, "gp registry with mindset should have 9 tools, got {:?}", defs);
         assert!(defs.contains(&"mindset".to_owned()), "gp registry should contain mindset tool");
+    }
+
+    #[test]
+    fn test_gp_registry_with_workspace() {
+        let client = dummy_client();
+        let ws = Arc::new(crate::workspace::Workspace {
+            root: std::env::temp_dir().join("rubberdux-ws-registry-test"),
+        });
+        let registries = build_subagent_registries(&client, &Some(ws), &None);
+        let r = registries.get(&SubagentType::GeneralPurpose).unwrap();
+        let defs: Vec<String> = r
+            .definitions()
+            .iter()
+            .map(|d| d.function.name.clone())
+            .collect();
+        assert_eq!(defs.len(), 9, "gp registry with workspace should have 9 tools, got {:?}", defs);
+        assert!(defs.contains(&"project".to_owned()), "gp registry should contain project tool");
     }
 
     #[tokio::test]

@@ -29,9 +29,11 @@ impl Workspace {
     pub fn ensure_dirs(&self) -> Result<(), Error> {
         for dir in [
             self.root.clone(),
-            self.root.join("artifacts"),
             self.root.join("projects"),
-            self.root.join("resources"),
+            self.root.join("tasks"),
+            self.root.join("archives"),
+            self.root.join("archives").join("projects"),
+            self.root.join("archives").join("tasks"),
         ] {
             std::fs::create_dir_all(&dir).map_err(|e| {
                 Error::Workspace(format!("Failed to create {}: {}", dir.display(), e))
@@ -44,12 +46,12 @@ impl Workspace {
         self.root.join("projects")
     }
 
-    pub fn artifacts_dir(&self) -> PathBuf {
-        self.root.join("artifacts")
+    pub fn tasks_dir(&self) -> PathBuf {
+        self.root.join("tasks")
     }
 
-    pub fn resources_dir(&self) -> PathBuf {
-        self.root.join("resources")
+    pub fn archives_dir(&self) -> PathBuf {
+        self.root.join("archives")
     }
 }
 
@@ -75,10 +77,13 @@ mod tests {
         let (root, ws) = temp_workspace();
         ws.ensure_dirs().unwrap();
 
-        assert!(root.join("artifacts").exists());
         assert!(root.join("projects").exists());
-        assert!(root.join("resources").exists());
-        assert!(!root.join("threads").exists());
+        assert!(root.join("tasks").exists());
+        assert!(root.join("archives").exists());
+        assert!(root.join("archives").join("projects").exists());
+        assert!(root.join("archives").join("tasks").exists());
+        assert!(!root.join("artifacts").exists());
+        assert!(!root.join("resources").exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -97,8 +102,8 @@ mod tests {
         let (root, ws) = temp_workspace();
 
         assert_eq!(ws.projects_dir(), root.join("projects"));
-        assert_eq!(ws.artifacts_dir(), root.join("artifacts"));
-        assert_eq!(ws.resources_dir(), root.join("resources"));
+        assert_eq!(ws.tasks_dir(), root.join("tasks"));
+        assert_eq!(ws.archives_dir(), root.join("archives"));
     }
 
     #[test]

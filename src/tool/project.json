@@ -1,0 +1,27 @@
+{
+  "type": "function",
+  "function": {
+    "name": "project",
+    "description": "Manage projects (human-defined work with deadlines). Each project has a manifest, an artifacts/ directory for MIME-organized files, and a worktrees/ directory for git working copies.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "description": "The action to perform.",
+          "enum": ["list", "create", "retrieve", "update", "complete"]
+        },
+        "name": {
+          "type": "string",
+          "description": "Project name. Required for create, retrieve, update, complete."
+        },
+        "fields": {
+          "type": "object",
+          "description": "Key-value pairs. Project fields: description, deadline (YYYY-MM-DD, stored as UTC).",
+          "additionalProperties": { "type": "string" }
+        }
+      },
+      "required": ["action"]
+    }
+  }
+}

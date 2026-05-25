@@ -3,28 +3,28 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::provider::moonshot::tool::ToolDefinition;
-use crate::workspace::entity::{ProjectManifest, ProjectStatus};
+use crate::workspace::entity::ProjectManifest;
 use crate::workspace::{format_yaml_front_matter, parse_yaml_front_matter, Workspace};
 
 use super::ToolOutcome;
 
-pub struct WorkspaceTool {
+pub struct ProjectTool {
     workspace: Arc<Workspace>,
 }
 
-impl WorkspaceTool {
+impl ProjectTool {
     pub fn new(workspace: Arc<Workspace>) -> Self {
         Self { workspace }
     }
 }
 
-impl super::Tool for WorkspaceTool {
+impl super::Tool for ProjectTool {
     fn name(&self) -> &str {
-        "workspace"
+        "project"
     }
 
     fn definition(&self) -> ToolDefinition {
-        serde_json::from_str(include_str!("workspace.json")).unwrap()
+        serde_json::from_str(include_str!("project.json")).unwrap()
     }
 
     fn execute<'a>(
@@ -42,16 +42,6 @@ impl super::Tool for WorkspaceTool {
                 }
             };
 
-            let entity = match args["entity"].as_str() {
-                Some(e) => e,
-                None => {
-                    return ToolOutcome::Immediate {
-                        content: "Missing required parameter: entity".into(),
-                        is_error: true,
-                    };
-                }
-            };
-
             let action = match args["action"].as_str() {
                 Some(a) => a,
                 None => {
@@ -62,14 +52,14 @@ impl super::Tool for WorkspaceTool {
                 }
             };
 
-            match entity {
-                "project" => self.handle_project(action, &args),
-                "artifact" | "resource" => ToolOutcome::Immediate {
-                    content: format!("Entity '{}' is not yet implemented.", entity),
-                    is_error: true,
-                },
+            match action {
+                "list" => self.project_list(),
+                "create" => self.project_create(&args),
+                "retrieve" => self.project_retrieve(&args),
+                "update" => self.project_update(&args),
+                "complete" => self.project_complete(&args),
                 _ => ToolOutcome::Immediate {
-                    content: format!("Unknown entity: {}", entity),
+                    content: format!("Unknown action: {}", action),
                     is_error: true,
                 },
             }
@@ -78,24 +68,10 @@ impl super::Tool for WorkspaceTool {
 }
 
 // ---------------------------------------------------------------------------
-// Project handlers
+// Helpers
 // ---------------------------------------------------------------------------
 
-impl WorkspaceTool {
-    fn handle_project(&self, action: &str, args: &serde_json::Value) -> ToolOutcome {
-        match action {
-            "list" => self.project_list(),
-            "create" => self.project_create(args),
-            "retrieve" => self.project_retrieve(args),
-            "update" => self.project_update(args),
-            "deactivate" => self.project_deactivate(args),
-            _ => ToolOutcome::Immediate {
-                content: format!("Unknown action: {}", action),
-                is_error: true,
-            },
-        }
-    }
-
+impl ProjectTool {
     fn find_project_dir(&self, name: &str) -> Option<std::path::PathBuf> {
         let projects_dir = self.workspace.projects_dir();
         let suffix = format!("-{}", name);
@@ -134,7 +110,13 @@ impl WorkspaceTool {
         std::fs::write(&index_path, content)
             .map_err(|e| format!("Failed to write {}: {}", index_path.display(), e))
     }
+}
 
+// ---------------------------------------------------------------------------
+// Action handlers
+// ---------------------------------------------------------------------------
+
+impl ProjectTool {
     fn project_list(&self) -> ToolOutcome {
         let projects_dir = self.workspace.projects_dir();
         let entries = match std::fs::read_dir(&projects_dir) {
@@ -155,12 +137,11 @@ impl WorkspaceTool {
             if let Ok(manifest) = self.read_project_manifest(&entry.path()) {
                 let deadline_str = manifest
                     .deadline
-                    .map(|d| d.to_string())
+                    .map(|d| d.format("%Y-%m-%d").to_string())
                     .unwrap_or_else(|| "none".into());
-                let active_str = if manifest.active { "active" } else { "inactive" };
                 items.push(format!(
-                    "- {} [status: {:?}, deadline: {}, {}]: {}",
-                    manifest.name, manifest.status, deadline_str, active_str, manifest.description
+                    "- {} [completed: {}, deadline: {}]: {}",
+                    manifest.name, manifest.completed, deadline_str, manifest.description
                 ));
             }
         }
@@ -209,32 +190,26 @@ impl WorkspaceTool {
         let deadline = fields
             .and_then(|f| f.get("deadline"))
             .and_then(|v| v.as_str())
-            .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
-        let status = fields
-            .and_then(|f| f.get("status"))
-            .and_then(|v| v.as_str())
-            .map(|s| parse_project_status(s))
-            .transpose();
-        let status = match status {
-            Ok(s) => s.unwrap_or_default(),
-            Err(e) => {
-                return ToolOutcome::Immediate {
-                    content: e,
-                    is_error: true,
-                };
-            }
-        };
+            .and_then(|s| {
+                chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok().map(|d| {
+                    chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                        d.and_hms_opt(0, 0, 0).unwrap(),
+                        chrono::Utc,
+                    )
+                })
+            });
 
         let manifest = ProjectManifest {
             name: name.to_string(),
             description,
             deadline,
-            status,
-            active: true,
+            completed: false,
+            active_tasks: vec![],
+            completed_tasks: vec![],
         };
 
-        // Create directory structure
-        for sub in &["scratches", "worktrees"] {
+        // Create directory structure: artifacts/ and worktrees/
+        for sub in &["artifacts", "worktrees"] {
             if let Err(e) = std::fs::create_dir_all(project_dir.join(sub)) {
                 return ToolOutcome::Immediate {
                     content: format!("Failed to create {}/{}: {}", dir_name, sub, e),
@@ -281,14 +256,12 @@ impl WorkspaceTool {
             Ok(manifest) => {
                 let deadline_str = manifest
                     .deadline
-                    .map(|d| d.to_string())
+                    .map(|d| d.format("%Y-%m-%d").to_string())
                     .unwrap_or_else(|| "none".into());
-                let active_str = if manifest.active { "active" } else { "inactive" };
                 ToolOutcome::Immediate {
                     content: format!(
-                        "Name: {}\nDescription: {}\nDeadline: {}\nStatus: {:?}\nActive: {}",
-                        manifest.name, manifest.description, deadline_str, manifest.status,
-                        active_str
+                        "Name: {}\nDescription: {}\nDeadline: {}\nCompleted: {}",
+                        manifest.name, manifest.description, deadline_str, manifest.completed
                     ),
                     is_error: false,
                 }
@@ -322,7 +295,7 @@ impl WorkspaceTool {
         };
 
         // Check for unknown fields
-        let valid_fields = ["description", "deadline", "status"];
+        let valid_fields = ["description", "deadline"];
         for key in fields.keys() {
             if !valid_fields.contains(&key.as_str()) {
                 return ToolOutcome::Immediate {
@@ -362,25 +335,20 @@ impl WorkspaceTool {
 
         if let Some(deadline_str) = fields.get("deadline").and_then(|v| v.as_str()) {
             match chrono::NaiveDate::parse_from_str(deadline_str, "%Y-%m-%d") {
-                Ok(d) => manifest.deadline = Some(d),
+                Ok(d) => {
+                    manifest.deadline = Some(
+                        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                            d.and_hms_opt(0, 0, 0).unwrap(),
+                            chrono::Utc,
+                        ),
+                    );
+                }
                 Err(e) => {
                     return ToolOutcome::Immediate {
                         content: format!(
                             "Invalid deadline '{}': {}. Expected YYYY-MM-DD.",
                             deadline_str, e
                         ),
-                        is_error: true,
-                    };
-                }
-            }
-        }
-
-        if let Some(status_str) = fields.get("status").and_then(|v| v.as_str()) {
-            match parse_project_status(status_str) {
-                Ok(s) => manifest.status = s,
-                Err(e) => {
-                    return ToolOutcome::Immediate {
-                        content: e,
                         is_error: true,
                     };
                 }
@@ -400,7 +368,7 @@ impl WorkspaceTool {
         }
     }
 
-    fn project_deactivate(&self, args: &serde_json::Value) -> ToolOutcome {
+    fn project_complete(&self, args: &serde_json::Value) -> ToolOutcome {
         let name = match args["name"].as_str() {
             Some(n) => n,
             None => {
@@ -421,6 +389,7 @@ impl WorkspaceTool {
             }
         };
 
+        // Read manifest and set completed = true
         let mut manifest = match self.read_project_manifest(&project_dir) {
             Ok(m) => m,
             Err(e) => {
@@ -431,7 +400,7 @@ impl WorkspaceTool {
             }
         };
 
-        manifest.active = false;
+        manifest.completed = true;
 
         if let Err(e) = self.write_project_manifest(&project_dir, &manifest) {
             return ToolOutcome::Immediate {
@@ -440,22 +409,36 @@ impl WorkspaceTool {
             };
         }
 
+        // Move directory to archives/projects/
+        let dir_name = project_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let archive_dest = self
+            .workspace
+            .archives_dir()
+            .join("projects")
+            .join(&dir_name);
+
+        if let Err(e) = std::fs::rename(&project_dir, &archive_dest) {
+            return ToolOutcome::Immediate {
+                content: format!(
+                    "Project '{}' marked complete but failed to move to archive: {}",
+                    name, e
+                ),
+                is_error: true,
+            };
+        }
+
         ToolOutcome::Immediate {
-            content: format!("Project '{}' deactivated.", name),
+            content: format!(
+                "Project '{}' completed and archived to {}.",
+                name,
+                archive_dest.display()
+            ),
             is_error: false,
         }
-    }
-}
-
-fn parse_project_status(s: &str) -> Result<ProjectStatus, String> {
-    match s {
-        "active" => Ok(ProjectStatus::Active),
-        "paused" => Ok(ProjectStatus::Paused),
-        "completed" => Ok(ProjectStatus::Completed),
-        _ => Err(format!(
-            "Unknown status '{}'. Valid values: active, paused, completed.",
-            s
-        )),
     }
 }
 
@@ -464,15 +447,21 @@ mod tests {
     use super::*;
     use crate::tool::Tool;
 
-    fn temp_tool() -> (std::path::PathBuf, WorkspaceTool) {
+    fn temp_tool() -> (std::path::PathBuf, ProjectTool) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("rubberdux-workspace-tool-test-{}", ts));
+        let cnt = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "rubberdux-project-tool-test-{}-{}",
+            ts, cnt
+        ));
         let ws = Arc::new(Workspace { root: root.clone() });
         ws.ensure_dirs().unwrap();
-        (root, WorkspaceTool::new(ws))
+        (root, ProjectTool::new(ws))
     }
 
     fn run<F: std::future::Future<Output = ToolOutcome>>(f: F) -> ToolOutcome {
@@ -489,46 +478,10 @@ mod tests {
     #[test]
     fn test_project_list_empty() {
         let (_root, tool) = temp_tool();
-        let args = serde_json::json!({"entity": "project", "action": "list"}).to_string();
+        let args = serde_json::json!({"action": "list"}).to_string();
         let (content, is_error) = assert_immediate(run(tool.execute(&args)));
         assert!(!is_error);
         assert!(content.contains("No projects found"));
-
-        let _ = std::fs::remove_dir_all(&_root);
-    }
-
-    #[test]
-    fn test_project_create() {
-        let (_root, tool) = temp_tool();
-
-        let args = serde_json::json!({
-            "entity": "project",
-            "action": "create",
-            "name": "TestProj",
-            "fields": {"description": "A test project"}
-        })
-        .to_string();
-        let (content, is_error) = assert_immediate(run(tool.execute(&args)));
-        assert!(!is_error, "create failed: {}", content);
-
-        // Verify directory structure
-        let project_dir = tool.find_project_dir("TestProj").unwrap();
-        assert!(project_dir.exists());
-        assert!(project_dir.join("index.md").exists());
-        assert!(project_dir.join("scratches").is_dir());
-        assert!(project_dir.join("worktrees").is_dir());
-
-        // Verify the dir name has a date prefix
-        let dir_name = project_dir.file_name().unwrap().to_string_lossy();
-        assert!(dir_name.ends_with("-TestProj"));
-        // Check date prefix format: YYYY-MM-DD
-        let date_part = &dir_name[..10];
-        assert!(
-            chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d").is_ok(),
-            "Directory should have date prefix, got: {}",
-            date_part
-        );
-
         let _ = std::fs::remove_dir_all(&_root);
     }
 
@@ -537,93 +490,142 @@ mod tests {
         let (_root, tool) = temp_tool();
 
         let create_args = serde_json::json!({
-            "entity": "project",
             "action": "create",
-            "name": "Listed",
-            "fields": {"description": "Show me", "status": "active"}
+            "name": "TestProj",
+            "fields": {"description": "A test project"}
         })
         .to_string();
-        let (_, is_error) = assert_immediate(run(tool.execute(&create_args)));
-        assert!(!is_error);
+        let (content, is_error) = assert_immediate(run(tool.execute(&create_args)));
+        assert!(!is_error, "create failed: {}", content);
 
-        let list_args = serde_json::json!({"entity": "project", "action": "list"}).to_string();
+        // Verify artifacts/ and worktrees/ dirs exist
+        let project_dir = tool.find_project_dir("TestProj").unwrap();
+        assert!(project_dir.join("artifacts").is_dir());
+        assert!(project_dir.join("worktrees").is_dir());
+
+        let list_args = serde_json::json!({"action": "list"}).to_string();
         let (content, is_error) = assert_immediate(run(tool.execute(&list_args)));
         assert!(!is_error);
-        assert!(content.contains("Listed"));
-        assert!(content.contains("Active"));
+        assert!(content.contains("TestProj"));
+        assert!(content.contains("A test project"));
 
         let _ = std::fs::remove_dir_all(&_root);
     }
 
     #[test]
-    fn test_project_update_single_field() {
+    fn test_project_create_directory_structure() {
         let (_root, tool) = temp_tool();
 
         let create_args = serde_json::json!({
-            "entity": "project",
             "action": "create",
-            "name": "SingleUpdate"
+            "name": "DirCheck",
+            "fields": {"description": "Check dirs"}
+        })
+        .to_string();
+        let (_, is_error) = assert_immediate(run(tool.execute(&create_args)));
+        assert!(!is_error);
+
+        let project_dir = tool.find_project_dir("DirCheck").unwrap();
+        assert!(project_dir.join("artifacts").is_dir(), "artifacts/ should exist");
+        assert!(project_dir.join("worktrees").is_dir(), "worktrees/ should exist");
+        assert!(
+            !project_dir.join("scratches").exists(),
+            "scratches/ should NOT exist"
+        );
+
+        let _ = std::fs::remove_dir_all(&_root);
+    }
+
+    #[test]
+    fn test_project_retrieve() {
+        let (_root, tool) = temp_tool();
+
+        let create_args = serde_json::json!({
+            "action": "create",
+            "name": "Retrievable",
+            "fields": {"description": "Retrieve me"}
+        })
+        .to_string();
+        let (_, is_error) = assert_immediate(run(tool.execute(&create_args)));
+        assert!(!is_error);
+
+        let retrieve_args = serde_json::json!({
+            "action": "retrieve",
+            "name": "Retrievable"
+        })
+        .to_string();
+        let (content, is_error) = assert_immediate(run(tool.execute(&retrieve_args)));
+        assert!(!is_error);
+        assert!(content.contains("Retrievable"));
+        assert!(content.contains("false")); // completed: false
+
+        let _ = std::fs::remove_dir_all(&_root);
+    }
+
+    #[test]
+    fn test_project_update() {
+        let (_root, tool) = temp_tool();
+
+        let create_args = serde_json::json!({
+            "action": "create",
+            "name": "Updatable",
+            "fields": {"description": "old desc"}
         })
         .to_string();
         let (_, is_error) = assert_immediate(run(tool.execute(&create_args)));
         assert!(!is_error);
 
         let update_args = serde_json::json!({
-            "entity": "project",
             "action": "update",
-            "name": "SingleUpdate",
-            "fields": {"status": "paused"}
+            "name": "Updatable",
+            "fields": {"description": "new desc"}
         })
         .to_string();
         let (_, is_error) = assert_immediate(run(tool.execute(&update_args)));
         assert!(!is_error);
 
         let retrieve_args = serde_json::json!({
-            "entity": "project",
             "action": "retrieve",
-            "name": "SingleUpdate"
+            "name": "Updatable"
         })
         .to_string();
         let (content, is_error) = assert_immediate(run(tool.execute(&retrieve_args)));
         assert!(!is_error);
-        assert!(content.contains("Paused"));
+        assert!(content.contains("new desc"));
+        assert!(!content.contains("old desc"));
 
         let _ = std::fs::remove_dir_all(&_root);
     }
 
     #[test]
-    fn test_project_update_multiple_fields() {
+    fn test_project_update_deadline() {
         let (_root, tool) = temp_tool();
 
         let create_args = serde_json::json!({
-            "entity": "project",
             "action": "create",
-            "name": "MultiUpdate"
+            "name": "DeadlineProj"
         })
         .to_string();
         let (_, is_error) = assert_immediate(run(tool.execute(&create_args)));
         assert!(!is_error);
 
         let update_args = serde_json::json!({
-            "entity": "project",
             "action": "update",
-            "name": "MultiUpdate",
-            "fields": {"deadline": "2027-01-01", "description": "Updated"}
+            "name": "DeadlineProj",
+            "fields": {"deadline": "2027-06-15"}
         })
         .to_string();
         let (_, is_error) = assert_immediate(run(tool.execute(&update_args)));
         assert!(!is_error);
 
         let retrieve_args = serde_json::json!({
-            "entity": "project",
             "action": "retrieve",
-            "name": "MultiUpdate"
+            "name": "DeadlineProj"
         })
         .to_string();
         let (content, is_error) = assert_immediate(run(tool.execute(&retrieve_args)));
         assert!(!is_error);
-        assert!(content.contains("2027-01-01"));
-        assert!(content.contains("Updated"));
+        assert!(content.contains("2027-06-15"));
 
         let _ = std::fs::remove_dir_all(&_root);
     }
@@ -633,7 +635,6 @@ mod tests {
         let (_root, tool) = temp_tool();
 
         let create_args = serde_json::json!({
-            "entity": "project",
             "action": "create",
             "name": "BadField"
         })
@@ -642,7 +643,6 @@ mod tests {
         assert!(!is_error);
 
         let update_args = serde_json::json!({
-            "entity": "project",
             "action": "update",
             "name": "BadField",
             "fields": {"nonexistent": "val"}
@@ -651,20 +651,80 @@ mod tests {
         let (content, is_error) = assert_immediate(run(tool.execute(&update_args)));
         assert!(is_error);
         assert!(content.contains("Unknown field"));
-        assert!(content.contains("description"));
-        assert!(content.contains("deadline"));
-        assert!(content.contains("status"));
 
         let _ = std::fs::remove_dir_all(&_root);
     }
 
     #[test]
-    fn test_unimplemented_entity() {
+    fn test_project_complete() {
         let (_root, tool) = temp_tool();
-        let args = serde_json::json!({"entity": "artifact", "action": "list"}).to_string();
+
+        let create_args = serde_json::json!({
+            "action": "create",
+            "name": "Completable",
+            "fields": {"description": "Will be completed"}
+        })
+        .to_string();
+        let (_, is_error) = assert_immediate(run(tool.execute(&create_args)));
+        assert!(!is_error);
+
+        // Verify project exists in projects/
+        let project_dir = tool.find_project_dir("Completable").unwrap();
+        let dir_name = project_dir.file_name().unwrap().to_string_lossy().to_string();
+        assert!(project_dir.exists());
+
+        // Complete it
+        let complete_args = serde_json::json!({
+            "action": "complete",
+            "name": "Completable"
+        })
+        .to_string();
+        let (content, is_error) = assert_immediate(run(tool.execute(&complete_args)));
+        assert!(!is_error, "complete failed: {}", content);
+
+        // Verify project dir no longer in projects/
+        assert!(tool.find_project_dir("Completable").is_none());
+
+        // Verify project dir exists in archives/projects/
+        let archive_dir = tool
+            .workspace
+            .archives_dir()
+            .join("projects")
+            .join(&dir_name);
+        assert!(archive_dir.exists());
+
+        // Verify manifest in archive has completed: true
+        let index_content =
+            std::fs::read_to_string(archive_dir.join("index.md")).unwrap();
+        assert!(index_content.contains("completed: true"));
+
+        let _ = std::fs::remove_dir_all(&_root);
+    }
+
+    #[test]
+    fn test_project_complete_nonexistent() {
+        let (_root, tool) = temp_tool();
+
+        let complete_args = serde_json::json!({
+            "action": "complete",
+            "name": "GhostProject"
+        })
+        .to_string();
+        let (content, is_error) = assert_immediate(run(tool.execute(&complete_args)));
+        assert!(is_error);
+        assert!(content.contains("not found"));
+
+        let _ = std::fs::remove_dir_all(&_root);
+    }
+
+    #[test]
+    fn test_project_unknown_action() {
+        let (_root, tool) = temp_tool();
+
+        let args = serde_json::json!({"action": "destroy"}).to_string();
         let (content, is_error) = assert_immediate(run(tool.execute(&args)));
         assert!(is_error);
-        assert!(content.contains("not yet implemented"));
+        assert!(content.contains("Unknown action"));
 
         let _ = std::fs::remove_dir_all(&_root);
     }
