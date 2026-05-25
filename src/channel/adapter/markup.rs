@@ -63,7 +63,11 @@ pub fn parse(input: &str) -> Document {
                 if pos >= input.len() {
                     break;
                 }
-                if input[pos..].starts_with("```") {
+                if input.as_bytes()[pos] == b'`'
+                    && pos + 2 < input.len()
+                    && input.as_bytes()[pos + 1] == b'`'
+                    && input.as_bytes()[pos + 2] == b'`'
+                {
                     pos += 3;
                     break;
                 }
@@ -418,5 +422,45 @@ mod tests {
             panic!("expected Message")
         };
         assert_eq!(el.from, "user");
+    }
+
+    #[test]
+    fn test_parse_code_block_with_em_dash() {
+        let input = "```\nsome — content\n```";
+        let doc = parse(input);
+        assert_eq!(doc.nodes.len(), 1);
+        assert!(matches!(&doc.nodes[0], Node::Text(t) if t.contains("—")));
+    }
+
+    #[test]
+    fn test_parse_code_block_with_chinese() {
+        let input = "```\n你好世界\n```";
+        let doc = parse(input);
+        assert_eq!(doc.nodes.len(), 1);
+        assert!(matches!(&doc.nodes[0], Node::Text(t) if t.contains("你好世界")));
+    }
+
+    #[test]
+    fn test_parse_code_block_with_chinese_and_backticks() {
+        let input = "```rust\nlet msg = \"这是测试\";\n```";
+        let doc = parse(input);
+        assert_eq!(doc.nodes.len(), 1);
+        assert!(matches!(&doc.nodes[0], Node::Text(t) if t.contains("这是测试")));
+    }
+
+    #[test]
+    fn test_parse_code_block_with_mixed_chinese_ascii() {
+        let input = "```\nhello 你好 world 世界\n```";
+        let doc = parse(input);
+        assert_eq!(doc.nodes.len(), 1);
+        assert!(matches!(&doc.nodes[0], Node::Text(t) if t.contains("你好")));
+    }
+
+    #[test]
+    fn test_parse_inline_code_with_chinese() {
+        let input = "Use `你好` to greet.";
+        let doc = parse(input);
+        assert_eq!(doc.nodes.len(), 1);
+        assert!(matches!(&doc.nodes[0], Node::Text(t) if t.contains("你好")));
     }
 }

@@ -126,6 +126,7 @@ pub fn format_reaction_section(emojis: &[String]) -> String {
 /// the `id` attribute is inserted into the existing tag.
 /// Otherwise, the content is wrapped in a new tag.
 pub fn inject_assistant_message_id(text: &mut String, msg_id: i32) {
+    log::debug!("markup::parse input: {:?}", text);
     let mut doc = markup::parse(text);
 
     let mut found = false;

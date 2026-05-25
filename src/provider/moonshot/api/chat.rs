@@ -192,6 +192,15 @@ impl MoonshotClient {
             }
         }
 
+        for (i, choice) in chat_response.choices.iter().enumerate() {
+            log::info!(
+                "Chat API response choice {}: content={:?}, finish_reason={}",
+                i,
+                choice.message.content_text(),
+                choice.finish_reason
+            );
+        }
+
         Ok(chat_response)
     }
 }
