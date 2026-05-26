@@ -33,6 +33,7 @@ pub struct AgentLoopBuilder {
     pub mindset: Option<Arc<crate::mindset::Mindset>>,
     pub channel_processors: std::collections::HashMap<String, std::sync::Arc<dyn crate::channel::processor::ChannelProcessor>>,
     pub guardrails: Option<crate::guardrail::GuardrailChain>,
+    pub external_cwd: Option<std::path::PathBuf>,
 }
 
 impl AgentLoopBuilder {
@@ -48,6 +49,7 @@ impl AgentLoopBuilder {
             mindset: None,
             channel_processors: std::collections::HashMap::new(),
             guardrails: None,
+            external_cwd: None,
         }
     }
 
@@ -92,6 +94,11 @@ impl AgentLoopBuilder {
 
     pub fn with_guardrails(mut self, guardrails: crate::guardrail::GuardrailChain) -> Self {
         self.guardrails = Some(guardrails);
+        self
+    }
+
+    pub fn with_external_cwd(mut self, cwd: std::path::PathBuf) -> Self {
+        self.external_cwd = Some(cwd);
         self
     }
 
@@ -142,7 +149,7 @@ impl AgentLoopBuilder {
                     context_tx.clone(),
                     Some(self.session_manager.clone()),
                     Some(session_id.clone()),
-                )));
+                ).with_external_cwd(self.external_cwd.clone())));
             }
 
             r

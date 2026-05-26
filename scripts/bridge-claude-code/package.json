@@ -1,0 +1,9 @@
+{
+    "name": "bridge-claude-code",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "dependencies": {
+        "toll-free-harness": "^0.1.1"
+    }
+}

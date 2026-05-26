@@ -29,6 +29,9 @@ pub enum SubagentType {
     /// Isolated GUI automation. May open apps, move the mouse, and send keys.
     /// Runs inside a dedicated child VM for host safety.
     ComputerUse,
+    /// Dispatch to an external coding agent (e.g. Claude Code, Codex).
+    /// Not managed by the internal subagent loop; requires `agent_name`.
+    External,
 }
 
 // ---------------------------------------------------------------------------

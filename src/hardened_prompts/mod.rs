@@ -27,6 +27,7 @@ pub fn subagent_preamble(subagent_type: crate::tool::SubagentType) -> &'static s
         SubagentType::Plan => include_str!("agents/PLAN_PREAMBLE.md"),
         SubagentType::GeneralPurpose => include_str!("agents/GP_PREAMBLE.md"),
         SubagentType::ComputerUse => include_str!("agents/COMPUTER_USE_PREAMBLE.md"),
+        SubagentType::External => include_str!("agents/EXTERNAL_PREAMBLE.md"),
     }
 }
 

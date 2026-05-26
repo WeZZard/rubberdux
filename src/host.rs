@@ -230,7 +230,8 @@ pub async fn run(_config: HostConfig, bot: Bot) {
         .with_mindset(mindset.clone())
         .with_channel_processor("telegram", telegram_processor)
         .with_guardrails(guardrails)
-        .with_recorder(broadcast_recorder);
+        .with_recorder(broadcast_recorder)
+        .with_external_cwd(project_root.clone());
     let (agent_loop, input_port, _context_tx) = builder.build(client).await;
 
     // Subscribe to entry broadcasts for the Telegram adapter

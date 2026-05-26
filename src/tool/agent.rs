@@ -85,6 +85,8 @@ pub struct AgentTool {
     session_id: Option<crate::session::SessionId>,
     /// Host RPC writer for dispatching isolated computer-use VM agents.
     rpc_writer: Option<Arc<Mutex<OwnedWriteHalf>>>,
+    /// Working directory for external agent sessions (e.g. Claude Code).
+    external_cwd: Option<PathBuf>,
 }
 
 impl AgentTool {
@@ -104,11 +106,17 @@ impl AgentTool {
             session_manager,
             session_id,
             rpc_writer: None,
+            external_cwd: None,
         }
     }
 
     pub fn with_rpc_writer(mut self, rpc_writer: Option<Arc<Mutex<OwnedWriteHalf>>>) -> Self {
         self.rpc_writer = rpc_writer;
+        self
+    }
+
+    pub fn with_external_cwd(mut self, cwd: Option<PathBuf>) -> Self {
+        self.external_cwd = cwd;
         self
     }
 }
@@ -143,7 +151,7 @@ impl super::Tool for AgentTool {
                     Ok(t) => t,
                     Err(_) => {
                         return ToolOutcome::Immediate {
-                            content: "Invalid 'subagent_type'. Must be one of: explore, plan, general_purpose, computer_use".into(),
+                            content: "Invalid 'subagent_type'. Must be one of: explore, plan, general_purpose, computer_use, external".into(),
                             is_error: true,
                         };
                     }
@@ -186,6 +194,58 @@ impl super::Tool for AgentTool {
                             is_error: true,
                         },
                     };
+                }
+            }
+
+            if subagent_type == SubagentType::External {
+                let agent_name = match args.get("agent_name").and_then(|v| v.as_str()) {
+                    Some(n) => n,
+                    None => {
+                        return ToolOutcome::Immediate {
+                            content: "Missing required 'agent_name' parameter for external subagent".into(),
+                            is_error: true,
+                        };
+                    }
+                };
+
+                let task_id = super::generate_task_id();
+                let cwd = self.external_cwd.clone()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+                match agent_name {
+                    "claude_code" => {
+                        let (event_tx, event_rx) = tokio::sync::mpsc::channel(32);
+                        let cancel = tokio_util::sync::CancellationToken::new();
+
+                        match crate::agent::external::claude_code::ClaudeCodeSession::spawn(
+                            &prompt, &cwd, event_tx,
+                        ).await {
+                            Ok(session) => {
+                                // Spawn the session driver as a background task
+                                tokio::spawn(session.drive());
+
+                                let handle = crate::agent::external::spawn_external_agent_session(
+                                    task_id, event_rx, cancel,
+                                );
+
+                                log::info!("Spawning external Claude Code agent {}", handle.task_id);
+
+                                return ToolOutcome::Subagent { handle };
+                            }
+                            Err(e) => {
+                                return ToolOutcome::Immediate {
+                                    content: format!("Failed to spawn Claude Code: {}", e),
+                                    is_error: true,
+                                };
+                            }
+                        }
+                    }
+                    _ => {
+                        return ToolOutcome::Immediate {
+                            content: format!("Unknown external agent: '{}'. Supported: claude_code", agent_name),
+                            is_error: true,
+                        };
+                    }
                 }
             }
 
@@ -635,6 +695,48 @@ mod tests {
                 "Expected Subagent outcome, got {:?}",
                 std::mem::discriminant(&other)
             ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_external_missing_agent_name() {
+        let tool = dummy_agent_tool();
+        let outcome = <AgentTool as Tool>::execute(
+            &tool,
+            r#"{"subagent_type":"external","prompt":"do something"}"#,
+        )
+        .await;
+        match outcome {
+            ToolOutcome::Immediate { content, is_error } => {
+                assert!(is_error);
+                assert!(
+                    content.contains("agent_name"),
+                    "expected 'agent_name', got: {}",
+                    content
+                );
+            }
+            _ => panic!("Expected Immediate outcome"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_external_unknown_agent() {
+        let tool = dummy_agent_tool();
+        let outcome = <AgentTool as Tool>::execute(
+            &tool,
+            r#"{"subagent_type":"external","prompt":"do something","agent_name":"nonexistent"}"#,
+        )
+        .await;
+        match outcome {
+            ToolOutcome::Immediate { content, is_error } => {
+                assert!(is_error);
+                assert!(
+                    content.contains("Unknown external agent"),
+                    "expected 'Unknown external agent', got: {}",
+                    content
+                );
+            }
+            _ => panic!("Expected Immediate outcome"),
         }
     }
 }

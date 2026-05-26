@@ -20,6 +20,9 @@ apps/macos/*.xcodeproj/xcuserdata/
 apps/macos/*.xcodeproj/project.xcworkspace/xcuserdata/
 apps/macos/.build/
 
+# Node
+node_modules/
+
 # Agent's Artifacts
 .review/**/*
 .plans/**/*

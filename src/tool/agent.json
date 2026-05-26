@@ -2,18 +2,22 @@
   "type": "function",
   "function": {
     "name": "agent",
-    "description": "Launch a subagent to handle a task autonomously. Choose the lightest subagent type that can accomplish the task.\n\n- **explore**: Read-only. Code search, finding definitions, tracing call chains.\n- **plan**: Read-only. Design implementation plans, analyze tradeoffs.\n- **general_purpose**: Full access. Write code, run builds, execute tests.\n- **computer_use**: Isolated GUI automation. Runs in a dedicated VM and may open apps, move the mouse, and send keys.\n\nDo not call this tool more than once for the same task — one agent per task is sufficient.",
+    "description": "Launch a subagent to handle a task autonomously. Choose the lightest subagent type that can accomplish the task.\n\n- **explore**: Read-only. Code search, finding definitions, tracing call chains.\n- **plan**: Read-only. Design implementation plans, analyze tradeoffs.\n- **general_purpose**: Full access. Write code, run builds, execute tests.\n- **computer_use**: Isolated GUI automation. Runs in a dedicated VM and may open apps, move the mouse, and send keys.\n- **external**: Dispatch to an external coding agent (Claude Code, Codex). Requires agent_name parameter.\n\nDo not call this tool more than once for the same task — one agent per task is sufficient.",
     "parameters": {
       "type": "object",
       "properties": {
         "subagent_type": {
           "type": "string",
-          "enum": ["explore", "plan", "general_purpose", "computer_use"],
+          "enum": ["explore", "plan", "general_purpose", "computer_use", "external"],
           "description": "The subagent execution strategy. Use 'explore' for read-only code search, 'plan' for read-only planning, 'general_purpose' for full tool access, 'computer_use' for isolated GUI automation."
         },
         "prompt": {
           "type": "string",
           "description": "A detailed description of the task for the subagent to perform. Include all necessary context — the subagent does not see the current conversation history."
+        },
+        "agent_name": {
+          "type": "string",
+          "description": "Name of the external agent to use. Required when subagent_type is 'external'. Currently supported: 'claude_code'."
         }
       },
       "required": ["subagent_type", "prompt"]
