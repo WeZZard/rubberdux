@@ -27,9 +27,11 @@ impl Mindset {
     }
 
     pub fn ensure_dirs(&self) -> Result<(), Error> {
-        std::fs::create_dir_all(&self.root).map_err(|e| {
-            Error::Mindset(format!("Failed to create {}: {}", self.root.display(), e))
-        })?;
+        for dir in [self.root.clone(), self.root.join("responsibilities")] {
+            std::fs::create_dir_all(&dir).map_err(|e| {
+                Error::Mindset(format!("Failed to create {}: {}", dir.display(), e))
+            })?;
+        }
         Ok(())
     }
 
@@ -41,8 +43,8 @@ impl Mindset {
         self.root.join("SOUL.md")
     }
 
-    pub fn responsibilities_path(&self) -> PathBuf {
-        self.root.join("responsibilities.md")
+    pub fn responsibilities_dir(&self) -> PathBuf {
+        self.root.join("responsibilities")
     }
 
     pub fn seed_defaults_if_empty(&self, seed_dir: &Path) {
@@ -80,6 +82,7 @@ mod tests {
         let (root, ms) = temp_mindset();
         ms.ensure_dirs().unwrap();
         assert!(root.exists());
+        assert!(root.join("responsibilities").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -96,7 +99,7 @@ mod tests {
         let (root, ms) = temp_mindset();
         assert_eq!(ms.identity_path(), root.join("IDENTITY.md"));
         assert_eq!(ms.soul_path(), root.join("SOUL.md"));
-        assert_eq!(ms.responsibilities_path(), root.join("responsibilities.md"));
+        assert_eq!(ms.responsibilities_dir(), root.join("responsibilities"));
     }
 
     #[test]

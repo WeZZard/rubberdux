@@ -61,10 +61,6 @@ pub fn build_subagent_registries(
             r.register(Box::new(crate::tool::task::TaskTool::new(ws.clone())));
         }
 
-        if let Some(ms) = mindset {
-            r.register(Box::new(crate::tool::mindset::MindsetTool::new(ms.clone())));
-        }
-
         r
     });
 
@@ -554,8 +550,8 @@ mod tests {
             .iter()
             .map(|d| d.function.name.clone())
             .collect();
-        assert_eq!(defs.len(), 9, "gp registry with mindset should have 9 tools, got {:?}", defs);
-        assert!(defs.contains(&"mindset".to_owned()), "gp registry should contain mindset tool");
+        assert_eq!(defs.len(), 8, "gp registry with mindset should have 8 tools (no mindset tool), got {:?}", defs);
+        assert!(!defs.contains(&"mindset".to_owned()), "gp registry should not contain mindset tool");
     }
 
     #[test]

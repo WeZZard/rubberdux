@@ -120,10 +120,6 @@ impl AgentLoopBuilder {
                 r.register(Box::new(crate::tool::task::TaskTool::new(ws.clone())));
             }
 
-            if let Some(ref ms) = self.mindset {
-                r.register(Box::new(crate::tool::mindset::MindsetTool::new(ms.clone())));
-            }
-
             for (_, processor) in &self.channel_processors {
                 for tool in processor.tools() {
                     r.register(tool);

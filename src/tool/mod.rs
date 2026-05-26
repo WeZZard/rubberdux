@@ -3,7 +3,6 @@ pub mod bash;
 pub mod edit;
 pub mod glob;
 pub mod grep;
-pub mod mindset;
 pub mod project;
 pub mod read;
 pub mod task;
