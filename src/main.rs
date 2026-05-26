@@ -15,6 +15,7 @@ mod frontmatter;
 mod mindset;
 mod workspace;
 mod vm;
+mod guardrail;
 
 #[cfg(feature = "host")]
 use teloxide::prelude::*;

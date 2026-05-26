@@ -32,6 +32,7 @@ pub struct AgentLoopBuilder {
     pub workspace: Option<Arc<crate::workspace::Workspace>>,
     pub mindset: Option<Arc<crate::mindset::Mindset>>,
     pub channel_processors: std::collections::HashMap<String, std::sync::Arc<dyn crate::channel::processor::ChannelProcessor>>,
+    pub guardrails: Option<crate::guardrail::GuardrailChain>,
 }
 
 impl AgentLoopBuilder {
@@ -46,6 +47,7 @@ impl AgentLoopBuilder {
             workspace: None,
             mindset: None,
             channel_processors: std::collections::HashMap::new(),
+            guardrails: None,
         }
     }
 
@@ -85,6 +87,11 @@ impl AgentLoopBuilder {
         processor: std::sync::Arc<dyn crate::channel::processor::ChannelProcessor>,
     ) -> Self {
         self.channel_processors.insert(name.into(), processor);
+        self
+    }
+
+    pub fn with_guardrails(mut self, guardrails: crate::guardrail::GuardrailChain) -> Self {
+        self.guardrails = Some(guardrails);
         self
     }
 
@@ -155,6 +162,7 @@ impl AgentLoopBuilder {
             compaction: Box::new(EvictOldestTurns),
             context_tx: Some(context_tx.clone()),
             channel_processors: self.channel_processors,
+            guardrails: self.guardrails.unwrap_or_else(crate::guardrail::GuardrailChain::new),
         };
 
         let (agent_loop, input_port) = AgentLoop::new(config).await;

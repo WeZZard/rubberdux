@@ -113,6 +113,7 @@ async fn test_tool_entry_ids_persisted_and_broadcast() {
         compaction: Box::new(EvictOldestTurns),
         context_tx: None,
         channel_processors: std::collections::HashMap::new(),
+        guardrails: rubberdux::guardrail::GuardrailChain::new(),
     };
 
     let (agent_loop, input_port) = AgentLoop::new(config).await;

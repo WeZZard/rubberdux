@@ -61,6 +61,15 @@ impl Mindset {
     }
 }
 
+pub fn convention() -> crate::guardrail::Convention {
+    crate::guardrail::Convention {
+        name: "Responsibilities".into(),
+        guidance: include_str!("convention.md").into(),
+        pre_guardrails: vec![],
+        post_guardrails: vec![],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

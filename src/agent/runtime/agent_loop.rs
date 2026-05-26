@@ -60,6 +60,7 @@ pub struct AgentLoopConfig {
     pub compaction: Box<dyn CompactionStrategy>,
     pub context_tx: Option<broadcast::Sender<ContextEvent>>,
     pub channel_processors: HashMap<String, Arc<dyn crate::channel::processor::ChannelProcessor>>,
+    pub guardrails: crate::guardrail::GuardrailChain,
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +105,10 @@ pub struct AgentLoop {
 
     // Compaction
     compaction: Box<dyn CompactionStrategy>,
+
+    // Guardrails
+    guardrails: crate::guardrail::GuardrailChain,
+    guardrail_retries: u8,
 
     // Cancellation
     cancel: CancellationToken,
@@ -187,6 +192,8 @@ impl AgentLoop {
             active_groups: TaskGroupSet::new(),
             channel_processors: config.channel_processors,
             compaction: config.compaction,
+            guardrails: config.guardrails,
+            guardrail_retries: 0,
             cancel: config.cancel,
         };
 
@@ -437,6 +444,7 @@ impl AgentLoop {
     ) {
         self.current_origin = origin.clone();
         self.current_channel_metadata = channel_metadata.clone();
+        self.guardrail_retries = 0;
 
         let entry_id = self
             .history
@@ -505,6 +513,82 @@ impl AgentLoop {
                 completion_tokens,
             } => {
                 log::info!("handle_turn_outcome: Text entry_id={} origin={:?} has_metadata={}", entry_id, self.current_origin, self.current_channel_metadata.is_some());
+
+                // Run post-guardrails on the assistant response content.
+                let content = self
+                    .history
+                    .get(entry_id)
+                    .map(|e| e.message.content_text().to_owned())
+                    .unwrap_or_default();
+                let guardrail_action = self.guardrails.run_post(&content);
+
+                match guardrail_action {
+                    crate::guardrail::PostGuardrailAction::Passed => {
+                        // Proceed as before.
+                    }
+                    crate::guardrail::PostGuardrailAction::Repaired(new_content) => {
+                        // Update the entry's message content with the repaired text.
+                        if let Some(entry) = self.history.get_mut(entry_id) {
+                            if let Message::Assistant { ref mut content, .. } = entry.message {
+                                *content = Some(new_content);
+                            }
+                        }
+                    }
+                    crate::guardrail::PostGuardrailAction::NeedsRetry => {
+                        if self.guardrail_retries < 1 {
+                            self.guardrail_retries += 1;
+                            log::warn!(
+                                "Guardrail requested retry for entry {} (attempt {})",
+                                entry_id,
+                                self.guardrail_retries
+                            );
+
+                            // Push a correction message to guide the LLM.
+                            let correction_msg = Message::User {
+                                content: UserContent::Text(
+                                    "Your previous response is missing the closing </telegram-message> tag. \
+                                     Please rewrite your complete response with the tag properly closed.".into()
+                                ),
+                            };
+                            let correction_id = self.history.push_user_with_metadata(
+                                correction_msg,
+                                EntryOrigin::System,
+                                None,
+                            );
+                            self.persist_entry(correction_id).await;
+
+                            // Continue the loop for another turn.
+                            self.state = AgentState::WaitingForResponse;
+                            return true;
+                        } else {
+                            log::error!(
+                                "Guardrail retry exhausted for entry {}; skipping outbound processing",
+                                entry_id
+                            );
+                            // Retries exhausted — persist and notify but skip
+                            // channel processor (do not send to user).
+                            self.persist_entry(entry_id).await;
+                            self.record_message("message.recorded", entry_id, "assistant", true);
+                            self.notify_entry(entry_id, true);
+
+                            self.record(
+                                "turn.completed",
+                                Some(turn_id),
+                                serde_json::json!({
+                                    "outcome": "text_guardrail_exhausted",
+                                    "entry_id": entry_id,
+                                    "prompt_tokens": prompt_tokens,
+                                    "completion_tokens": completion_tokens,
+                                }),
+                            );
+
+                            self.state = AgentState::Idle;
+                            return false;
+                        }
+                    }
+                }
+
+                // Passed or Repaired: run channel processor and proceed normally.
                 if let EntryOrigin::User { ref channel } = self.current_origin {
                     if let Some(processor) = self.channel_processors.get(channel) {
                         if let Some(ref metadata) = self.current_channel_metadata {

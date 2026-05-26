@@ -55,6 +55,15 @@ impl Workspace {
     }
 }
 
+pub fn convention() -> crate::guardrail::Convention {
+    crate::guardrail::Convention {
+        name: "Workspace".into(),
+        guidance: include_str!("convention.md").into(),
+        pre_guardrails: vec![],
+        post_guardrails: vec![],
+    }
+}
+
 pub use crate::frontmatter::{parse_yaml_front_matter, format_yaml_front_matter};
 
 #[cfg(test)]

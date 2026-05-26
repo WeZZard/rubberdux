@@ -65,6 +65,7 @@ impl AgentLoopHarness {
             compaction: Box::new(EvictOldestTurns),
             context_tx: None,
             channel_processors: std::collections::HashMap::new(),
+            guardrails: rubberdux::guardrail::GuardrailChain::new(),
         };
 
         let (agent_loop, input_port) = AgentLoop::new(config).await;

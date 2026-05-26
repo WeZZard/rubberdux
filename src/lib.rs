@@ -16,3 +16,4 @@ pub mod mindset;
 pub mod trajectory;
 #[cfg(feature = "host")]
 pub mod vm;
+pub mod guardrail;

@@ -71,6 +71,7 @@ fn build_config(
         compaction: Box::new(EvictOldestTurns),
         context_tx: None,
         channel_processors,
+        guardrails: rubberdux::guardrail::GuardrailChain::new(),
     };
 
     (config, artifact_dir)

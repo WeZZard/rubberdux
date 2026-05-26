@@ -183,7 +183,16 @@ pub async fn run(_config: HostConfig, bot: Bot) {
 
     log::info!("Workspace root: {}", workspace.root.display());
 
-    let prompt_parts = crate::hardened_prompts::load_prompt_parts(&mindset.root);
+    let mut conventions = crate::guardrail::ConventionRegistry::new();
+    conventions.register(crate::channel::adapter::telegram_guardrails::convention());
+    conventions.register(crate::workspace::convention());
+    conventions.register(crate::mindset::convention());
+
+    let convention_guidance = conventions.compose_guidance();
+    let guardrails = conventions.build_guardrail_chain();
+
+    let mut prompt_parts = crate::hardened_prompts::load_prompt_parts(&mindset.root);
+    prompt_parts.push(convention_guidance);
     let channel_partial = Some(crate::channel::adapter::telegram::channel_prompt());
     let system_prompt =
         crate::hardened_prompts::compose_system_prompt(&prompt_parts, channel_partial);
@@ -220,6 +229,7 @@ pub async fn run(_config: HostConfig, bot: Bot) {
         .with_workspace(workspace)
         .with_mindset(mindset.clone())
         .with_channel_processor("telegram", telegram_processor)
+        .with_guardrails(guardrails)
         .with_recorder(broadcast_recorder);
     let (agent_loop, input_port, _context_tx) = builder.build(client).await;
 
