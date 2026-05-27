@@ -6,22 +6,26 @@ use tokio::sync::mpsc;
 
 use crate::error::Error;
 
-use super::{ExternalAgentEvent, QuestionOption, UIInteractionRequest};
+use super::{ExternalAgentEvent, QuestionOption, UIInteractionRequest, UIInteractionResponse};
 
 pub struct ClaudeCodeSession {
     child: Child,
     stdin: BufWriter<ChildStdin>,
     stdout_lines: Lines<BufReader<ChildStdout>>,
     event_tx: mpsc::Sender<ExternalAgentEvent>,
+    response_rx: mpsc::Receiver<UIInteractionResponse>,
 }
 
 impl ClaudeCodeSession {
     /// Spawn a Claude Code session via the bridge script.
+    ///
+    /// Returns the session and a sender for forwarding UI interaction responses
+    /// back to the bridge process.
     pub async fn spawn(
         prompt: &str,
         cwd: &Path,
         event_tx: mpsc::Sender<ExternalAgentEvent>,
-    ) -> Result<Self, Error> {
+    ) -> Result<(Self, mpsc::Sender<UIInteractionResponse>), Error> {
         // Find the bridge script relative to the current binary or project root
         let bridge_path = std::env::current_dir()
             .unwrap_or_default()
@@ -45,11 +49,14 @@ impl ClaudeCodeSession {
             .take()
             .ok_or_else(|| Error::Provider("Failed to capture bridge stdout".into()))?;
 
+        let (response_tx, response_rx) = mpsc::channel(32);
+
         let mut session = Self {
             child,
             stdin: BufWriter::new(stdin),
             stdout_lines: BufReader::new(stdout).lines(),
             event_tx,
+            response_rx,
         };
 
         // Send the start command
@@ -61,7 +68,7 @@ impl ClaudeCodeSession {
         });
         session.send_command(&start_cmd).await?;
 
-        Ok(session)
+        Ok((session, response_tx))
     }
 
     async fn send_command(&mut self, cmd: &serde_json::Value) -> Result<(), Error> {
@@ -83,13 +90,32 @@ impl ClaudeCodeSession {
     }
 
     /// Drive the event loop: read events from bridge stdout, forward to event_tx.
+    /// Also receives UI interaction responses and forwards them to the bridge.
     /// Call this from a spawned tokio task.
     pub async fn drive(mut self) {
-        while let Ok(Some(line)) = self.stdout_lines.next_line().await {
-            if let Some(event) = parse_bridge_event(&line) {
-                if self.event_tx.send(event).await.is_err() {
-                    log::warn!("External agent event receiver dropped");
-                    break;
+        loop {
+            tokio::select! {
+                line = self.stdout_lines.next_line() => {
+                    match line {
+                        Ok(Some(line)) => {
+                            if let Some(event) = parse_bridge_event(&line) {
+                                if self.event_tx.send(event).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                response = self.response_rx.recv() => {
+                    match response {
+                        Some(resp) => {
+                            if let Err(e) = self.forward_response(resp).await {
+                                log::warn!("Failed to forward response to bridge: {}", e);
+                            }
+                        }
+                        None => {} // channel closed, senders dropped
+                    }
                 }
             }
         }
@@ -100,6 +126,30 @@ impl ClaudeCodeSession {
                 result: "Claude Code session ended".into(),
             })
             .await;
+    }
+
+    async fn forward_response(&mut self, response: UIInteractionResponse) -> Result<(), Error> {
+        let cmd = match response {
+            UIInteractionResponse::SelectedOption { request_id, index } => {
+                serde_json::json!({"type": "answer_question", "requestId": request_id, "selectedIndex": index})
+            }
+            UIInteractionResponse::PlanApproved { request_id } => {
+                serde_json::json!({"type": "approve_plan", "requestId": request_id})
+            }
+            UIInteractionResponse::PlanRejected {
+                request_id,
+                feedback,
+            } => {
+                serde_json::json!({"type": "reject_plan", "requestId": request_id, "feedback": feedback})
+            }
+            UIInteractionResponse::PermissionGranted { request_id } => {
+                serde_json::json!({"type": "approve_plan", "requestId": request_id})
+            }
+            UIInteractionResponse::PermissionDenied { request_id, reason } => {
+                serde_json::json!({"type": "reject_plan", "requestId": request_id, "feedback": reason})
+            }
+        };
+        self.send_command(&cmd).await
     }
 
     pub async fn cancel(&mut self) {
@@ -260,5 +310,89 @@ mod tests {
     #[test]
     fn test_parse_invalid_json() {
         assert!(parse_bridge_event("not json").is_none());
+    }
+
+    #[test]
+    fn test_forward_response_json_selected_option() {
+        let response = UIInteractionResponse::SelectedOption {
+            request_id: "q-1".into(),
+            index: 2,
+        };
+        let cmd = match response {
+            UIInteractionResponse::SelectedOption { request_id, index } => {
+                serde_json::json!({"type": "answer_question", "requestId": request_id, "selectedIndex": index})
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(cmd["type"], "answer_question");
+        assert_eq!(cmd["requestId"], "q-1");
+        assert_eq!(cmd["selectedIndex"], 2);
+    }
+
+    #[test]
+    fn test_forward_response_json_plan_approved() {
+        let response = UIInteractionResponse::PlanApproved {
+            request_id: "p-1".into(),
+        };
+        let cmd = match response {
+            UIInteractionResponse::PlanApproved { request_id } => {
+                serde_json::json!({"type": "approve_plan", "requestId": request_id})
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(cmd["type"], "approve_plan");
+        assert_eq!(cmd["requestId"], "p-1");
+    }
+
+    #[test]
+    fn test_forward_response_json_plan_rejected() {
+        let response = UIInteractionResponse::PlanRejected {
+            request_id: "p-2".into(),
+            feedback: "needs more detail".into(),
+        };
+        let cmd = match response {
+            UIInteractionResponse::PlanRejected {
+                request_id,
+                feedback,
+            } => {
+                serde_json::json!({"type": "reject_plan", "requestId": request_id, "feedback": feedback})
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(cmd["type"], "reject_plan");
+        assert_eq!(cmd["requestId"], "p-2");
+        assert_eq!(cmd["feedback"], "needs more detail");
+    }
+
+    #[test]
+    fn test_forward_response_json_permission_granted() {
+        let response = UIInteractionResponse::PermissionGranted {
+            request_id: "perm-1".into(),
+        };
+        let cmd = match response {
+            UIInteractionResponse::PermissionGranted { request_id } => {
+                serde_json::json!({"type": "approve_plan", "requestId": request_id})
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(cmd["type"], "approve_plan");
+        assert_eq!(cmd["requestId"], "perm-1");
+    }
+
+    #[test]
+    fn test_forward_response_json_permission_denied() {
+        let response = UIInteractionResponse::PermissionDenied {
+            request_id: "perm-2".into(),
+            reason: "not allowed".into(),
+        };
+        let cmd = match response {
+            UIInteractionResponse::PermissionDenied { request_id, reason } => {
+                serde_json::json!({"type": "reject_plan", "requestId": request_id, "feedback": reason})
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(cmd["type"], "reject_plan");
+        assert_eq!(cmd["requestId"], "perm-2");
+        assert_eq!(cmd["feedback"], "not allowed");
     }
 }

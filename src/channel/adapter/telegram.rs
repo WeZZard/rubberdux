@@ -5,13 +5,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use teloxide::prelude::*;
-use teloxide::types::{MessageReactionUpdated, ReactionType};
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageReactionUpdated, ReactionType};
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 
 use super::markup::{self, Document, MessageElement, Node};
 use super::parser::{self, Segment};
 use crate::agent::entry::{Entry, EntryOrigin};
+use crate::agent::external::interaction_queue::InteractionQueue;
+use crate::agent::external::{UIInteractionRequest, UIInteractionResponse};
 use crate::agent::runtime::port::{EntryNotification, InputPort, InternalMutation, LoopEvent};
 use crate::channel::interpreter;
 use crate::channel::processor::ChannelProcessor;
@@ -161,12 +163,62 @@ pub fn inject_assistant_message_id(text: &mut String, msg_id: i32) {
     }
 }
 
+/// Builds an inline keyboard from all pending interaction requests in the queue.
+///
+/// Returns `None` when there are no pending requests so callers can skip
+/// attaching a reply markup to their outbound message.
+pub fn build_interaction_keyboard(queue: &InteractionQueue) -> Option<InlineKeyboardMarkup> {
+    let requests = queue.pending_requests();
+    if requests.is_empty() {
+        return None;
+    }
+
+    let mut rows: Vec<Vec<InlineKeyboardButton>> = Vec::new();
+
+    for request in &requests {
+        match request {
+            UIInteractionRequest::Question { request_id, options, .. } => {
+                let option_buttons: Vec<InlineKeyboardButton> = options.iter().enumerate()
+                    .map(|(i, opt)| {
+                        InlineKeyboardButton::callback(
+                            opt.label.clone(),
+                            format!("{}:{}", request_id, i),
+                        )
+                    })
+                    .collect();
+                if !option_buttons.is_empty() {
+                    rows.push(option_buttons);
+                }
+            }
+            UIInteractionRequest::PlanApproval { request_id, .. } => {
+                rows.push(vec![
+                    InlineKeyboardButton::callback("Approve", format!("{}:approve", request_id)),
+                    InlineKeyboardButton::callback("Reject", format!("{}:reject", request_id)),
+                ]);
+            }
+            UIInteractionRequest::PermissionRequest { request_id, .. } => {
+                rows.push(vec![
+                    InlineKeyboardButton::callback("Allow", format!("{}:grant", request_id)),
+                    InlineKeyboardButton::callback("Deny", format!("{}:deny", request_id)),
+                ]);
+            }
+        }
+    }
+
+    if rows.is_empty() {
+        None
+    } else {
+        Some(InlineKeyboardMarkup::new(rows))
+    }
+}
+
 /// Run the Telegram adapter.
 pub async fn run(
     bot: Bot,
     input_port: InputPort,
     entry_rx: broadcast::Receiver<EntryNotification>,
     chat_id: Arc<Mutex<Option<i64>>>,
+    interaction_queue: Arc<InteractionQueue>,
 ) {
     let reactions_fetched = Arc::new(AtomicBool::new(false));
     let entry_cache: Arc<Mutex<HashMap<usize, Entry>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -181,10 +233,11 @@ pub async fn run(
     // Run teloxide dispatcher
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(handle_message))
-        .branch(Update::filter_message_reaction_updated().endpoint(handle_reaction));
+        .branch(Update::filter_message_reaction_updated().endpoint(handle_reaction))
+        .branch(Update::filter_callback_query().endpoint(handle_callback_query));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![input_port, reactions_fetched, entry_cache, chat_id])
+        .dependencies(dptree::deps![input_port, reactions_fetched, entry_cache, chat_id, interaction_queue])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
@@ -345,6 +398,64 @@ async fn handle_reaction(
     Ok(())
 }
 
+async fn handle_callback_query(
+    bot: Bot,
+    q: teloxide::types::CallbackQuery,
+    interaction_queue: Arc<InteractionQueue>,
+) -> Result<(), teloxide::RequestError> {
+    let data = q.data.clone().unwrap_or_default();
+    let (request_id, action) = match data.split_once(':') {
+        Some((id, act)) => (id, act),
+        None => {
+            let _ = bot.answer_callback_query(&q.id).await;
+            return Ok(());
+        }
+    };
+
+    let response = match action {
+        "approve" => UIInteractionResponse::PlanApproved {
+            request_id: request_id.into(),
+        },
+        "reject" => UIInteractionResponse::PlanRejected {
+            request_id: request_id.into(),
+            feedback: String::new(),
+        },
+        "grant" => UIInteractionResponse::PermissionGranted {
+            request_id: request_id.into(),
+        },
+        "deny" => UIInteractionResponse::PermissionDenied {
+            request_id: request_id.into(),
+            reason: String::new(),
+        },
+        idx => {
+            if let Ok(index) = idx.parse::<usize>() {
+                UIInteractionResponse::SelectedOption {
+                    request_id: request_id.into(),
+                    index,
+                }
+            } else {
+                let _ = bot.answer_callback_query(&q.id).await;
+                return Ok(());
+            }
+        }
+    };
+
+    let resolved = interaction_queue.resolve(request_id, response);
+
+    let _ = bot.answer_callback_query(&q.id).await;
+    if resolved {
+        if let Some(msg) = q.message {
+            let chat = msg.chat();
+            let msg_id = msg.id();
+            let _ = bot
+                .edit_message_text(chat.id, msg_id, format!("Responded: {}", action))
+                .await;
+        }
+    }
+
+    Ok(())
+}
+
 async fn fetch_and_send_reactions(bot: &Bot, chat_id: ChatId, input_port: &InputPort) {
     let emojis: Vec<String> = match bot.get_chat(chat_id).await {
         Ok(chat) => match chat.available_reactions {
@@ -380,11 +491,21 @@ async fn fetch_and_send_reactions(bot: &Bot, chat_id: ChatId, input_port: &Input
 pub struct TelegramChannelProcessor {
     bot: Bot,
     chat_id: Arc<Mutex<Option<i64>>>,
+    interaction_queue: Option<Arc<InteractionQueue>>,
 }
 
 impl TelegramChannelProcessor {
     pub fn new(bot: Bot, chat_id: Arc<Mutex<Option<i64>>>) -> Self {
-        Self { bot, chat_id }
+        Self {
+            bot,
+            chat_id,
+            interaction_queue: None,
+        }
+    }
+
+    pub fn with_interaction_queue(mut self, queue: Arc<InteractionQueue>) -> Self {
+        self.interaction_queue = Some(queue);
+        self
     }
 }
 
@@ -449,6 +570,11 @@ impl ChannelProcessor for TelegramChannelProcessor {
                     log::info!("Channel processor: sending message to chat_id={} (content_len={})", chat_id, content.len());
                     let formatted = super::markdown::format(content);
 
+                    // Check for pending interaction buttons to attach
+                    let keyboard = self.interaction_queue
+                        .as_ref()
+                        .and_then(|q| build_interaction_keyboard(q));
+
                     let mut req = self
                         .bot
                         .send_message(ChatId(chat_id), &formatted)
@@ -459,6 +585,9 @@ impl ChannelProcessor for TelegramChannelProcessor {
                                 teloxide::types::MessageId(reply_id),
                             ),
                         );
+                    }
+                    if let Some(ref kb) = keyboard {
+                        req = req.reply_markup(kb.clone());
                     }
                     let sent_msg = req.await;
 
@@ -473,6 +602,9 @@ impl ChannelProcessor for TelegramChannelProcessor {
                                         teloxide::types::MessageId(reply_id),
                                     ),
                                 );
+                            }
+                            if let Some(ref kb) = keyboard {
+                                fallback = fallback.reply_markup(kb.clone());
                             }
                             match fallback.await {
                                 Ok(m) => {

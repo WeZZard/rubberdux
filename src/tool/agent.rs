@@ -87,6 +87,12 @@ pub struct AgentTool {
     rpc_writer: Option<Arc<Mutex<OwnedWriteHalf>>>,
     /// Working directory for external agent sessions (e.g. Claude Code).
     external_cwd: Option<PathBuf>,
+    /// Shared interaction queue for external agent UI interactions.
+    interaction_queue: Option<Arc<crate::agent::external::interaction_queue::InteractionQueue>>,
+    /// Channel to send UI interaction responses back to the external agent bridge.
+    interaction_response_tx: Option<tokio::sync::mpsc::Sender<crate::agent::external::UIInteractionResponse>>,
+    /// Channel to notify about new UI interaction requests (e.g. for Telegram buttons).
+    interaction_notify_tx: Option<tokio::sync::mpsc::Sender<crate::agent::external::UIInteractionRequest>>,
 }
 
 impl AgentTool {
@@ -107,6 +113,9 @@ impl AgentTool {
             session_id,
             rpc_writer: None,
             external_cwd: None,
+            interaction_queue: None,
+            interaction_response_tx: None,
+            interaction_notify_tx: None,
         }
     }
 
@@ -117,6 +126,18 @@ impl AgentTool {
 
     pub fn with_external_cwd(mut self, cwd: Option<PathBuf>) -> Self {
         self.external_cwd = cwd;
+        self
+    }
+
+    pub fn with_interaction_queue(
+        mut self,
+        queue: Arc<crate::agent::external::interaction_queue::InteractionQueue>,
+        response_tx: tokio::sync::mpsc::Sender<crate::agent::external::UIInteractionResponse>,
+        notify_tx: tokio::sync::mpsc::Sender<crate::agent::external::UIInteractionRequest>,
+    ) -> Self {
+        self.interaction_queue = Some(queue);
+        self.interaction_response_tx = Some(response_tx);
+        self.interaction_notify_tx = Some(notify_tx);
         self
     }
 }
@@ -220,12 +241,31 @@ impl super::Tool for AgentTool {
                         match crate::agent::external::claude_code::ClaudeCodeSession::spawn(
                             &prompt, &cwd, event_tx,
                         ).await {
-                            Ok(session) => {
+                            Ok((session, _response_tx)) => {
                                 // Spawn the session driver as a background task
                                 tokio::spawn(session.drive());
 
+                                let (resp_tx, resp_notify_tx, iq) = match (
+                                    &self.interaction_response_tx,
+                                    &self.interaction_notify_tx,
+                                    &self.interaction_queue,
+                                ) {
+                                    (Some(rt), Some(nt), Some(q)) => {
+                                        (rt.clone(), nt.clone(), q.clone())
+                                    }
+                                    _ => {
+                                        let (rt, _) = tokio::sync::mpsc::channel(8);
+                                        let (nt, _) = tokio::sync::mpsc::channel(8);
+                                        let q = Arc::new(
+                                            crate::agent::external::interaction_queue::InteractionQueue::new(),
+                                        );
+                                        (rt, nt, q)
+                                    }
+                                };
+
                                 let handle = crate::agent::external::spawn_external_agent_session(
                                     task_id, event_rx, cancel,
+                                    resp_tx, iq, resp_notify_tx,
                                 );
 
                                 log::info!("Spawning external Claude Code agent {}", handle.task_id);
