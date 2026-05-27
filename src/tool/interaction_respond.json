@@ -1,0 +1,30 @@
+{
+  "type": "function",
+  "function": {
+    "name": "interaction_respond",
+    "description": "Respond to a pending external agent interaction. Use this after investigating a question or reviewing a plan. The request_id comes from the injected interaction message.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "description": "The request ID of the pending interaction."
+        },
+        "response_type": {
+          "type": "string",
+          "enum": ["select_option", "approve_plan", "reject_plan", "grant_permission", "deny_permission"],
+          "description": "The type of response."
+        },
+        "index": {
+          "type": "integer",
+          "description": "Option index. Required when response_type is select_option."
+        },
+        "feedback": {
+          "type": "string",
+          "description": "Feedback text. Used with reject_plan or deny_permission."
+        }
+      },
+      "required": ["request_id", "response_type"]
+    }
+  }
+}

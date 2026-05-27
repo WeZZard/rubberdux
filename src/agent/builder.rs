@@ -34,6 +34,7 @@ pub struct AgentLoopBuilder {
     pub channel_processors: std::collections::HashMap<String, std::sync::Arc<dyn crate::channel::processor::ChannelProcessor>>,
     pub guardrails: Option<crate::guardrail::GuardrailChain>,
     pub external_cwd: Option<std::path::PathBuf>,
+    pub interaction_queue: Option<Arc<crate::agent::external::interaction_queue::InteractionQueue>>,
 }
 
 impl AgentLoopBuilder {
@@ -50,6 +51,7 @@ impl AgentLoopBuilder {
             channel_processors: std::collections::HashMap::new(),
             guardrails: None,
             external_cwd: None,
+            interaction_queue: None,
         }
     }
 
@@ -102,6 +104,14 @@ impl AgentLoopBuilder {
         self
     }
 
+    pub fn with_interaction_queue(
+        mut self,
+        queue: Arc<crate::agent::external::interaction_queue::InteractionQueue>,
+    ) -> Self {
+        self.interaction_queue = Some(queue);
+        self
+    }
+
     /// Build the AgentLoop and return it along with its input port and context broadcaster.
     pub async fn build(
         self,
@@ -140,16 +150,32 @@ impl AgentLoopBuilder {
                 }
             }
 
+            if let Some(ref queue) = self.interaction_queue {
+                r.register(Box::new(crate::tool::interaction_respond::InteractionRespondTool::new(queue.clone())));
+            }
+
             if self.with_agent_tool {
                 let subagent_registries = build_subagent_registries(&client, &self.workspace, &self.mindset);
-                r.register(Box::new(AgentTool::new(
+                let mut agent_tool = AgentTool::new(
                     client.clone(),
                     subagent_registries,
                     self.system_prompt.clone(),
                     context_tx.clone(),
                     Some(self.session_manager.clone()),
                     Some(session_id.clone()),
-                ).with_external_cwd(self.external_cwd.clone())));
+                ).with_external_cwd(self.external_cwd.clone());
+
+                if let Some(ref queue) = self.interaction_queue {
+                    let (response_tx, _response_rx) = tokio::sync::mpsc::channel(32);
+                    let (notify_tx, _notify_rx) = tokio::sync::mpsc::channel(32);
+                    agent_tool = agent_tool.with_interaction_queue(
+                        queue.clone(),
+                        response_tx,
+                        notify_tx,
+                    );
+                }
+
+                r.register(Box::new(agent_tool));
             }
 
             r

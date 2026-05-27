@@ -183,10 +183,15 @@ pub async fn run(_config: HostConfig, bot: Bot) {
 
     log::info!("Workspace root: {}", workspace.root.display());
 
+    let interaction_queue = std::sync::Arc::new(
+        crate::agent::external::interaction_queue::InteractionQueue::new(),
+    );
+
     let mut conventions = crate::guardrail::ConventionRegistry::new();
     conventions.register(crate::channel::adapter::telegram_guardrails::convention());
     conventions.register(crate::workspace::convention());
     conventions.register(crate::mindset::convention());
+    conventions.register(crate::agent::external::convention(interaction_queue.clone()));
 
     let convention_guidance = conventions.compose_guidance();
     let guardrails = conventions.build_guardrail_chain();
@@ -218,9 +223,6 @@ pub async fn run(_config: HostConfig, bot: Bot) {
     let gateway_system_prompt = system_prompt.clone();
     let telegram_chat_id: std::sync::Arc<tokio::sync::Mutex<Option<i64>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(None));
-    let interaction_queue = std::sync::Arc::new(
-        crate::agent::external::interaction_queue::InteractionQueue::new(),
-    );
     let telegram_processor = std::sync::Arc::new(
         crate::channel::adapter::telegram::TelegramChannelProcessor::new(
             bot.clone(),
@@ -235,7 +237,8 @@ pub async fn run(_config: HostConfig, bot: Bot) {
         .with_channel_processor("telegram", telegram_processor)
         .with_guardrails(guardrails)
         .with_recorder(broadcast_recorder)
-        .with_external_cwd(project_root.clone());
+        .with_external_cwd(project_root.clone())
+        .with_interaction_queue(interaction_queue.clone());
     let (agent_loop, input_port, _context_tx) = builder.build(client).await;
 
     // Subscribe to entry broadcasts for the Telegram adapter

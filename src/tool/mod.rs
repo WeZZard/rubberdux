@@ -3,6 +3,7 @@ pub mod bash;
 pub mod edit;
 pub mod glob;
 pub mod grep;
+pub mod interaction_respond;
 pub mod project;
 pub mod read;
 pub mod task;

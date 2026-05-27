@@ -93,6 +93,8 @@ pub struct AgentTool {
     interaction_response_tx: Option<tokio::sync::mpsc::Sender<crate::agent::external::UIInteractionResponse>>,
     /// Channel to notify about new UI interaction requests (e.g. for Telegram buttons).
     interaction_notify_tx: Option<tokio::sync::mpsc::Sender<crate::agent::external::UIInteractionRequest>>,
+    /// Input port for injecting interaction messages into the parent agent loop.
+    input_port: Option<crate::agent::runtime::port::InputPort>,
 }
 
 impl AgentTool {
@@ -116,6 +118,7 @@ impl AgentTool {
             interaction_queue: None,
             interaction_response_tx: None,
             interaction_notify_tx: None,
+            input_port: None,
         }
     }
 
@@ -138,6 +141,11 @@ impl AgentTool {
         self.interaction_queue = Some(queue);
         self.interaction_response_tx = Some(response_tx);
         self.interaction_notify_tx = Some(notify_tx);
+        self
+    }
+
+    pub fn with_input_port(mut self, input_port: crate::agent::runtime::port::InputPort) -> Self {
+        self.input_port = Some(input_port);
         self
     }
 }
@@ -263,9 +271,14 @@ impl super::Tool for AgentTool {
                                     }
                                 };
 
+                                let ip = self.input_port.clone().unwrap_or_else(|| {
+                                    let (tx, _) = tokio::sync::mpsc::channel(8);
+                                    crate::agent::runtime::port::InputPort::new(tx)
+                                });
+
                                 let handle = crate::agent::external::spawn_external_agent_session(
                                     task_id, event_rx, cancel,
-                                    resp_tx, iq, resp_notify_tx,
+                                    resp_tx, iq, resp_notify_tx, ip,
                                 );
 
                                 log::info!("Spawning external Claude Code agent {}", handle.task_id);

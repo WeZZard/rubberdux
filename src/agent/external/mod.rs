@@ -1,4 +1,5 @@
 pub mod claude_code;
+pub mod guardrails;
 pub mod interaction_queue;
 
 use std::sync::Arc;
@@ -74,9 +75,75 @@ fn get_request_id(request: &UIInteractionRequest) -> &str {
     }
 }
 
+pub fn convention(
+    interaction_queue: std::sync::Arc<interaction_queue::InteractionQueue>,
+) -> crate::guardrail::Convention {
+    crate::guardrail::Convention {
+        name: "External Agent Interactions".into(),
+        guidance: include_str!("convention.md").into(),
+        pre_guardrails: vec![Box::new(guardrails::SafetyGateGuardrail)],
+        post_guardrails: vec![Box::new(guardrails::InteractionActionGuardrail::new(
+            interaction_queue,
+        ))],
+    }
+}
+
+/// Formats a UIInteractionRequest into a human-readable message for injection
+/// into the agent conversation loop.
+fn format_interaction_message(request: &UIInteractionRequest, task_id: &str) -> String {
+    match request {
+        UIInteractionRequest::Question {
+            request_id,
+            text,
+            options,
+            ..
+        } => {
+            let mut msg = format!(
+                "[External agent interaction — task {}]\nType: Question\nText: \"{}\"\n",
+                task_id, text
+            );
+            if !options.is_empty() {
+                msg.push_str("Options:\n");
+                for (i, opt) in options.iter().enumerate() {
+                    msg.push_str(&format!("  {}: {} — {}\n", i, opt.label, opt.description));
+                }
+            }
+            msg.push_str(&format!("\nRequest ID: {}\n\n", request_id));
+            msg.push_str("Investigate by searching the codebase for evidence. If you find a definitive answer, call interaction_respond. If you cannot determine the answer, let it remain pending for the user.");
+            msg
+        }
+        UIInteractionRequest::PlanApproval {
+            request_id,
+            plan_text,
+            ..
+        } => {
+            let preview = if plan_text.len() > 2000 {
+                &plan_text[..2000]
+            } else {
+                plan_text.as_str()
+            };
+            format!(
+                "[External agent interaction — plan review]\nAgent task: {}\nRequest ID: {}\n\nPlan:\n{}\n\nSpawn review subagents to check format, consistency, design, and completeness. Present findings to the user. Do not auto-approve.",
+                task_id, request_id, preview
+            )
+        }
+        UIInteractionRequest::PermissionRequest {
+            request_id,
+            description,
+            ..
+        } => {
+            format!(
+                "[External agent interaction — permission request]\nAgent task: {}\nRequest ID: {}\nAction: {}\n\nEvaluate if this is a safe operation. If safe, call interaction_respond to grant. If dangerous or uncertain, let it remain pending for the user.",
+                task_id, request_id, description
+            )
+        }
+    }
+}
+
 /// Spawns a tokio task that drives an external agent event loop.
 /// Forwards Completed/Failed to SubagentResult. Logs other events.
-/// UI interaction requests are queued and forwarded for notification.
+/// UI interaction requests are queued and forwarded for notification,
+/// and also injected into the parent agent conversation via `input_port`.
 pub fn spawn_external_agent_session(
     task_id: String,
     mut event_rx: tokio::sync::mpsc::Receiver<ExternalAgentEvent>,
@@ -84,6 +151,7 @@ pub fn spawn_external_agent_session(
     response_tx: tokio::sync::mpsc::Sender<UIInteractionResponse>,
     interaction_queue: Arc<interaction_queue::InteractionQueue>,
     interaction_notify_tx: tokio::sync::mpsc::Sender<UIInteractionRequest>,
+    input_port: crate::agent::runtime::port::InputPort,
 ) -> SubagentHandle {
     let (result_tx, result_rx) = oneshot::channel();
     let cancel_clone = cancel.clone();
@@ -122,7 +190,17 @@ pub fn spawn_external_agent_session(
                             );
 
                             // Notify (Telegram will show buttons)
-                            let _ = interaction_notify_tx.send(request).await;
+                            let _ = interaction_notify_tx.send(request.clone()).await;
+
+                            // Inject the interaction as a user message into the parent agent loop
+                            let injection_text = format_interaction_message(&request, &task_id);
+                            let injection_message = crate::provider::moonshot::Message::User {
+                                content: crate::provider::moonshot::UserContent::Text(injection_text),
+                            };
+                            let _ = input_port.send_user_message(
+                                injection_message,
+                                crate::agent::entry::EntryOrigin::System,
+                            ).await;
 
                             // Spawn waiter: when user responds via button, forward to bridge
                             let response_fwd = response_tx.clone();
@@ -164,6 +242,11 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
+    fn dummy_input_port() -> crate::agent::runtime::port::InputPort {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        crate::agent::runtime::port::InputPort::new(tx)
+    }
+
     fn spawn_test_session(
         event_rx: mpsc::Receiver<ExternalAgentEvent>,
     ) -> (
@@ -183,6 +266,7 @@ mod tests {
             response_tx.clone(),
             queue.clone(),
             notify_tx,
+            dummy_input_port(),
         );
         (handle, response_tx, queue, notify_rx)
     }
@@ -235,6 +319,7 @@ mod tests {
             response_tx,
             queue,
             notify_tx,
+            dummy_input_port(),
         );
 
         cancel.cancel();
@@ -259,6 +344,7 @@ mod tests {
             response_tx,
             queue.clone(),
             notify_tx,
+            dummy_input_port(),
         );
 
         // Send a UIInteraction event
@@ -281,5 +367,51 @@ mod tests {
         // Verify notification was sent
         let notified = notify_rx.try_recv();
         assert!(notified.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_injects_question() {
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let (response_tx, _response_rx) = mpsc::channel(8);
+        let queue = Arc::new(interaction_queue::InteractionQueue::new());
+        let (notify_tx, _notify_rx) = mpsc::channel(8);
+
+        // Create InputPort where we can check injected messages
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(8);
+        let input_port = crate::agent::runtime::port::InputPort::new(input_tx);
+
+        let _handle = spawn_external_agent_session(
+            "test-inject".into(),
+            event_rx,
+            cancel,
+            response_tx,
+            queue,
+            notify_tx,
+            input_port,
+        );
+
+        // Send a UIInteraction event
+        event_tx
+            .send(ExternalAgentEvent::UIInteraction(
+                UIInteractionRequest::Question {
+                    request_id: "q-inject".into(),
+                    agent_task_id: String::new(),
+                    text: "Which database?".into(),
+                    options: vec![QuestionOption {
+                        label: "PostgreSQL".into(),
+                        description: "relational".into(),
+                    }],
+                },
+            ))
+            .await
+            .unwrap();
+
+        // Wait for injection
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Check that a message was injected into the input port
+        let event = input_rx.try_recv();
+        assert!(event.is_ok(), "Expected injected message on input port");
     }
 }
