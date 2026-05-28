@@ -245,6 +245,24 @@ impl super::Tool for AgentTool {
                     }
                 };
 
+                let plan_first = args.get("plan_first")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+
+                let effective_prompt = if plan_first {
+                    format!(
+                        "IMPORTANT: Plan before implementing.\n\
+                         1. Enter plan mode and write a detailed implementation plan.\n\
+                         2. Your plan will be reviewed before you may proceed.\n\
+                         3. Do not start implementation until the plan is approved.\n\
+                         4. If your plan is rejected, revise it based on the feedback.\n\n\
+                         Task:\n{}",
+                        prompt
+                    )
+                } else {
+                    prompt.clone()
+                };
+
                 let task_id = super::generate_task_id();
                 let cwd = self.external_cwd.clone()
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -255,7 +273,7 @@ impl super::Tool for AgentTool {
                         let cancel = tokio_util::sync::CancellationToken::new();
 
                         match crate::agent::external::claude_code::ClaudeCodeSession::spawn(
-                            &prompt, &cwd, event_tx,
+                            &effective_prompt, &cwd, event_tx,
                         ).await {
                             Ok((session, _response_tx)) => {
                                 // Spawn the session driver as a background task
@@ -311,7 +329,7 @@ impl super::Tool for AgentTool {
                         let cancel = tokio_util::sync::CancellationToken::new();
 
                         match crate::agent::external::codex::CodexSession::spawn(
-                            &prompt, &cwd, event_tx,
+                            &effective_prompt, &cwd, event_tx,
                         ).await {
                             Ok((session, _response_tx)) => {
                                 // Spawn the session driver as a background task
@@ -860,6 +878,67 @@ mod tests {
             }
             _ => panic!("Expected Immediate outcome"),
         }
+    }
+
+    #[test]
+    fn test_plan_first_defaults_true() {
+        let args: serde_json::Value = serde_json::json!({
+            "subagent_type": "external",
+            "prompt": "do something",
+            "agent_name": "claude_code"
+        });
+        let plan_first = args.get("plan_first")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        assert!(plan_first);
+    }
+
+    #[test]
+    fn test_plan_first_explicit_false() {
+        let args: serde_json::Value = serde_json::json!({
+            "subagent_type": "external",
+            "prompt": "do something",
+            "agent_name": "claude_code",
+            "plan_first": false
+        });
+        let plan_first = args.get("plan_first")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        assert!(!plan_first);
+    }
+
+    #[test]
+    fn test_plan_first_prompt_wrapping() {
+        let prompt = "Fix the bug";
+        let plan_first = true;
+        let effective_prompt = if plan_first {
+            format!(
+                "IMPORTANT: Plan before implementing.\n\
+                 1. Enter plan mode and write a detailed implementation plan.\n\
+                 2. Your plan will be reviewed before you may proceed.\n\
+                 3. Do not start implementation until the plan is approved.\n\
+                 4. If your plan is rejected, revise it based on the feedback.\n\n\
+                 Task:\n{}",
+                prompt
+            )
+        } else {
+            prompt.to_string()
+        };
+        assert!(effective_prompt.contains("IMPORTANT: Plan before implementing"));
+        assert!(effective_prompt.contains("Fix the bug"));
+    }
+
+    #[test]
+    fn test_plan_first_disabled_no_wrapping() {
+        let prompt = "Fix the bug";
+        let plan_first = false;
+        let effective_prompt = if plan_first {
+            format!("IMPORTANT: Plan before implementing.\n\nTask:\n{}", prompt)
+        } else {
+            prompt.to_string()
+        };
+        assert!(!effective_prompt.contains("IMPORTANT"));
+        assert_eq!(effective_prompt, "Fix the bug");
     }
 
     #[tokio::test]

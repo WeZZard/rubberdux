@@ -18,6 +18,11 @@
         "agent_name": {
           "type": "string",
           "description": "Name of the external agent to use. Required when subagent_type is 'external'. Currently supported: 'claude_code'."
+        },
+        "plan_first": {
+          "type": "boolean",
+          "description": "If true (default), the external agent plans before implementing. The plan is reviewed before execution begins. Set to false for simple tasks that don't need planning.",
+          "default": true
         }
       },
       "required": ["subagent_type", "prompt"]

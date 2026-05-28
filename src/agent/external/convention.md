@@ -8,3 +8,7 @@ When you receive a message about an external agent interaction, follow these rul
    - Spawn an explore subagent to verify the changes meet the original task goal
    - Check for errors, incomplete work, or deviations from the plan
    - Present audit findings to the user — do not assume success without verification
+6. External agents plan before implementing by default. When you dispatch a task to an
+   external agent, the agent will produce a plan first. The plan arrives as a PlanApproval
+   interaction. Follow rule 2 to review it. After approval, the agent executes the plan.
+   If the agent completes without producing a plan, note this in the audit (rule 5).
