@@ -306,9 +306,65 @@ impl super::Tool for AgentTool {
                             }
                         }
                     }
+                    "codex" => {
+                        let (event_tx, event_rx) = tokio::sync::mpsc::channel(32);
+                        let cancel = tokio_util::sync::CancellationToken::new();
+
+                        match crate::agent::external::codex::CodexSession::spawn(
+                            &prompt, &cwd, event_tx,
+                        ).await {
+                            Ok((session, _response_tx)) => {
+                                // Spawn the session driver as a background task
+                                tokio::spawn(session.drive());
+
+                                let (resp_tx, resp_notify_tx, iq) = match (
+                                    &self.interaction_response_tx,
+                                    &self.interaction_notify_tx,
+                                    &self.interaction_queue,
+                                ) {
+                                    (Some(rt), Some(nt), Some(q)) => {
+                                        (rt.clone(), nt.clone(), q.clone())
+                                    }
+                                    _ => {
+                                        let (rt, _) = tokio::sync::mpsc::channel(8);
+                                        let (nt, _) = tokio::sync::mpsc::channel(8);
+                                        let q = Arc::new(
+                                            crate::agent::external::interaction_queue::InteractionQueue::new(),
+                                        );
+                                        (rt, nt, q)
+                                    }
+                                };
+
+                                let ip = self.input_port.clone().unwrap_or_else(|| {
+                                    let (tx, _) = tokio::sync::mpsc::channel(8);
+                                    crate::agent::runtime::port::InputPort::new(tx)
+                                });
+
+                                let recorder: crate::trajectory::SharedTrajectoryRecorder =
+                                    self.recorder.clone().unwrap_or_else(|| {
+                                        std::sync::Arc::new(crate::trajectory::NoopTrajectoryRecorder)
+                                    });
+
+                                let handle = crate::agent::external::spawn_external_agent_session(
+                                    task_id, event_rx, cancel,
+                                    resp_tx, iq, resp_notify_tx, ip, recorder,
+                                );
+
+                                log::info!("Spawning external Codex agent {}", handle.task_id);
+
+                                return ToolOutcome::Subagent { handle };
+                            }
+                            Err(e) => {
+                                return ToolOutcome::Immediate {
+                                    content: format!("Failed to spawn Codex: {}", e),
+                                    is_error: true,
+                                };
+                            }
+                        }
+                    }
                     _ => {
                         return ToolOutcome::Immediate {
-                            content: format!("Unknown external agent: '{}'. Supported: claude_code", agent_name),
+                            content: format!("Unknown external agent: '{}'. Supported: claude_code, codex", agent_name),
                             is_error: true,
                         };
                     }
@@ -803,6 +859,27 @@ mod tests {
                 );
             }
             _ => panic!("Expected Immediate outcome"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_external_codex_no_server() {
+        let tool = dummy_agent_tool();
+        let outcome = <AgentTool as Tool>::execute(
+            &tool,
+            r#"{"subagent_type":"external","prompt":"do something","agent_name":"codex"}"#,
+        )
+        .await;
+        match outcome {
+            ToolOutcome::Immediate { content, is_error } => {
+                assert!(is_error);
+                assert!(
+                    content.contains("Failed to spawn Codex") || content.contains("connect"),
+                    "Expected connection error, got: {}",
+                    content
+                );
+            }
+            _ => panic!("Expected Immediate outcome (connection error)"),
         }
     }
 }

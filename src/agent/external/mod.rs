@@ -1,4 +1,5 @@
 pub mod claude_code;
+pub mod codex;
 pub mod guardrails;
 pub mod interaction_queue;
 

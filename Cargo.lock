@@ -3707,6 +3707,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "tower 0.5.3",
  "unicode-segmentation",
