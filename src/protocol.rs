@@ -18,6 +18,11 @@ pub enum AgentToHost {
         prompt: String,
         subagent_type: String,
     },
+    /// VM child's external agent needs user input.
+    ExternalInteraction {
+        task_id: String,
+        request: crate::agent::external::UIInteractionRequest,
+    },
 }
 
 /// Messages sent from the host to a VM agent.
@@ -34,6 +39,11 @@ pub enum HostToAgent {
     VMFailed { task_id: String, error: String },
     /// Shutdown signal.
     Shutdown,
+    /// Response to an external agent interaction (from user or LLM).
+    InteractionResponse {
+        request_id: String,
+        response: crate::agent::external::UIInteractionResponse,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +89,7 @@ pub async fn read_message<T: for<'de> Deserialize<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::external::{UIInteractionRequest, UIInteractionResponse, QuestionOption};
     use tokio::net::TcpListener;
 
     #[tokio::test]
@@ -165,6 +176,92 @@ mod tests {
             }
             _ => panic!("message mismatch"),
         }
+    }
+
+    #[test]
+    fn test_external_interaction_roundtrip() {
+        let msg = AgentToHost::ExternalInteraction {
+            task_id: "task-1".into(),
+            request: UIInteractionRequest::Question {
+                request_id: "q-1".into(),
+                agent_task_id: "task-1".into(),
+                text: "Which database?".into(),
+                options: vec![
+                    QuestionOption { label: "PostgreSQL".into(), description: "relational".into() },
+                ],
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: AgentToHost = serde_json::from_str(&json).unwrap();
+        match back {
+            AgentToHost::ExternalInteraction { task_id, request } => {
+                assert_eq!(task_id, "task-1");
+                match request {
+                    UIInteractionRequest::Question { request_id, text, options, .. } => {
+                        assert_eq!(request_id, "q-1");
+                        assert_eq!(text, "Which database?");
+                        assert_eq!(options.len(), 1);
+                    }
+                    _ => panic!("Expected Question"),
+                }
+            }
+            _ => panic!("Expected ExternalInteraction"),
+        }
+    }
+
+    #[test]
+    fn test_interaction_response_roundtrip() {
+        let msg = HostToAgent::InteractionResponse {
+            request_id: "q-1".into(),
+            response: UIInteractionResponse::SelectedOption {
+                request_id: "q-1".into(),
+                index: 2,
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: HostToAgent = serde_json::from_str(&json).unwrap();
+        match back {
+            HostToAgent::InteractionResponse { request_id, response } => {
+                assert_eq!(request_id, "q-1");
+                match response {
+                    UIInteractionResponse::SelectedOption { index, .. } => {
+                        assert_eq!(index, 2);
+                    }
+                    _ => panic!("Expected SelectedOption"),
+                }
+            }
+            _ => panic!("Expected InteractionResponse"),
+        }
+    }
+
+    #[test]
+    fn test_external_interaction_json_format() {
+        let msg = AgentToHost::ExternalInteraction {
+            task_id: "t-1".into(),
+            request: UIInteractionRequest::PermissionRequest {
+                request_id: "perm-1".into(),
+                agent_task_id: "t-1".into(),
+                description: "run cargo test".into(),
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("ExternalInteraction"));
+        assert!(json.contains("task_id"));
+        assert!(json.contains("perm-1"));
+    }
+
+    #[test]
+    fn test_interaction_response_json_format() {
+        let msg = HostToAgent::InteractionResponse {
+            request_id: "p-1".into(),
+            response: UIInteractionResponse::PlanApproved {
+                request_id: "p-1".into(),
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("InteractionResponse"));
+        assert!(json.contains("request_id"));
+        assert!(json.contains("PlanApproved"));
     }
 
     #[tokio::test]

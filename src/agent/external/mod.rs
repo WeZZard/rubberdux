@@ -68,7 +68,7 @@ fn set_agent_task_id(request: &mut UIInteractionRequest, task_id: &str) {
     }
 }
 
-fn get_request_id(request: &UIInteractionRequest) -> &str {
+pub fn get_request_id(request: &UIInteractionRequest) -> &str {
     match request {
         UIInteractionRequest::Question { request_id, .. } => request_id,
         UIInteractionRequest::PlanApproval { request_id, .. } => request_id,

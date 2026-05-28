@@ -278,6 +278,7 @@ pub async fn run_child_vm(
     subagent_type: &str,
     config: &HostConfig,
     listener: Arc<TcpListener>,
+    interaction_queue: std::sync::Arc<crate::agent::external::interaction_queue::InteractionQueue>,
 ) -> Result<String, Error> {
     // Helper to write status updates to the child share for debugging
     async fn write_status(share_dir: &std::path::Path, msg: &str) {
@@ -359,7 +360,8 @@ pub async fn run_child_vm(
         let (stream, addr) = listener.accept().await?;
         log::info!("Child VM {} connected from {}", task_id, addr);
 
-        let (mut reader, _writer) = stream.into_split();
+        let (mut reader, writer) = stream.into_split();
+        let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
 
         // Read messages until the child sends its final response
         let mut final_text = String::new();
@@ -376,6 +378,34 @@ pub async fn run_child_vm(
                     // Defensive guard: child VMs no longer have the agent tool,
                     // so this should never happen. Log and ignore.
                     log::warn!("Child VM {} requested nested spawn (ignoring)", task_id);
+                }
+                Some(AgentToHost::ExternalInteraction { task_id: _ext_task_id, request }) => {
+                    let request_id = crate::agent::external::get_request_id(&request).to_string();
+                    log::info!("VM child {} sent ExternalInteraction: {}", task_id, request_id);
+
+                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                    interaction_queue.add(
+                        request_id.clone(),
+                        crate::agent::external::interaction_queue::PendingInteraction {
+                            request,
+                            response_tx: resp_tx,
+                        },
+                    );
+
+                    // Spawn task to write response back to VM when interaction is resolved
+                    let writer_clone = writer.clone();
+                    tokio::spawn(async move {
+                        if let Ok(response) = resp_rx.await {
+                            let msg = crate::protocol::HostToAgent::InteractionResponse {
+                                request_id,
+                                response,
+                            };
+                            let mut w = writer_clone.lock().await;
+                            if let Err(e) = crate::protocol::write_message(&mut *w, &msg).await {
+                                log::warn!("Failed to send InteractionResponse to VM: {}", e);
+                            }
+                        }
+                    });
                 }
                 None => {
                     log::info!("Child VM {} disconnected", task_id);
