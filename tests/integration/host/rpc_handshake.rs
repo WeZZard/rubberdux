@@ -13,6 +13,7 @@ async fn test_rpc_roundtrip_agent_to_host() {
         task_id: "t1".into(),
         prompt: "do stuff".into(),
         subagent_type: "computer_use".into(),
+        agent_name: None,
     };
 
     let send_msg = msg.clone();
@@ -34,16 +35,19 @@ async fn test_rpc_roundtrip_agent_to_host() {
                 task_id: t1,
                 prompt: p1,
                 subagent_type: s1,
+                agent_name: a1,
             },
             AgentToHost::SpawnVM {
                 task_id: t2,
                 prompt: p2,
                 subagent_type: s2,
+                agent_name: a2,
             },
         ) => {
             assert_eq!(t1, t2);
             assert_eq!(p1, p2);
             assert_eq!(s1, s2);
+            assert_eq!(a1, a2);
         }
         _ => panic!("message mismatch"),
     }

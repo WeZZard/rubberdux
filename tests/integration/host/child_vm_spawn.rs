@@ -61,6 +61,7 @@ async fn test_computer_use_with_rpc_sends_spawn_vm() {
                 task_id,
                 prompt,
                 subagent_type,
+                agent_name: _,
             } => {
                 assert!(!task_id.is_empty());
                 assert_eq!(prompt, "click ok");

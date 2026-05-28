@@ -218,6 +218,7 @@ impl super::Tool for AgentTool {
                         task_id: task_id.clone(),
                         prompt,
                         subagent_type: "computer_use".to_owned(),
+                        agent_name: None,
                     };
 
                     let mut writer = rpc_writer.lock().await;
@@ -262,6 +263,42 @@ impl super::Tool for AgentTool {
                 } else {
                     prompt.clone()
                 };
+
+                let isolate = args.get("isolate")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                if isolate {
+                    if let Some(rpc_writer) = &self.rpc_writer {
+                        let task_id = super::generate_task_id();
+                        let msg = crate::protocol::AgentToHost::SpawnVM {
+                            task_id: task_id.clone(),
+                            prompt: effective_prompt,
+                            subagent_type: "external".into(),
+                            agent_name: Some(agent_name.into()),
+                        };
+
+                        let mut writer = rpc_writer.lock().await;
+                        return match crate::protocol::write_message(&mut writer, &msg).await {
+                            Ok(()) => {
+                                log::info!("External agent '{}' dispatched to VM (task {})", agent_name, task_id);
+                                ToolOutcome::Immediate {
+                                    content: format!("External agent '{}' dispatched to isolated VM (task {}).", agent_name, task_id),
+                                    is_error: false,
+                                }
+                            }
+                            Err(e) => ToolOutcome::Immediate {
+                                content: format!("Failed to dispatch external agent to VM: {}", e),
+                                is_error: true,
+                            },
+                        };
+                    } else {
+                        return ToolOutcome::Immediate {
+                            content: "VM isolation requested but VM infrastructure is not available. Run in host mode (remove isolate=true) or start with --host flag.".into(),
+                            is_error: true,
+                        };
+                    }
+                }
 
                 let task_id = super::generate_task_id();
                 let cwd = self.external_cwd.clone()
@@ -939,6 +976,38 @@ mod tests {
         };
         assert!(!effective_prompt.contains("IMPORTANT"));
         assert_eq!(effective_prompt, "Fix the bug");
+    }
+
+    #[tokio::test]
+    async fn test_external_isolate_no_vm() {
+        let tool = dummy_agent_tool();
+        let outcome = <AgentTool as Tool>::execute(
+            &tool,
+            r#"{"subagent_type":"external","prompt":"do something","agent_name":"claude_code","isolate":true}"#,
+        ).await;
+        match outcome {
+            ToolOutcome::Immediate { content, is_error } => {
+                assert!(is_error);
+                assert!(
+                    content.contains("VM") || content.contains("not available"),
+                    "Expected VM error, got: {}", content
+                );
+            }
+            _ => panic!("Expected Immediate outcome"),
+        }
+    }
+
+    #[test]
+    fn test_isolate_defaults_false() {
+        let args: serde_json::Value = serde_json::json!({
+            "subagent_type": "external",
+            "prompt": "do something",
+            "agent_name": "claude_code"
+        });
+        let isolate = args.get("isolate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(!isolate);
     }
 
     #[tokio::test]

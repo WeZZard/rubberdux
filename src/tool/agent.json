@@ -23,6 +23,11 @@
           "type": "boolean",
           "description": "If true (default), the external agent plans before implementing. The plan is reviewed before execution begins. Set to false for simple tasks that don't need planning.",
           "default": true
+        },
+        "isolate": {
+          "type": "boolean",
+          "description": "If true, run the external agent in an isolated VM instead of on the host. Requires VM infrastructure (tart). Defaults to false.",
+          "default": false
         }
       },
       "required": ["subagent_type", "prompt"]

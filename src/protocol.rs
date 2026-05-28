@@ -17,6 +17,7 @@ pub enum AgentToHost {
         task_id: String,
         prompt: String,
         subagent_type: String,
+        agent_name: Option<String>,
     },
     /// VM child's external agent needs user input.
     ExternalInteraction {
@@ -101,6 +102,7 @@ mod tests {
             task_id: "t1".into(),
             prompt: "do stuff".into(),
             subagent_type: "computer_use".into(),
+            agent_name: None,
         };
 
         let send_msg = msg.clone();
@@ -122,16 +124,19 @@ mod tests {
                     task_id: t1,
                     prompt: p1,
                     subagent_type: s1,
+                    agent_name: a1,
                 },
                 AgentToHost::SpawnVM {
                     task_id: t2,
                     prompt: p2,
                     subagent_type: s2,
+                    agent_name: a2,
                 },
             ) => {
                 assert_eq!(t1, t2);
                 assert_eq!(p1, p2);
                 assert_eq!(s1, s2);
+                assert_eq!(a1, a2);
             }
             _ => panic!("message mismatch"),
         }
@@ -262,6 +267,43 @@ mod tests {
         assert!(json.contains("InteractionResponse"));
         assert!(json.contains("request_id"));
         assert!(json.contains("PlanApproved"));
+    }
+
+    #[test]
+    fn test_spawn_vm_with_agent_name_roundtrip() {
+        let msg = AgentToHost::SpawnVM {
+            task_id: "t-1".into(),
+            prompt: "do stuff".into(),
+            subagent_type: "external".into(),
+            agent_name: Some("claude_code".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: AgentToHost = serde_json::from_str(&json).unwrap();
+        match back {
+            AgentToHost::SpawnVM { task_id, agent_name, .. } => {
+                assert_eq!(task_id, "t-1");
+                assert_eq!(agent_name, Some("claude_code".into()));
+            }
+            _ => panic!("Expected SpawnVM"),
+        }
+    }
+
+    #[test]
+    fn test_spawn_vm_without_agent_name_roundtrip() {
+        let msg = AgentToHost::SpawnVM {
+            task_id: "t-2".into(),
+            prompt: "do stuff".into(),
+            subagent_type: "computer_use".into(),
+            agent_name: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: AgentToHost = serde_json::from_str(&json).unwrap();
+        match back {
+            AgentToHost::SpawnVM { agent_name, .. } => {
+                assert_eq!(agent_name, None);
+            }
+            _ => panic!("Expected SpawnVM"),
+        }
     }
 
     #[tokio::test]

@@ -276,6 +276,7 @@ pub async fn run_child_vm(
     task_id: &str,
     prompt: &str,
     subagent_type: &str,
+    agent_name: Option<&str>,
     config: &HostConfig,
     listener: Arc<TcpListener>,
     interaction_queue: std::sync::Arc<crate::agent::external::interaction_queue::InteractionQueue>,
@@ -320,6 +321,13 @@ pub async fn run_child_vm(
             tokio::fs::write(&prompt_path, prompt).await?;
             let subagent_type_path = mgr.share_dir(task_id).join("subagent_type.txt");
             tokio::fs::write(&subagent_type_path, subagent_type).await?;
+            if let Some(name) = agent_name {
+                let agent_name_path = mgr.share_dir(task_id).join("agent_name.txt");
+                tokio::fs::write(&agent_name_path, name).await.map_err(|e| {
+                    Error::Vm(format!("Failed to write agent_name.txt: {}", e))
+                })?;
+                log::info!("Wrote agent_name.txt: {}", name);
+            }
         }
 
         // Start the agent inside the child VM
