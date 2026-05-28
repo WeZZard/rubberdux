@@ -35,6 +35,12 @@ pub struct AgentLoopBuilder {
     pub guardrails: Option<crate::guardrail::GuardrailChain>,
     pub external_cwd: Option<std::path::PathBuf>,
     pub interaction_queue: Option<Arc<crate::agent::external::interaction_queue::InteractionQueue>>,
+    #[cfg(feature = "host")]
+    pub vm_manager: Option<std::sync::Arc<tokio::sync::Mutex<crate::vm::manager::VMManager>>>,
+    #[cfg(feature = "host")]
+    pub vm_listener: Option<std::sync::Arc<tokio::net::TcpListener>>,
+    #[cfg(feature = "host")]
+    pub host_config: Option<std::sync::Arc<crate::host::HostConfig>>,
 }
 
 impl AgentLoopBuilder {
@@ -52,6 +58,12 @@ impl AgentLoopBuilder {
             guardrails: None,
             external_cwd: None,
             interaction_queue: None,
+            #[cfg(feature = "host")]
+            vm_manager: None,
+            #[cfg(feature = "host")]
+            vm_listener: None,
+            #[cfg(feature = "host")]
+            host_config: None,
         }
     }
 
@@ -109,6 +121,19 @@ impl AgentLoopBuilder {
         queue: Arc<crate::agent::external::interaction_queue::InteractionQueue>,
     ) -> Self {
         self.interaction_queue = Some(queue);
+        self
+    }
+
+    #[cfg(feature = "host")]
+    pub fn with_vm_infrastructure(
+        mut self,
+        manager: std::sync::Arc<tokio::sync::Mutex<crate::vm::manager::VMManager>>,
+        listener: std::sync::Arc<tokio::net::TcpListener>,
+        config: std::sync::Arc<crate::host::HostConfig>,
+    ) -> Self {
+        self.vm_manager = Some(manager);
+        self.vm_listener = Some(listener);
+        self.host_config = Some(config);
         self
     }
 
@@ -177,6 +202,13 @@ impl AgentLoopBuilder {
 
                 if let Some(ref recorder) = self.recorder {
                     agent_tool = agent_tool.with_recorder(recorder.clone());
+                }
+
+                #[cfg(feature = "host")]
+                if let (Some(vm_mgr), Some(vm_listener), Some(host_cfg)) =
+                    (self.vm_manager, self.vm_listener, self.host_config)
+                {
+                    agent_tool = agent_tool.with_vm_infrastructure(vm_mgr, vm_listener, host_cfg);
                 }
 
                 r.register(Box::new(agent_tool));

@@ -97,6 +97,12 @@ pub struct AgentTool {
     input_port: Option<crate::agent::runtime::port::InputPort>,
     /// Trajectory recorder for external agent sessions.
     recorder: Option<crate::trajectory::SharedTrajectoryRecorder>,
+    #[cfg(feature = "host")]
+    vm_manager: Option<std::sync::Arc<tokio::sync::Mutex<crate::vm::manager::VMManager>>>,
+    #[cfg(feature = "host")]
+    vm_listener: Option<std::sync::Arc<tokio::net::TcpListener>>,
+    #[cfg(feature = "host")]
+    host_config: Option<std::sync::Arc<crate::host::HostConfig>>,
 }
 
 impl AgentTool {
@@ -122,6 +128,12 @@ impl AgentTool {
             interaction_notify_tx: None,
             input_port: None,
             recorder: None,
+            #[cfg(feature = "host")]
+            vm_manager: None,
+            #[cfg(feature = "host")]
+            vm_listener: None,
+            #[cfg(feature = "host")]
+            host_config: None,
         }
     }
 
@@ -155,6 +167,65 @@ impl AgentTool {
     pub fn with_recorder(mut self, recorder: crate::trajectory::SharedTrajectoryRecorder) -> Self {
         self.recorder = Some(recorder);
         self
+    }
+
+    #[cfg(feature = "host")]
+    pub fn with_vm_infrastructure(
+        mut self,
+        manager: std::sync::Arc<tokio::sync::Mutex<crate::vm::manager::VMManager>>,
+        listener: std::sync::Arc<tokio::net::TcpListener>,
+        config: std::sync::Arc<crate::host::HostConfig>,
+    ) -> Self {
+        self.vm_manager = Some(manager);
+        self.vm_listener = Some(listener);
+        self.host_config = Some(config);
+        self
+    }
+}
+
+#[cfg(feature = "host")]
+fn spawn_vm_external_task(
+    task_id: String,
+    prompt: String,
+    agent_name: String,
+    vm_manager: std::sync::Arc<tokio::sync::Mutex<crate::vm::manager::VMManager>>,
+    listener: std::sync::Arc<tokio::net::TcpListener>,
+    interaction_queue: Arc<crate::agent::external::interaction_queue::InteractionQueue>,
+    host_config: std::sync::Arc<crate::host::HostConfig>,
+) -> crate::agent::runtime::subagent::SubagentHandle {
+    use crate::agent::runtime::subagent::{SubagentHandle, SubagentResult};
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let task_id_for_handle = task_id.clone();
+
+    tokio::spawn(async move {
+        let result = crate::host::run_child_vm(
+            vm_manager,
+            &task_id,
+            &prompt,
+            "external",
+            Some(&agent_name),
+            &host_config,
+            listener,
+            interaction_queue,
+        )
+        .await;
+
+        let summary = match result {
+            Ok(text) => text,
+            Err(e) => format!("VM external agent failed: {}", e),
+        };
+        let _ = result_tx.send(SubagentResult {
+            task_id,
+            summary,
+        });
+    });
+
+    SubagentHandle {
+        task_id: task_id_for_handle,
+        result_rx,
+        cancel,
     }
 }
 
@@ -269,6 +340,27 @@ impl super::Tool for AgentTool {
                     .unwrap_or(false);
 
                 if isolate {
+                    #[cfg(feature = "host")]
+                    if let (Some(vm_mgr), Some(listener), Some(config)) =
+                        (&self.vm_manager, &self.vm_listener, &self.host_config)
+                    {
+                        let task_id = super::generate_task_id();
+                        let iq = self.interaction_queue.clone().unwrap_or_else(|| {
+                            Arc::new(crate::agent::external::interaction_queue::InteractionQueue::new())
+                        });
+                        log::info!("Spawning VM for external agent '{}' (task {})", agent_name, task_id);
+                        let handle = spawn_vm_external_task(
+                            task_id,
+                            effective_prompt,
+                            agent_name.to_string(),
+                            vm_mgr.clone(),
+                            listener.clone(),
+                            iq,
+                            config.clone(),
+                        );
+                        return ToolOutcome::Subagent { handle };
+                    }
+
                     if let Some(rpc_writer) = &self.rpc_writer {
                         let task_id = super::generate_task_id();
                         let msg = crate::protocol::AgentToHost::SpawnVM {
@@ -292,12 +384,12 @@ impl super::Tool for AgentTool {
                                 is_error: true,
                             },
                         };
-                    } else {
-                        return ToolOutcome::Immediate {
-                            content: "VM isolation requested but VM infrastructure is not available. Run in host mode (remove isolate=true) or start with --host flag.".into(),
-                            is_error: true,
-                        };
                     }
+
+                    return ToolOutcome::Immediate {
+                        content: "VM isolation requested but VM infrastructure is not available. Run in host mode (remove isolate=true) or start with --host flag.".into(),
+                        is_error: true,
+                    };
                 }
 
                 let task_id = super::generate_task_id();

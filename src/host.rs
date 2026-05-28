@@ -149,8 +149,30 @@ fn shell_quote(s: &str) -> String {
 ///
 /// The host runs the AgentLoop locally and bridges Telegram ↔ AgentLoop
 /// via the broadcast-based adapter.
-pub async fn run(_config: HostConfig, bot: Bot) {
+pub async fn run(config: HostConfig, bot: Bot) {
     use crate::agent::builder::AgentLoopBuilder;
+
+    let rpc_listener = match TcpListener::bind(("0.0.0.0", config.rpc_port)).await {
+        Ok(l) => {
+            log::info!("RPC listener bound to 0.0.0.0:{}", config.rpc_port);
+            Arc::new(l)
+        }
+        Err(e) => {
+            log::warn!("Failed to bind RPC listener on port {}: {} (VM isolation disabled)", config.rpc_port, e);
+            // Continue without VM support — isolate=true will return an error
+            Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("Failed to bind fallback listener"))
+        }
+    };
+
+    let mut vm_manager = VMManager::new(config.vm_image.clone(), config.share_root.clone());
+    if let Some(mem) = config.memory_mb {
+        vm_manager = vm_manager.with_memory_mb(mem);
+    }
+    if let Some(cpus) = config.cpu_count {
+        vm_manager = vm_manager.with_cpu_count(cpus);
+    }
+    let vm_manager = Arc::new(Mutex::new(vm_manager));
+    let host_config = Arc::new(config);
 
     // Initialize session manager and create new session
     let session_manager = Arc::new(crate::session::SessionManager::new());
@@ -238,7 +260,8 @@ pub async fn run(_config: HostConfig, bot: Bot) {
         .with_guardrails(guardrails)
         .with_recorder(broadcast_recorder)
         .with_external_cwd(project_root.clone())
-        .with_interaction_queue(interaction_queue.clone());
+        .with_interaction_queue(interaction_queue.clone())
+        .with_vm_infrastructure(vm_manager, rpc_listener, host_config);
     let (agent_loop, input_port, _context_tx) = builder.build(client).await;
 
     // Subscribe to entry broadcasts for the Telegram adapter

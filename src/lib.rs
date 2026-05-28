@@ -1,6 +1,7 @@
 pub mod agent;
 #[cfg(feature = "host")]
 pub mod channel;
+pub mod child;
 pub mod error;
 pub mod gateway;
 pub mod hardened_prompts;

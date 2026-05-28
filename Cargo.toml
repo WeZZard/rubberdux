@@ -81,3 +81,7 @@ name = "e2e"
 path = "tests/e2e/runner.rs"
 harness = false
 
+[[test]]
+name = "vm_rpc"
+path = "tests/vm_rpc.rs"
+
