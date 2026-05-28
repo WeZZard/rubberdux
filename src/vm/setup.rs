@@ -427,26 +427,32 @@ async fn provision_base_vm(image: &VMImage) -> Result<(), Error> {
         tokio::fs::write(provision_dir.join("authorized_keys"), pub_key).await?;
     }
 
-    // Copy rubberdux binary to provision directory
-    if image.is_linux {
-        let linux_binary = std::env::current_dir()
-            .unwrap_or_default()
-            .join("target")
-            .join("aarch64-unknown-linux-musl")
-            .join("release")
-            .join("rubberduxd");
-        if !linux_binary.exists() {
-            return Err(Error::Vm(format!(
-                "Linux agent binary not found at {}. Build it with:\n\
-                cargo build --no-default-features --features agent --target aarch64-unknown-linux-musl --release",
-                linux_binary.display()
-            )));
+    // Copy bridge script for external agent communication
+    let bridge_src = std::env::current_dir()
+        .unwrap_or_default()
+        .join("scripts/bridge-claude-code");
+    if bridge_src.exists() {
+        let bridge_dest = provision_dir.join("bridge-claude-code");
+        tokio::fs::create_dir_all(&bridge_dest).await.map_err(|e| {
+            Error::Vm(format!("Failed to create bridge dir: {}", e))
+        })?;
+        // Copy package.json and index.mjs (not node_modules)
+        let mut entries = tokio::fs::read_dir(&bridge_src).await.map_err(|e| {
+            Error::Vm(format!("Failed to read bridge dir: {}", e))
+        })?;
+        while let Some(entry) = entries.next_entry().await.map_err(|e| {
+            Error::Vm(format!("{}", e))
+        })? {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy().to_string();
+            if name_str != "node_modules" && name_str != "package-lock.json" {
+                let dest = bridge_dest.join(&name);
+                tokio::fs::copy(entry.path(), &dest).await.map_err(|e| {
+                    Error::Vm(format!("Failed to copy {}: {}", name_str, e))
+                })?;
+            }
         }
-        tokio::fs::copy(&linux_binary, provision_dir.join("rubberduxd")).await?;
-    } else {
-        let exe_path = std::env::current_exe()
-            .map_err(|e| Error::Vm(format!("failed to get current exe: {}", e)))?;
-        tokio::fs::copy(&exe_path, provision_dir.join("rubberduxd")).await?;
+        log::info!("Copied bridge-claude-code to provision directory");
     }
 
     // Start VM with shared directory
@@ -550,44 +556,22 @@ fn write_stored_hash(base_vm_name: &str, hash: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn compute_provision_hash(image: &VMImage) -> Result<String, Error> {
-    use std::io::Read;
-
+fn compute_provision_hash(_image: &VMImage) -> Result<String, Error> {
     let mut hasher = sha256_hasher();
 
     // Hash software.sh contents
     let software_script = include_str!("guest/software.sh");
     hasher.update(software_script.as_bytes());
 
-    // Hash agent binary
-    let binary_path = if image.is_linux {
-        std::env::current_dir()
-            .unwrap_or_default()
-            .join("target")
-            .join("aarch64-unknown-linux-musl")
-            .join("release")
-            .join("rubberduxd")
-    } else {
-        std::env::current_exe()
-            .map_err(|e| Error::Vm(format!("failed to get current exe: {}", e)))?
-    };
-
-    let mut file = std::fs::File::open(&binary_path).map_err(|e| {
-        Error::Vm(format!(
-            "failed to open binary {}: {}",
-            binary_path.display(),
-            e
-        ))
-    })?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).map_err(|e| {
-        Error::Vm(format!(
-            "failed to read binary {}: {}",
-            binary_path.display(),
-            e
-        ))
-    })?;
-    hasher.update(&buf);
+    // Include bridge script in hash
+    let bridge_path = std::env::current_dir()
+        .unwrap_or_default()
+        .join("scripts/bridge-claude-code/index.mjs");
+    if bridge_path.exists() {
+        let content = std::fs::read(&bridge_path)
+            .map_err(|e| Error::Vm(format!("Failed to read bridge script: {}", e)))?;
+        hasher.update(&content);
+    }
 
     Ok(hex::encode(hasher.finalize()))
 }

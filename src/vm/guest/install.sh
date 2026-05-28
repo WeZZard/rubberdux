@@ -12,20 +12,6 @@ else
     exit 1
 fi
 
-# Install rubberdux binary (copied by host before boot)
-if [[ -f "$SHARE/rubberdux" ]]; then
-    if [[ "$OS" == "Darwin" ]]; then
-        sudo cp "$SHARE/rubberdux" /usr/local/bin/rubberdux
-        sudo chmod +x /usr/local/bin/rubberdux
-    else
-        sudo cp "$SHARE/rubberdux" /usr/local/bin/rubberdux
-        sudo chmod +x /usr/local/bin/rubberdux
-    fi
-    echo "Installed rubberdux to /usr/local/bin"
-else
-    echo "Warning: rubberdux binary not found in provision share"
-fi
-
 # Configure SSH authorized_keys for passwordless access
 mkdir -p ~/.ssh
 chmod 700 ~/.ssh
@@ -39,6 +25,16 @@ fi
 if [[ -f "$SHARE/software.sh" ]]; then
     echo "Running software provisioning..."
     bash "$SHARE/software.sh"
+fi
+
+# Install bridge script for external agent communication
+if [[ -d "$SHARE/bridge-claude-code" ]]; then
+    sudo mkdir -p /opt/rubberdux/bridge-claude-code
+    sudo cp -r "$SHARE/bridge-claude-code/"* /opt/rubberdux/bridge-claude-code/
+    if command -v npm &> /dev/null; then
+        cd /opt/rubberdux/bridge-claude-code && sudo npm install --production 2>/dev/null || true
+    fi
+    echo "Installed bridge-claude-code to /opt/rubberdux"
 fi
 
 echo "Guest provisioning complete"

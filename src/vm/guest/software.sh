@@ -17,7 +17,15 @@ if [[ "$OS" == "Darwin" ]]; then
     # - Google Chrome (for web_fetch JS rendering)
     brew install jq || true
     brew install --cask google-chrome || true
-    
+
+    # Node.js for external agent bridges
+    brew install node || true
+
+    # External coding agent CLIs
+    npm install -g @anthropic-ai/claude-code || true
+    npm install -g @openai/codex || true
+    npm install -g toll-free-harness || true
+
     # Verify Chrome installation
     if [ -d "/Applications/Google Chrome.app" ]; then
         echo "Google Chrome is pre-installed"
@@ -33,6 +41,19 @@ elif [[ "$OS" == "Linux" ]]; then
         jq \
         chromium-browser \
         chromium-chromedriver
+
+    # Node.js via nvm (more reliable than apt on Ubuntu)
+    if ! command -v node &> /dev/null; then
+        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+        export NVM_DIR="$HOME/.nvm"
+        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+        nvm install --lts
+    fi
+
+    # External coding agent CLIs
+    npm install -g @anthropic-ai/claude-code || true
+    npm install -g @openai/codex || true
+    npm install -g toll-free-harness || true
 fi
 
 # Verify Chrome is installed
@@ -43,3 +64,8 @@ elif command -v google-chrome &> /dev/null; then
 else
     echo "WARNING: Chrome/Chromium not found"
 fi
+
+# Verify external agent toolchain
+echo "Node.js: $(node --version 2>/dev/null || echo 'NOT INSTALLED')"
+echo "Claude Code: $(claude --version 2>/dev/null || echo 'NOT INSTALLED')"
+echo "Codex: $(codex --version 2>/dev/null || echo 'NOT INSTALLED')"
