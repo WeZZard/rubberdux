@@ -4,3 +4,7 @@ When you receive a message about an external agent interaction, follow these rul
 2. For plan reviews: spawn review subagents to check format, consistency, design, and completeness. Present findings to the user. Never auto-approve plans.
 3. For permission requests: evaluate if the operation is safe. Grant safe operations. Escalate dangerous or uncertain operations to the user.
 4. Never guess. Only answer with evidence. If you cannot find ground truth, let the interaction remain pending for the human user.
+5. When an external agent completes, audit the work before presenting results:
+   - Spawn an explore subagent to verify the changes meet the original task goal
+   - Check for errors, incomplete work, or deviations from the plan
+   - Present audit findings to the user — do not assume success without verification

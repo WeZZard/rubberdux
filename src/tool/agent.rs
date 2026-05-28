@@ -95,6 +95,8 @@ pub struct AgentTool {
     interaction_notify_tx: Option<tokio::sync::mpsc::Sender<crate::agent::external::UIInteractionRequest>>,
     /// Input port for injecting interaction messages into the parent agent loop.
     input_port: Option<crate::agent::runtime::port::InputPort>,
+    /// Trajectory recorder for external agent sessions.
+    recorder: Option<crate::trajectory::SharedTrajectoryRecorder>,
 }
 
 impl AgentTool {
@@ -119,6 +121,7 @@ impl AgentTool {
             interaction_response_tx: None,
             interaction_notify_tx: None,
             input_port: None,
+            recorder: None,
         }
     }
 
@@ -146,6 +149,11 @@ impl AgentTool {
 
     pub fn with_input_port(mut self, input_port: crate::agent::runtime::port::InputPort) -> Self {
         self.input_port = Some(input_port);
+        self
+    }
+
+    pub fn with_recorder(mut self, recorder: crate::trajectory::SharedTrajectoryRecorder) -> Self {
+        self.recorder = Some(recorder);
         self
     }
 }
@@ -276,9 +284,14 @@ impl super::Tool for AgentTool {
                                     crate::agent::runtime::port::InputPort::new(tx)
                                 });
 
+                                let recorder: crate::trajectory::SharedTrajectoryRecorder =
+                                    self.recorder.clone().unwrap_or_else(|| {
+                                        std::sync::Arc::new(crate::trajectory::NoopTrajectoryRecorder)
+                                    });
+
                                 let handle = crate::agent::external::spawn_external_agent_session(
                                     task_id, event_rx, cancel,
-                                    resp_tx, iq, resp_notify_tx, ip,
+                                    resp_tx, iq, resp_notify_tx, ip, recorder,
                                 );
 
                                 log::info!("Spawning external Claude Code agent {}", handle.task_id);

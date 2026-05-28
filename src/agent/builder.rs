@@ -175,6 +175,10 @@ impl AgentLoopBuilder {
                     );
                 }
 
+                if let Some(ref recorder) = self.recorder {
+                    agent_tool = agent_tool.with_recorder(recorder.clone());
+                }
+
                 r.register(Box::new(agent_tool));
             }
 

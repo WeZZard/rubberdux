@@ -152,6 +152,7 @@ pub fn spawn_external_agent_session(
     interaction_queue: Arc<interaction_queue::InteractionQueue>,
     interaction_notify_tx: tokio::sync::mpsc::Sender<UIInteractionRequest>,
     input_port: crate::agent::runtime::port::InputPort,
+    recorder: crate::trajectory::SharedTrajectoryRecorder,
 ) -> SubagentHandle {
     let (result_tx, result_rx) = oneshot::channel();
     let cancel_clone = cancel.clone();
@@ -163,6 +164,10 @@ pub fn spawn_external_agent_session(
                 event = event_rx.recv() => {
                     match event {
                         Some(ExternalAgentEvent::Completed { result }) => {
+                            recorder.record(crate::trajectory::TrajectoryEventDraft::new(
+                                "external_agent.completed", "agent.external", &task_id,
+                            ).with_task_id(Some(task_id.clone()))
+                             .with_payload(serde_json::json!({ "result_length": result.len() })));
                             let _ = result_tx.send(SubagentResult {
                                 task_id: task_id.clone(),
                                 summary: result,
@@ -170,6 +175,10 @@ pub fn spawn_external_agent_session(
                             break;
                         }
                         Some(ExternalAgentEvent::Failed { error }) => {
+                            recorder.record(crate::trajectory::TrajectoryEventDraft::new(
+                                "external_agent.failed", "agent.external", &task_id,
+                            ).with_task_id(Some(task_id.clone()))
+                             .with_payload(serde_json::json!({ "error": error })));
                             let _ = result_tx.send(SubagentResult {
                                 task_id: task_id.clone(),
                                 summary: format!("External agent failed: {}", error),
@@ -188,6 +197,11 @@ pub fn spawn_external_agent_session(
                                     response_tx: resp_tx,
                                 },
                             );
+
+                            recorder.record(crate::trajectory::TrajectoryEventDraft::new(
+                                "external_agent.interaction", "agent.external", &task_id,
+                            ).with_task_id(Some(task_id.clone()))
+                             .with_payload(serde_json::json!({ "request_id": get_request_id(&request) })));
 
                             // Notify (Telegram will show buttons)
                             let _ = interaction_notify_tx.send(request.clone()).await;
@@ -211,6 +225,10 @@ pub fn spawn_external_agent_session(
                             });
                         }
                         Some(ExternalAgentEvent::Progress { message }) => {
+                            recorder.record(crate::trajectory::TrajectoryEventDraft::new(
+                                "external_agent.progress", "agent.external", &task_id,
+                            ).with_task_id(Some(task_id.clone()))
+                             .with_payload(serde_json::json!({ "message": message })));
                             log::info!("[external:{}] {}", task_id, message);
                         }
                         None => {
@@ -259,6 +277,8 @@ mod tests {
         let (response_tx, _response_rx) = mpsc::channel(8);
         let queue = Arc::new(interaction_queue::InteractionQueue::new());
         let (notify_tx, notify_rx) = mpsc::channel(8);
+        let recorder: crate::trajectory::SharedTrajectoryRecorder =
+            std::sync::Arc::new(crate::trajectory::NoopTrajectoryRecorder);
         let handle = spawn_external_agent_session(
             "test".into(),
             event_rx,
@@ -267,6 +287,7 @@ mod tests {
             queue.clone(),
             notify_tx,
             dummy_input_port(),
+            recorder,
         );
         (handle, response_tx, queue, notify_rx)
     }
@@ -312,6 +333,8 @@ mod tests {
         let (response_tx, _response_rx) = mpsc::channel(8);
         let queue = Arc::new(interaction_queue::InteractionQueue::new());
         let (notify_tx, _notify_rx) = mpsc::channel(8);
+        let recorder: crate::trajectory::SharedTrajectoryRecorder =
+            std::sync::Arc::new(crate::trajectory::NoopTrajectoryRecorder);
         let handle = spawn_external_agent_session(
             "test-cancel".into(),
             event_rx,
@@ -320,6 +343,7 @@ mod tests {
             queue,
             notify_tx,
             dummy_input_port(),
+            recorder,
         );
 
         cancel.cancel();
@@ -336,6 +360,8 @@ mod tests {
         let (response_tx, _response_rx) = mpsc::channel(8);
         let queue = Arc::new(interaction_queue::InteractionQueue::new());
         let (notify_tx, mut notify_rx) = mpsc::channel(8);
+        let recorder: crate::trajectory::SharedTrajectoryRecorder =
+            std::sync::Arc::new(crate::trajectory::NoopTrajectoryRecorder);
 
         let _handle = spawn_external_agent_session(
             "test-ui".into(),
@@ -345,6 +371,7 @@ mod tests {
             queue.clone(),
             notify_tx,
             dummy_input_port(),
+            recorder,
         );
 
         // Send a UIInteraction event
@@ -376,6 +403,8 @@ mod tests {
         let (response_tx, _response_rx) = mpsc::channel(8);
         let queue = Arc::new(interaction_queue::InteractionQueue::new());
         let (notify_tx, _notify_rx) = mpsc::channel(8);
+        let recorder: crate::trajectory::SharedTrajectoryRecorder =
+            std::sync::Arc::new(crate::trajectory::NoopTrajectoryRecorder);
 
         // Create InputPort where we can check injected messages
         let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(8);
@@ -389,6 +418,7 @@ mod tests {
             queue,
             notify_tx,
             input_port,
+            recorder,
         );
 
         // Send a UIInteraction event
@@ -413,5 +443,160 @@ mod tests {
         // Check that a message was injected into the input port
         let event = input_rx.try_recv();
         assert!(event.is_ok(), "Expected injected message on input port");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_records_progress() {
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let (response_tx, _) = mpsc::channel(8);
+        let queue = Arc::new(interaction_queue::InteractionQueue::new());
+        let (notify_tx, _) = mpsc::channel(8);
+        let input_port = dummy_input_port();
+        let recorder = std::sync::Arc::new(crate::trajectory::MemoryTrajectoryRecorder::new());
+        let shared_recorder: crate::trajectory::SharedTrajectoryRecorder = recorder.clone();
+
+        let _handle = spawn_external_agent_session(
+            "test-progress".into(),
+            event_rx,
+            cancel,
+            response_tx,
+            queue,
+            notify_tx,
+            input_port,
+            shared_recorder,
+        );
+
+        // Send progress then completed to end the session
+        event_tx
+            .send(ExternalAgentEvent::Progress {
+                message: "step 1 done".into(),
+            })
+            .await
+            .unwrap();
+        event_tx
+            .send(ExternalAgentEvent::Completed {
+                result: "done".into(),
+            })
+            .await
+            .unwrap();
+
+        // Wait for processing
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let events = recorder.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == "external_agent.progress"),
+            "Expected progress event, got: {:?}",
+            events
+                .iter()
+                .map(|e| &e.event_type)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == "external_agent.completed"),
+            "Expected completed event"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_records_failed() {
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let (response_tx, _) = mpsc::channel(8);
+        let queue = Arc::new(interaction_queue::InteractionQueue::new());
+        let (notify_tx, _) = mpsc::channel(8);
+        let input_port = dummy_input_port();
+        let recorder = std::sync::Arc::new(crate::trajectory::MemoryTrajectoryRecorder::new());
+        let shared_recorder: crate::trajectory::SharedTrajectoryRecorder = recorder.clone();
+
+        let _handle = spawn_external_agent_session(
+            "test-fail".into(),
+            event_rx,
+            cancel,
+            response_tx,
+            queue,
+            notify_tx,
+            input_port,
+            shared_recorder,
+        );
+
+        event_tx
+            .send(ExternalAgentEvent::Failed {
+                error: "something broke".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let events = recorder.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == "external_agent.failed"),
+            "Expected failed event, got: {:?}",
+            events
+                .iter()
+                .map(|e| &e.event_type)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_records_interaction() {
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let (response_tx, _) = mpsc::channel(8);
+        let queue = Arc::new(interaction_queue::InteractionQueue::new());
+        let (notify_tx, _notify_rx) = mpsc::channel(8);
+        let input_port = dummy_input_port();
+        let recorder = std::sync::Arc::new(crate::trajectory::MemoryTrajectoryRecorder::new());
+        let shared_recorder: crate::trajectory::SharedTrajectoryRecorder = recorder.clone();
+
+        let _handle = spawn_external_agent_session(
+            "test-interaction".into(),
+            event_rx,
+            cancel,
+            response_tx,
+            queue,
+            notify_tx,
+            input_port,
+            shared_recorder,
+        );
+
+        event_tx
+            .send(ExternalAgentEvent::UIInteraction(
+                UIInteractionRequest::Question {
+                    request_id: "q-rec".into(),
+                    agent_task_id: String::new(),
+                    text: "Pick one".into(),
+                    options: vec![],
+                },
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let events = recorder.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == "external_agent.interaction"),
+            "Expected interaction event, got: {:?}",
+            events
+                .iter()
+                .map(|e| &e.event_type)
+                .collect::<Vec<_>>()
+        );
+        // Verify payload contains request_id
+        let interaction_event = events
+            .iter()
+            .find(|e| e.event_type == "external_agent.interaction")
+            .unwrap();
+        assert_eq!(interaction_event.payload["request_id"], "q-rec");
     }
 }
