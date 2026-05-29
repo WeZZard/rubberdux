@@ -7,8 +7,9 @@ if [[ "$OS" == "Darwin" ]]; then
     # macOS packages via Homebrew
     if ! command -v brew &> /dev/null; then
         echo "Installing Homebrew..."
-        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
     fi
+    eval "$(/opt/homebrew/bin/brew shellenv)"
     
     # Pre-installed apps for macOS:
     # - curl (built-in)
@@ -39,6 +40,8 @@ elif [[ "$OS" == "Linux" ]]; then
         curl \
         git \
         jq \
+        build-essential \
+        python3 \
         chromium-browser \
         chromium-chromedriver
 
