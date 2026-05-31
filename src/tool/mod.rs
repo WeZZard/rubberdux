@@ -101,6 +101,8 @@ impl ToolRegistry {
 pub struct BackgroundTaskResult {
     pub task_id: String,
     pub content: String,
+    /// Human-readable source label (e.g. "Subagent", "Web search", "Bash command").
+    pub source: String,
 }
 
 /// Raw outcome from tool execution, before provider-specific formatting.

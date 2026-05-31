@@ -282,6 +282,7 @@ impl AgentLoop {
                     let bg_result = BackgroundTaskResult {
                         task_id: agent_result.task_id,
                         content: agent_result.summary,
+                        source: "Subagent".into(),
                     };
                     let outcome = self.handle_task_result(bg_result).await;
                     log::info!("Child agent task result: {:?}", outcome);
@@ -331,6 +332,7 @@ impl AgentLoop {
                     let bg_result = BackgroundTaskResult {
                         task_id: agent_result.task_id,
                         content: agent_result.summary,
+                        source: "Subagent".into(),
                     };
                     let outcome = self.handle_task_result(bg_result).await;
                     log::info!("Child agent task result: {:?}", outcome);
@@ -723,8 +725,8 @@ impl AgentLoop {
                 for result in &completed.group.completed_results {
                     let msg = Message::User {
                         content: UserContent::Text(format!(
-                            "[Subagent {} completed. This is a subagent result — the user has not seen this content. Decide whether and how to present it based on the original request.]\n{}",
-                            result.task_id, result.content
+                            "[{} {} completed. This is a background result — the user has not seen this content. Decide whether and how to present it based on the original request.]\n{}",
+                            result.source, result.task_id, result.content
                         )),
                     };
                     let entry_id = self.history.push_user_with_metadata(
@@ -783,8 +785,8 @@ impl AgentLoop {
                 // Orphaned result — inject directly.
                 let msg = Message::User {
                     content: UserContent::Text(format!(
-                        "[Subagent {} completed. This is a subagent result — the user has not seen this content. Decide whether and how to present it based on the original request.]\n{}",
-                        result.task_id, result.content
+                        "[{} {} completed. This is a background result — the user has not seen this content. Decide whether and how to present it based on the original request.]\n{}",
+                        result.source, result.task_id, result.content
                     )),
                 };
                 let entry_id = self.history.push_user_with_metadata(

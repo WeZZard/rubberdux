@@ -166,6 +166,7 @@ async fn execute_background(command: &str) -> ToolOutcome {
         let _ = tx.send(super::BackgroundTaskResult {
             task_id: tid,
             content,
+            source: "Bash command".into(),
         });
     });
 

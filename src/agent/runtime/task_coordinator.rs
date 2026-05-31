@@ -135,6 +135,7 @@ mod tests {
         BackgroundTaskResult {
             task_id: task_id.into(),
             content: format!("result for {}", task_id),
+            source: "Background task".into(),
         }
     }
 

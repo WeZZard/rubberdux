@@ -95,6 +95,7 @@ pub async fn execute(arguments: &str, context: Option<WebSearchContext>) -> Tool
                         let _ = tx.send(crate::tool::BackgroundTaskResult {
                             task_id: tid.clone(),
                             content: "(empty search result)".into(),
+                            source: "Web search".into(),
                         });
                         if let Err(e) = std::fs::write(&path, "(empty search result)") {
                             log::error!("Failed to write search result: {}", e);
@@ -130,6 +131,7 @@ pub async fn execute(arguments: &str, context: Option<WebSearchContext>) -> Tool
         let _ = tx.send(crate::tool::BackgroundTaskResult {
             task_id: tid,
             content: output,
+            source: "Web search".into(),
         });
     });
 

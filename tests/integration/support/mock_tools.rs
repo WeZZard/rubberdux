@@ -39,6 +39,7 @@ impl MockBackgroundTool {
         let _ = tx.send(BackgroundTaskResult {
             task_id: format!("mock_{}", self.name),
             content: content.to_string(),
+            source: "Background task".into(),
         });
     }
 }
