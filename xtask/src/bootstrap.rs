@@ -6,6 +6,7 @@ use crate::launch::launch_rubberdux;
 
 pub async fn bootstrap() -> Result<(), String> {
     let sha = git_short_sha()?;
+    let previous = previous_sha().await;
 
     // 1. Build if needed
     let current = current_sha().await;
@@ -15,31 +16,34 @@ pub async fn bootstrap() -> Result<(), String> {
         println!("Build already up to date: {}", sha);
     }
 
-    // 2. Launch if not running or running old version
-    if !host_alive() || current.as_ref() != Some(&sha) {
-        launch_rubberdux().await?;
+    // 2. Launch (capture result, don't short-circuit on error)
+    let launch_result = if !host_alive() || current.as_ref() != Some(&sha) {
+        println!("Launching new version...");
+        launch_rubberdux().await
     } else {
         println!("Host already running with current version.");
-    }
+        Ok(())
+    };
 
     // 3. Health check
     println!("Waiting for health check...");
     sleep(Duration::from_secs(5)).await;
 
-    if host_alive() {
+    if launch_result.is_ok() && host_alive() {
         println!("Bootstrap succeeded.");
         return Ok(());
     }
 
-    // 4. Rollback
-    println!("Health check failed.");
-    if let Some(prev) = previous_sha().await {
+    // 4. Rollback on any failure (launch error or health check failure)
+    println!("Bootstrap failed.");
+    if let Some(prev) = previous {
         println!("Rolling back to {}...", prev);
         update_symlink(&prev).await?;
-        launch_rubberdux().await?;
 
+        let rollback_result = launch_rubberdux().await;
         sleep(Duration::from_secs(5)).await;
-        if host_alive() {
+
+        if rollback_result.is_ok() && host_alive() {
             println!("Rollback succeeded.");
             return Ok(());
         } else {
@@ -47,7 +51,7 @@ pub async fn bootstrap() -> Result<(), String> {
         }
     }
 
-    Err("Health check failed and no previous version available.".into())
+    Err("Bootstrap failed and no previous version available.".into())
 }
 
 fn git_short_sha() -> Result<String, String> {

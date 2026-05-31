@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Pinned versions ──────────────────────────────────────────────
-NODE_MAJOR=24
+NODE_MAJOR=22
 CLAUDE_CODE_VERSION="2.1.157"
 CODEX_VERSION="0.135.0"
 TOLL_FREE_HARNESS_VERSION="0.1.2"
