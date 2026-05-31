@@ -1,12 +1,16 @@
 use clap::{Parser, Subcommand};
 
 mod app;
+mod bootstrap;
+mod build;
 mod distribute;
 mod launch;
 mod provision;
 mod sessions;
 mod stop;
 
+use bootstrap::bootstrap;
+use build::build_daemon;
 use distribute::distribute as distribute_app;
 use launch::launch_rubberdux;
 use provision::provision_images;
@@ -27,8 +31,12 @@ enum Commands {
         /// Specific image to provision (ubuntu24, macos15, macos26)
         image: Option<String>,
     },
-    /// Provision VMs, build, and launch rubberdux
+    /// Build rubberdux daemon with versioned binary management
+    Build,
+    /// Provision VMs and launch rubberdux (no build)
     Launch,
+    /// Bootstrap: build, launch, health-check, rollback on failure
+    Bootstrap,
     /// Stop running rubberdux process and VMs
     Stop,
     /// Build or run the macOS app (builds Rust backend first)
@@ -83,9 +91,21 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Build => {
+            if let Err(e) = build_daemon().await {
+                eprintln!("Build failed: {}", e);
+                std::process::exit(1);
+            }
+        }
         Commands::Launch => {
             if let Err(e) = launch_rubberdux().await {
                 eprintln!("Launch failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Bootstrap => {
+            if let Err(e) = bootstrap().await {
+                eprintln!("Bootstrap failed: {}", e);
                 std::process::exit(1);
             }
         }

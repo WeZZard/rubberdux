@@ -3,6 +3,7 @@ use std::process::{Command, Stdio};
 use tokio::fs;
 use tokio::time::{sleep, Duration};
 
+use crate::build::get_binary_path;
 use crate::provision::provision_images;
 
 pub async fn launch_rubberdux() -> Result<(), String> {
@@ -124,16 +125,9 @@ pub async fn launch_rubberdux() -> Result<(), String> {
         println!("Archived previous session to {}", archive_name);
     }
 
-    // Build
-    println!("Building rubberdux...");
-    let status = Command::new("cargo")
-        .args(["build", "--release"])
-        .status()
-        .map_err(|e| format!("cargo build failed: {}", e))?;
-    if !status.success() {
-        return Err("cargo build --release failed".into());
-    }
-    println!("Build succeeded.");
+    // Find binary
+    let binary = get_binary_path().await?;
+    println!("Using binary: {}", binary.display());
 
     // Launch as background process with log file
     println!("Launching rubberdux (log: {})...", log_file.display());
@@ -144,7 +138,8 @@ pub async fn launch_rubberdux() -> Result<(), String> {
         .map_err(|e| format!("Failed to clone log file handle: {}", e))?;
 
     let child = Command::new("nohup")
-        .args(["cargo", "run", "--release", "--", "--host"])
+        .arg(&binary)
+        .arg("--host")
         .stdout(Stdio::from(log_file_std))
         .stderr(Stdio::from(log_file_stderr))
         .spawn()
