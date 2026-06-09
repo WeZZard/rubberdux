@@ -1,0 +1,5 @@
+#!/bin/sh
+# Tracked pre-commit hook (version-controlled, shared via core.hooksPath).
+# Armed by `cargo xtask install-git-hooks`; also auto-armed by any `cargo xtask` run.
+# Runs the design-documentation structure linter. Bypass once with: git commit --no-verify
+exec cargo xtask lint

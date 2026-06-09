@@ -1,0 +1,20 @@
+name: lint
+
+# The design-documentation linter also runs locally as a pre-commit hook, but
+# local hooks are optional per clone and bypassable with --no-verify. This job
+# is the authoritative, non-bypassable gate: it runs the same `cargo xtask lint`
+# on every push and pull request and blocks merge on failure.
+on:
+  push:
+  pull_request:
+
+jobs:
+  design-doc-lint:
+    name: design-doc lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run design-documentation linter
+        run: cargo xtask lint

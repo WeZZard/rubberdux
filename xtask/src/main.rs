@@ -4,7 +4,9 @@ mod app;
 mod bootstrap;
 mod build;
 mod distribute;
+mod git_hooks;
 mod launch;
+mod lint;
 mod provision;
 mod sessions;
 mod stop;
@@ -33,6 +35,10 @@ enum Commands {
     },
     /// Build rubberdux daemon with versioned binary management
     Build,
+    /// Lint the design-documentation structure (runs in the git pre-commit hook)
+    Lint,
+    /// Arm the git pre-commit linter for this clone (sets core.hooksPath)
+    InstallGitHooks,
     /// Provision VMs and launch rubberdux (no build)
     Launch,
     /// Bootstrap: build, launch, health-check, rollback on failure
@@ -84,6 +90,11 @@ enum SessionCommands {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    // Opportunistically arm the pre-commit linter for contributors who build,
+    // without re-arming on the install command itself. Best-effort and silent.
+    if !matches!(cli.command, Commands::InstallGitHooks) {
+        git_hooks::ensure_armed_quietly();
+    }
     match cli.command {
         Commands::Provision { image } => {
             if let Err(e) = provision_images(image).await {
@@ -94,6 +105,18 @@ async fn main() {
         Commands::Build => {
             if let Err(e) = build_daemon().await {
                 eprintln!("Build failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Lint => {
+            if let Err(e) = lint::lint() {
+                eprintln!("Lint failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::InstallGitHooks => {
+            if let Err(e) = git_hooks::install() {
+                eprintln!("Install git hooks failed: {}", e);
                 std::process::exit(1);
             }
         }

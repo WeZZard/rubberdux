@@ -42,6 +42,16 @@ cargo xtask launch                 # release build + launch rubberduxd --host
 cargo xtask stop                   # stop running instance
 ```
 
+### Git Hooks
+
+After cloning, arm the design-documentation pre-commit linter once:
+
+```bash
+cargo xtask install-git-hooks      # points core.hooksPath at .githooks/
+```
+
+Any `cargo xtask` command also arms it automatically, so contributors who build are covered without this step. The same linter runs in CI as the authoritative, non-bypassable gate; the local hook is a fast safety net and can be skipped with `git commit --no-verify`.
+
 ## macOS VM Concurrency Limits
 
 - Apple Silicon Macs enforce a hard limit of **2 concurrent macOS VMs** via `Virtualization.framework`.
@@ -236,6 +246,7 @@ Comments explain the purpose of the item they're attached to, not how other part
 **DO:**
 - Explain WHAT the item represents and WHY it exists.
 - Reference other modules when it explains this item's purpose.
+- Reference the design document that governs this item (e.g. `// see docs/<domain>/…`) so a reader can find the specification it implements.
 - Use doc comments (`///`) on public items to describe the item's contract.
 - Use inline comments (`//`) to explain non-obvious *why* for the adjacent line/block.
 
@@ -259,6 +270,31 @@ Comments explain the purpose of the item they're attached to, not how other part
 **You MUST NOT:**
 - Use comments to document how other parts of the system work — that belongs in those parts' own comments.
 - Write comments that create implicit coupling between unrelated modules.
+
+## Design Documentation
+
+Design documentation is the system- and subsystem-level record of *why* the project is shaped the way it is: context, architecture, the model, decisions and their rejected alternatives, and design language. It lives in dedicated documents — not in code comments (which serve the narrower, item-scoped purpose of the Comment Scoping Rule) and not in `CLAUDE.md` files (which hold only the principles for manipulating their folder). This mirrors the established split between Architecture Decision Records and inline comments.
+
+### Where Design Documents Live
+
+Design documents live under `docs/`, organized to mirror the code's domain-first paths:
+
+- Code at `src/<domain>/<layer>/` → docs at `docs/<domain>/<layer>/`.
+- Code under `apps/<platform>/` → docs under `docs/apps/`.
+- Cross-cutting design that belongs to no single code path sits at the nearest shared parent under `docs/`.
+
+**The test**: the doc path is the code path with its root (`src/`, or the repo root for `apps/`) rebased onto `docs/`. If you can compute one from the other, discovery is working.
+
+### Finding a Subsystem's Design Documents
+
+Compute the doc location from the code location by the path-mirror rule above — that mapping is the sole discovery mechanism. There are no hand-maintained pointers in `CLAUDE.md` files to drift out of sync; the convention is enforced mechanically by the design-documentation linter (`cargo xtask lint`). It runs as a git pre-commit hook — the tracked `.githooks/pre-commit`, armed via `cargo xtask install-git-hooks` (which points `core.hooksPath` at it; also auto-armed by any `cargo xtask` run) — and as a CI job, which is the authoritative, non-bypassable gate.
+
+**You MUST:**
+- Place new design documentation under the mirrored `docs/` path so the linter can find it.
+
+**You MUST NOT:**
+- Put design documentation — architecture, rationale, rejected alternatives — into `CLAUDE.md` files or code comments. Those reference the design documents; they do not contain them.
+- Add hand-maintained design-document pointers to a folder's `CLAUDE.md`; rely on the path-mirror convention instead.
 
 ## Testing
 
