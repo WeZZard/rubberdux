@@ -137,9 +137,22 @@ pub async fn launch_rubberdux() -> Result<(), String> {
         .try_clone()
         .map_err(|e| format!("Failed to clone log file handle: {}", e))?;
 
+    // Launch the daemon through the user's login + interactive shell so it
+    // inherits the user's real environment (PATH, etc.). Non-interactive
+    // shells skip ~/.zshrc, where environment like `brew shellenv` lives;
+    // without it the daemon's `git` would resolve to the xcode-select shim
+    // instead of the user's Homebrew git. `exec` replaces the shell with the
+    // daemon so `child.id()` is the daemon's real PID.
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let inner = format!(
+        "cd {} && exec {} --host",
+        shell_escape(&project_dir.to_string_lossy()),
+        shell_escape(&binary.to_string_lossy()),
+    );
     let child = Command::new("nohup")
-        .arg(&binary)
-        .arg("--host")
+        .arg(&shell)
+        .arg("-lic")
+        .arg(&inner)
         .stdout(Stdio::from(log_file_std))
         .stderr(Stdio::from(log_file_stderr))
         .spawn()
@@ -181,4 +194,31 @@ pub async fn launch_rubberdux() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Single-quote a string for safe interpolation inside a POSIX shell `-c`
+/// command. Wraps in single quotes and escapes embedded single quotes via the
+/// `'\''` idiom.
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_escape;
+
+    #[test]
+    fn test_shell_escape_plain() {
+        assert_eq!(shell_escape("/Users/me/proj"), "'/Users/me/proj'");
+    }
+
+    #[test]
+    fn test_shell_escape_with_space() {
+        assert_eq!(shell_escape("/Volumes/My Shared"), "'/Volumes/My Shared'");
+    }
+
+    #[test]
+    fn test_shell_escape_with_single_quote() {
+        assert_eq!(shell_escape("a'b"), "'a'\\''b'");
+    }
 }
