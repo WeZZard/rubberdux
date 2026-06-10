@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio::process::Command;
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::app::registry::store::AppStore;
@@ -65,6 +65,16 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// [`INITIAL_BACKOFF`]. A worker that survives this long is treated as healthy,
 /// so an unrelated later crash starts its backoff fresh.
 const HEALTHY_UPTIME: Duration = Duration::from_secs(10);
+
+/// How long `start_worker`/`ensure_active` waits for a freshly spawned worker to
+/// dial back and identify itself (its `Hello` is accepted and the host-side RPC
+/// writer is live) before returning. This makes restore a deterministic barrier:
+/// a `send_message` that follows a `restore`/`ensure_active` is delivered to a
+/// worker that is already connected and pumping, eliminating the
+/// send-after-restore race. The frame queue is buffered regardless, so exceeding
+/// this bound only logs a warning and proceeds — the buffered frame still flushes
+/// once the worker connects. See `docs/app/runtime/worker-lifecycle.md`.
+const CONNECT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long `suspend` lets a worker drain after a `HostToAgent::Shutdown` before
 /// killing it. The cancellation token always kills the child eventually; this is
@@ -271,8 +281,22 @@ impl LocalSupervisor {
             let (trajectory_tx, _) = broadcast::channel::<TrajectoryEvent>(CHANNEL_CAPACITY);
             let (outbound_tx, outbound_rx) = mpsc::channel::<HostToAgent>(OUTBOUND_CAPACITY);
             let (conn_tx, conn_rx) = mpsc::channel::<WorkerStream>(1);
+            // Fires once, the moment the supervision task has accepted the worker's
+            // `Hello` and its outbound RPC writer is live. Awaiting it below turns
+            // `start_worker` (and therefore `ensure_active`/`restore`) into a
+            // connection-ready barrier so a following `send_message` is delivered to
+            // a connected, pumping worker rather than racing a not-yet-connected one.
+            let (ready_tx, ready_rx) = oneshot::channel::<()>();
             let cancel = CancellationToken::new();
 
+            // Keep a clone of this connection's sender so the supervision task can
+            // tell, on teardown, whether the inbox map still holds *its own* inbox.
+            // A `restore` that races a tombstone's grace period reinstalls a fresh
+            // inbox under the same id while the old task is still winding down;
+            // without this guard the old task's unconditional removal would clobber
+            // the new worker's route and strand its `Hello` (see
+            // `docs/app/runtime/worker-lifecycle.md`).
+            let own_inbox = conn_tx.clone();
             self.inboxes
                 .lock()
                 .await
@@ -292,12 +316,30 @@ impl LocalSupervisor {
                 entry_tx: entry_tx.clone(),
                 cancel: cancel.clone(),
                 inboxes: self.inboxes.clone(),
+                own_inbox,
                 runtimes: self.runtimes.clone(),
                 lifecycles: self.lifecycles.clone(),
                 peer_broker: self.peer_broker.clone(),
                 supervisor: self.me.clone(),
             };
-            tokio::spawn(task.run(conn_rx, outbound_rx));
+            tokio::spawn(task.run(conn_rx, outbound_rx, Some(ready_tx)));
+
+            // Wait for the worker to connect before returning, bounded so a worker
+            // that never dials back does not wedge the caller. The outbound queue is
+            // buffered, so a timeout only degrades determinism (the buffered frame
+            // still flushes on connect); it does not drop messages.
+            match tokio::time::timeout(CONNECT_READY_TIMEOUT, ready_rx).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => log::warn!(
+                    "[app-worker:{}] supervision task ended before signaling connection-ready",
+                    app.id
+                ),
+                Err(_) => log::warn!(
+                    "[app-worker:{}] worker did not connect within {:?}; proceeding (outbound frames stay buffered)",
+                    app.id,
+                    CONNECT_READY_TIMEOUT
+                ),
+            }
 
             WorkerHandle::new(outbound_tx, entry_tx, trajectory_tx, cancel)
         })
@@ -556,6 +598,12 @@ struct SupervisionTask {
     entry_tx: broadcast::Sender<EntryNotification>,
     cancel: CancellationToken,
     inboxes: Arc<Mutex<HashMap<AppId, ConnectionInbox>>>,
+    /// This task's own connection inbox sender, kept solely to identify it on
+    /// teardown: the task removes the App's inbox only when the map still holds
+    /// *this* sender (`Sender::same_channel`). A `restore` that races this task's
+    /// shutdown reinstalls a fresh inbox under the same id; comparing identity
+    /// stops this task from clobbering the new worker's route.
+    own_inbox: ConnectionInbox,
     /// Shared with the supervisor so the RPC pump can record a worker-raised
     /// interaction on this App's [`WorkerHandle`] (a `Tombstoned` suspend later
     /// captures it in `resume.json`). See `docs/app/runtime/worker-lifecycle.md`.
@@ -587,6 +635,7 @@ impl SupervisionTask {
         self,
         mut conn_rx: mpsc::Receiver<WorkerStream>,
         mut outbound_rx: mpsc::Receiver<HostToAgent>,
+        mut ready_tx: Option<oneshot::Sender<()>>,
     ) {
         let mut backoff = INITIAL_BACKOFF;
         loop {
@@ -596,7 +645,7 @@ impl SupervisionTask {
 
             let started = std::time::Instant::now();
             let outcome = self
-                .spawn_and_pump(&mut conn_rx, &mut outbound_rx)
+                .spawn_and_pump(&mut conn_rx, &mut outbound_rx, &mut ready_tx)
                 .await;
 
             if self.cancel.is_cancelled() {
@@ -632,8 +681,20 @@ impl SupervisionTask {
         }
 
         // Tear down the connection inbox so the accept router stops routing to a
-        // dead task.
-        self.inboxes.lock().await.remove(&self.app_id);
+        // dead task — but only if the map still holds *this* task's inbox. A
+        // `restore` racing this shutdown may have already reinstalled a fresh inbox
+        // under the same id; removing it would strand the new worker's `Hello` and
+        // wedge its connect barrier. Compare channel identity so only the owning
+        // task removes its own entry. See `docs/app/runtime/worker-lifecycle.md`.
+        {
+            let mut inboxes = self.inboxes.lock().await;
+            if inboxes
+                .get(&self.app_id)
+                .is_some_and(|current| current.same_channel(&self.own_inbox))
+            {
+                inboxes.remove(&self.app_id);
+            }
+        }
         log::info!("[app-worker:{}] supervision stopped", self.app_id);
     }
 
@@ -644,6 +705,7 @@ impl SupervisionTask {
         &self,
         conn_rx: &mut mpsc::Receiver<WorkerStream>,
         outbound_rx: &mut mpsc::Receiver<HostToAgent>,
+        ready_tx: &mut Option<oneshot::Sender<()>>,
     ) -> Result<(), Error> {
         let exe = std::env::current_exe()
             .map_err(|e| Error::App(format!("locate current executable: {e}")))?;
@@ -681,6 +743,15 @@ impl SupervisionTask {
                 }
             }
         };
+
+        // The worker's `Hello` was accepted by the router and its socket handed to
+        // us, so the outbound RPC writer (`stream.writer`) is live. Signal
+        // connection-ready exactly once — the first connect, not crash-restarts —
+        // so `start_worker`/`ensure_active` can stop waiting and the following
+        // `send_message` reaches a connected, pumping worker.
+        if let Some(tx) = ready_tx.take() {
+            let _ = tx.send(());
+        }
 
         let result = self.pump(stream, &mut child, outbound_rx).await;
         // Always reap the child so a crashed-but-not-exited or still-running
