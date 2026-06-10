@@ -43,10 +43,15 @@ it to the backend.
 
 ### BoardEvent
 
-`BoardEvent` mirrors `src/app/supervisor.rs::BoardEvent`. The wire
-representation uses a `"kind"` field with values `"created"`, `"status_changed"`,
-`"moved"`, `"archived"`. The backend WebSocket surface for board events is
-designed in the next task; this model is ready for it.
+`BoardEvent` mirrors `src/gateway/apps_stream.rs::BoardWsMessage`, the frame the
+backend actually emits over `/api/v1/ws/board`. The backend uses
+`#[serde(tag = "type", rename_all = "snake_case")]`, so the wire discriminator is
+the string field `"type"` with values `"app_created"` (carrying `app`, an
+`AppDto` → Swift `App`), `"updated"` (carrying `id`), `"archived"` (carrying
+`id`), and `"badge"` (carrying `app_id` and `count`). The supervisor's internal
+`src/app/supervisor.rs::BoardEvent` collapses into this wire frame — its
+`StatusChanged` and `Moved` both project to `"updated"` — and is never wire
+serialized itself.
 
 `Entry` and `TrajectoryEvent` from the existing model layer are reused unchanged
 as the element types for per-app entry and trajectory snapshots.

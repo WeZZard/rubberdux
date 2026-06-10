@@ -2,100 +2,100 @@ import Foundation
 
 // MARK: - BoardEvent
 
-/// A board-level lifecycle event emitted over the board WebSocket stream.
-/// Mirrors the `BoardEvent` enum in `src/app/supervisor.rs`.
-/// The `kind` field is the discriminator.
+/// A board-level frame emitted over the board WebSocket stream
+/// (`/api/v1/ws/board`). Mirrors `BoardWsMessage` in
+/// `src/gateway/apps_stream.rs`, which uses
+/// `#[serde(tag = "type", rename_all = "snake_case")]`. The `type` field is the
+/// wire discriminator, decoupled from the Rust variant names.
 enum BoardEvent: Codable, Equatable {
-    /// A new App was created on the board.
-    case created(app: App)
-    /// An existing App's status changed.
-    case statusChanged(id: String, status: AppStatus)
-    /// An App's board position changed.
-    case moved(id: String, position: BoardPosition)
-    /// An App was archived and removed from the default board listing.
+    /// A new App appeared on the board (`"app_created"`).
+    case appCreated(app: App)
+    /// An existing App's status or position changed (`"updated"`).
+    case updated(id: String)
+    /// An App was archived and left the board (`"archived"`).
     case archived(id: String)
+    /// The number of interactions an App is awaiting changed (`"badge"`).
+    case badge(appId: String, count: Int)
 
     // MARK: Codable
 
-    private enum KindKey: String, CodingKey {
-        case kind
+    private enum TypeKey: String, CodingKey {
+        case type
     }
 
-    private enum CreatedKeys: String, CodingKey {
-        case kind, app
+    private enum AppCreatedKeys: String, CodingKey {
+        case type, app
     }
 
-    private enum StatusChangedKeys: String, CodingKey {
-        case kind, id, status
-    }
-
-    private enum MovedKeys: String, CodingKey {
-        case kind, id, position
+    private enum UpdatedKeys: String, CodingKey {
+        case type, id
     }
 
     private enum ArchivedKeys: String, CodingKey {
-        case kind, id
+        case type, id
+    }
+
+    private enum BadgeKeys: String, CodingKey {
+        case type
+        case appId = "app_id"
+        case count
     }
 
     init(from decoder: Decoder) throws {
-        let kindContainer = try decoder.container(keyedBy: KindKey.self)
-        let kind = try kindContainer.decode(String.self, forKey: .kind)
+        let typeContainer = try decoder.container(keyedBy: TypeKey.self)
+        let type = try typeContainer.decode(String.self, forKey: .type)
 
-        switch kind {
-        case "created":
-            let c = try decoder.container(keyedBy: CreatedKeys.self)
-            self = .created(app: try c.decode(App.self, forKey: .app))
+        switch type {
+        case "app_created":
+            let c = try decoder.container(keyedBy: AppCreatedKeys.self)
+            self = .appCreated(app: try c.decode(App.self, forKey: .app))
 
-        case "status_changed":
-            let c = try decoder.container(keyedBy: StatusChangedKeys.self)
-            self = .statusChanged(
-                id: try c.decode(String.self, forKey: .id),
-                status: try c.decode(AppStatus.self, forKey: .status)
-            )
-
-        case "moved":
-            let c = try decoder.container(keyedBy: MovedKeys.self)
-            self = .moved(
-                id: try c.decode(String.self, forKey: .id),
-                position: try c.decode(BoardPosition.self, forKey: .position)
-            )
+        case "updated":
+            let c = try decoder.container(keyedBy: UpdatedKeys.self)
+            self = .updated(id: try c.decode(String.self, forKey: .id))
 
         case "archived":
             let c = try decoder.container(keyedBy: ArchivedKeys.self)
             self = .archived(id: try c.decode(String.self, forKey: .id))
 
+        case "badge":
+            let c = try decoder.container(keyedBy: BadgeKeys.self)
+            self = .badge(
+                appId: try c.decode(String.self, forKey: .appId),
+                count: try c.decode(Int.self, forKey: .count)
+            )
+
         default:
             throw DecodingError.dataCorruptedError(
-                forKey: KindKey.kind,
-                in: kindContainer,
-                debugDescription: "Unknown BoardEvent kind: \(kind)"
+                forKey: TypeKey.type,
+                in: typeContainer,
+                debugDescription: "Unknown BoardEvent type: \(type)"
             )
         }
     }
 
     func encode(to encoder: Encoder) throws {
         switch self {
-        case .created(let app):
-            var c = encoder.container(keyedBy: CreatedKeys.self)
-            try c.encode("created", forKey: .kind)
+        case .appCreated(let app):
+            var c = encoder.container(keyedBy: AppCreatedKeys.self)
+            try c.encode("app_created", forKey: .type)
             try c.encode(app, forKey: .app)
 
-        case .statusChanged(let id, let status):
-            var c = encoder.container(keyedBy: StatusChangedKeys.self)
-            try c.encode("status_changed", forKey: .kind)
+        case .updated(let id):
+            var c = encoder.container(keyedBy: UpdatedKeys.self)
+            try c.encode("updated", forKey: .type)
             try c.encode(id, forKey: .id)
-            try c.encode(status, forKey: .status)
-
-        case .moved(let id, let position):
-            var c = encoder.container(keyedBy: MovedKeys.self)
-            try c.encode("moved", forKey: .kind)
-            try c.encode(id, forKey: .id)
-            try c.encode(position, forKey: .position)
 
         case .archived(let id):
             var c = encoder.container(keyedBy: ArchivedKeys.self)
-            try c.encode("archived", forKey: .kind)
+            try c.encode("archived", forKey: .type)
             try c.encode(id, forKey: .id)
+
+        case .badge(let appId, let count):
+            var c = encoder.container(keyedBy: BadgeKeys.self)
+            try c.encode("badge", forKey: .type)
+            try c.encode(appId, forKey: .appId)
+            try c.encode(count, forKey: .count)
         }
     }
 }

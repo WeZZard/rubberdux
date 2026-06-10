@@ -4,8 +4,9 @@
 > (`src/app/runtime/worker.rs`), the host↔worker RPC frames in
 > `src/protocol.rs`, the `Hello`-based socket routing in `src/host.rs`, and the
 > host-side `LocalSupervisor` (`src/app/runtime/local_supervisor.rs`) that spawns,
-> connects, pumps, and restarts the subprocess. The peer broker behind the peer
-> frames and tombstoning are designed separately and are out of scope here.
+> connects, pumps, and restarts the subprocess, plus idle tombstoning and
+> transparent restore (`src/app/runtime/lifecycle.rs`). The peer broker behind the
+> peer frames is designed separately and is out of scope here.
 
 ## Context
 
@@ -163,10 +164,94 @@ child, exits the supervision task, and tears down the App's connection inbox.
 trajectory frame, so that channel stays quiet until such a frame lands. Keeping
 it preserves the `AppSupervisor` seam without inventing protocol surface here.
 
+## Idle tombstoning and transparent restore
+
+Tombstoning is an idle-eviction optimization: an `Active` App that has been quiet
+long enough has its worker subprocess suspended to free host resources, and the
+next message wakes it again so transparently that the caller never observes the
+gap. The state machine and the durable resume record live in
+`src/app/runtime/lifecycle.rs`; `LocalSupervisor` drives them.
+
+### Lifecycle state machine
+
+`AppLifecycle` (`lifecycle.rs`) is the runtime truth the supervisor owns for each
+App — distinct from the on-disk manifest, which always loads `Tombstoned`. It
+records the phase (`Active` / `Tombstoned`), the last-activity instant, whether a
+turn is in flight, and whether any interaction is awaiting a user answer. Its
+mutators are immutable transitions (each returns a new value), matching the
+project's functional posture. An App is **idle-evictable** only when it is
+`Active`, has no in-flight turn, has no pending interaction, *and* has been quiet
+at least the idle window.
+
+These flags are driven from real runtime events, not left inert:
+
+- **Turn started** — `create_app`, `send_message`, and `respond_to_interaction`
+  mark the turn in flight (`turn_started`) right after they queue the outbound
+  user message / interaction answer to the worker, so the sweeper never evicts an
+  App that is still working on a request.
+- **Turn finished** — the RPC pump calls `turn_finished` when the worker emits its
+  final entry (`EntryNotification{is_final:true}`), refreshing the idle clock from
+  the end of the work.
+- **Pending interaction** — the pump calls `with_pending_interaction(true)` when an
+  `AgentToHost::Interaction` frame arrives (and records the interaction on the
+  `WorkerHandle`); `respond_to_interaction` re-syncs the flag from the handle's
+  live truth once an answer clears the last pending interaction.
+
+### The idle sweeper
+
+`LocalSupervisor::bind` starts one background sweeper task (no foreground sleep)
+that wakes on a fixed cadence (`SWEEP_INTERVAL`, 30 s), collects every
+idle-evictable App from the lifecycle map, and tombstones each. The idle window
+is read once from `RUBBERDUX_APP_IDLE_SECS` (default 300 s) — named after what it
+represents, not after any timer library. The sweep cadence is independent of the
+window; it only bounds how long past the window an idle App may linger before
+eviction. The sweeper shares the supervisor's `runtimes`, `lifecycles`,
+`inboxes`, `store`, and board channel (all `Arc`/clonable), so it evicts through
+the same routine `suspend` uses.
+
+### Suspend = persist → shutdown → kill
+
+`suspend` and the sweeper both call the shared `tombstone_app` routine, so manual
+and automatic tombstoning follow one sequence:
+
+1. **Persist `resume.json`** — the App's `session.jsonl` already holds the full
+   conversation history (the worker's `FilesystemStore` writes it continuously),
+   so the resume record carries only the *transient* state that would otherwise
+   be lost: the interactions awaiting answers, plus a documented (currently
+   empty) slot for peer messages addressed to this App but not yet delivered.
+   Peer-message redelivery is a later task; the field exists so the on-disk
+   format is stable from the start. The record is written last-writer-wins to
+   `{app_dir}/resume.json`.
+2. **Cooperative shutdown** — a `HostToAgent::Shutdown` frame is sent so a healthy
+   worker can flush and exit on its own. A send failure is ignored (the worker is
+   already gone).
+3. **Kill on timeout** — after a short grace window (`SHUTDOWN_GRACE`, 2 s) the
+   handle's cancellation token fires, killing the child and exiting its
+   supervision task (which tears down the App's connection inbox). The App's
+   lifecycle record transitions to `Tombstoned` and a `StatusChanged` board event
+   is emitted.
+
+### Transparent restore
+
+Every message-path method — `send_message`, `respond_to_interaction`,
+`subscribe_entries`, `subscribe_trajectory` — calls `ensure_active` first. If the
+App is already `Active` it is a no-op; otherwise the supervisor re-runs the
+existing worker spawn path against the App's session directory. The restored
+worker rebuilds its history from the durable `session.jsonl`; the supervisor
+loads `resume.json` and re-attaches its pending interactions to the new
+`WorkerHandle` (`set_pending_interactions`) — carrying the pending-interaction
+block forward onto the restored lifecycle record — *before* clearing the file, so
+an interaction the worker was awaiting an answer for survives the suspend→restore
+gap rather than being discarded. The record is cleared only after it is applied,
+so a later tombstone writes a fresh one. A missing or malformed `resume.json` degrades to
+an empty record — a restore proceeds on the durable history alone rather than
+failing. `restore` (the trait method) is just `ensure_active`. Because restore is
+woven into the message path, a caller addressing a tombstoned App sees only the
+normal flow: the suspended gap is invisible.
+
 ## Out of scope
 
-- The peer broker / directory behind the peer frames.
-- Tombstoning's persistence semantics (the supervisor's suspend/restore stop and
-  restart workers; the durable tombstone bookkeeping is a separate task).
+- The peer broker / directory behind the peer frames. `resume.json` reserves an
+  `undelivered_peer_messages` slot for it, but redelivery is a later task.
 - The gateway / host-startup wiring that picks `LocalSupervisor` over
   `MemorySupervisor` and hands it the store.

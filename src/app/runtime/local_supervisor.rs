@@ -30,6 +30,7 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::app::registry::store::AppStore;
+use crate::app::runtime::lifecycle::{AppLifecycle, ResumeState, idle_window};
 use crate::app::runtime::worker_handle::WorkerHandle;
 use crate::app::supervisor::{AppSupervisor, BoardEvent, CreateAppRequest};
 use crate::app::{App, AppId, AppStatus, BoardPosition};
@@ -63,6 +64,17 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// so an unrelated later crash starts its backoff fresh.
 const HEALTHY_UPTIME: Duration = Duration::from_secs(10);
 
+/// How long `suspend` lets a worker drain after a `HostToAgent::Shutdown` before
+/// killing it. The cancellation token always kills the child eventually; this is
+/// the grace period in which a cooperative worker can exit on its own after
+/// flushing. Kept short so suspend stays responsive.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// How often the idle sweeper wakes to tombstone quiet Apps. Independent of the
+/// idle window itself (`RUBBERDUX_APP_IDLE_SECS`): the sweep cadence bounds how
+/// long past the window an idle App may linger before eviction.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
 /// The mailbox an accepted worker socket is delivered into, keyed by App id.
 /// The single accept router (one per supervisor) classifies each incoming
 /// `Hello`-routed socket and hands it to the matching App's supervision task,
@@ -78,8 +90,14 @@ pub struct LocalSupervisor {
     /// OS assigns a free port; children are told this exact address.
     rpc_addr: std::net::SocketAddr,
     /// Live worker handles for `Active` Apps, keyed by id. Guarded by an async
-    /// mutex so the trait's `&self` methods mutate it without a `&mut self`.
-    runtimes: Mutex<HashMap<AppId, WorkerHandle>>,
+    /// mutex so the trait's `&self` methods mutate it without a `&mut self`, and
+    /// shared (`Arc`) with the idle sweeper so it can evict quiet workers.
+    runtimes: Arc<Mutex<HashMap<AppId, WorkerHandle>>>,
+    /// Per-App lifecycle records the idle sweeper reads to decide eviction and
+    /// suspend/restore update. An entry exists for every App the supervisor has
+    /// ever made `Active`; it persists across a tombstone so the sweeper sees the
+    /// `Tombstoned` phase (and skips it). See `src/app/runtime/lifecycle.rs`.
+    lifecycles: Arc<Mutex<HashMap<AppId, AppLifecycle>>>,
     /// Per-App connection mailboxes the accept router delivers sockets into.
     /// Shared with the router task so it can route by the `Hello` frame's id.
     inboxes: Arc<Mutex<HashMap<AppId, ConnectionInbox>>>,
@@ -100,13 +118,16 @@ impl LocalSupervisor {
 
         Self::spawn_accept_router(listener, inboxes.clone());
 
-        Ok(Self {
+        let supervisor = Self {
             store,
             rpc_addr,
-            runtimes: Mutex::new(HashMap::new()),
+            runtimes: Arc::new(Mutex::new(HashMap::new())),
+            lifecycles: Arc::new(Mutex::new(HashMap::new())),
             inboxes,
             board_tx,
-        })
+        };
+        supervisor.spawn_idle_sweeper();
+        Ok(supervisor)
     }
 
     /// The address worker children connect back on, e.g. for tests that spawn a
@@ -183,6 +204,8 @@ impl LocalSupervisor {
             entry_tx: entry_tx.clone(),
             cancel: cancel.clone(),
             inboxes: self.inboxes.clone(),
+            runtimes: self.runtimes.clone(),
+            lifecycles: self.lifecycles.clone(),
         };
         tokio::spawn(task.run(conn_rx, outbound_rx));
 
@@ -209,6 +232,174 @@ impl LocalSupervisor {
             status,
         });
     }
+
+    /// Mark a turn as started on an `Active` App, called right after an outbound
+    /// user message is queued to the worker. Blocks the idle sweeper from evicting
+    /// the App until the worker's final entry calls `turn_finished`. A no-op for an
+    /// App with no lifecycle record.
+    async fn mark_turn_started(&self, id: &AppId) {
+        let mut lifecycles = self.lifecycles.lock().await;
+        if let Some(state) = lifecycles.remove(id) {
+            lifecycles.insert(id.clone(), state.turn_started(std::time::Instant::now()));
+        }
+    }
+
+    /// Refresh an `Active` App's lifecycle pending-interaction flag from the live
+    /// truth on its [`WorkerHandle`]. Called after answering an interaction so the
+    /// sweeper sees the App unblocked once its last interaction is cleared.
+    async fn sync_pending_interaction(&self, id: &AppId) {
+        let has_pending = {
+            let runtimes = self.runtimes.lock().await;
+            runtimes
+                .get(id)
+                .map(|handle| handle.has_pending_interaction())
+                .unwrap_or(false)
+        };
+        let mut lifecycles = self.lifecycles.lock().await;
+        if let Some(state) = lifecycles.remove(id) {
+            lifecycles.insert(id.clone(), state.with_pending_interaction(has_pending));
+        }
+    }
+
+    /// If `id` is not currently `Active`, restore its worker from disk
+    /// transparently: the conversation history lives in the App's `session.jsonl`
+    /// (continuously persisted by the worker), and any `resume.json` carries the
+    /// interactions awaiting answers. Returns after the worker is started so the
+    /// caller's message/subscription proceeds against a live worker. A no-op for
+    /// an already-`Active` App.
+    ///
+    /// This is the transparent half of tombstoning: every message-path method
+    /// calls it first so a caller never observes the `Tombstoned` gap.
+    async fn ensure_active(&self, id: &AppId) -> Result<(), Error> {
+        if self.runtimes.lock().await.contains_key(id) {
+            return Ok(());
+        }
+        let app = self.require_app(id).await?;
+        let session_dir = self.app_session_dir(id);
+
+        // The worker reads its history from `session.jsonl` under the session
+        // dir; `resume.json` carries the transient state. Load it and re-attach
+        // the pending interactions to the new handle *before* clearing the record,
+        // so an interaction the worker was awaiting an answer for survives the
+        // suspend→restore gap. (Peer-message redelivery is a later task.)
+        let resume = ResumeState::load(&session_dir);
+        let mut handle = self.start_worker(&app, session_dir.clone()).await;
+        let restored_pending = resume.pending_interactions;
+        let has_pending = !restored_pending.is_empty();
+        handle.set_pending_interactions(restored_pending);
+        ResumeState::clear(&session_dir)?;
+
+        self.runtimes.lock().await.insert(id.clone(), handle);
+        // A just-restored App starts a fresh idle window; carry forward the
+        // pending-interaction block so the sweeper does not immediately re-evict
+        // an App that is still awaiting a user answer.
+        self.lifecycles.lock().await.insert(
+            id.clone(),
+            AppLifecycle::active(std::time::Instant::now())
+                .with_pending_interaction(has_pending),
+        );
+        self.announce_status(id, AppStatus::Active);
+        Ok(())
+    }
+
+    /// Start the background idle sweeper: a tokio task that periodically
+    /// tombstones every `Active` App that has been quiet past the configured idle
+    /// window with no in-flight turn or pending interaction. Honors
+    /// `RUBBERDUX_APP_IDLE_SECS` (default 300). Runs for the supervisor's lifetime
+    /// and never blocks a request path. See `src/app/runtime/lifecycle.rs`.
+    fn spawn_idle_sweeper(&self) {
+        let runtimes = self.runtimes.clone();
+        let lifecycles = self.lifecycles.clone();
+        let inboxes = self.inboxes.clone();
+        let store = self.store.clone();
+        let board_tx = self.board_tx.clone();
+        tokio::spawn(async move {
+            let window = idle_window();
+            let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
+            loop {
+                ticker.tick().await;
+                let now = std::time::Instant::now();
+                let evictable: Vec<AppId> = {
+                    let lifecycles = lifecycles.lock().await;
+                    lifecycles
+                        .iter()
+                        .filter(|(_, state)| state.is_idle_evictable(now, window))
+                        .map(|(id, _)| id.clone())
+                        .collect()
+                };
+                for id in evictable {
+                    if let Err(e) = tombstone_app(
+                        &id,
+                        &runtimes,
+                        &lifecycles,
+                        &inboxes,
+                        store.as_ref(),
+                        &board_tx,
+                    )
+                    .await
+                    {
+                        log::warn!("idle sweeper failed to tombstone App `{id}`: {e}");
+                    } else {
+                        log::info!("idle sweeper tombstoned App `{id}`");
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Tombstone one App: persist its `resume.json`, ask the worker to shut down
+/// cooperatively, wait a short grace period, then cancel the handle (which kills
+/// the child and tears down the supervision task) and mark the App `Tombstoned`.
+/// Shared by `LocalSupervisor::suspend` and the idle sweeper so both follow the
+/// same persist→shutdown→kill sequence. A no-op for an App with no live worker.
+async fn tombstone_app(
+    id: &AppId,
+    runtimes: &Mutex<HashMap<AppId, WorkerHandle>>,
+    lifecycles: &Mutex<HashMap<AppId, AppLifecycle>>,
+    inboxes: &Mutex<HashMap<AppId, ConnectionInbox>>,
+    store: &dyn AppStore,
+    board_tx: &broadcast::Sender<BoardEvent>,
+) -> Result<(), Error> {
+    let removed = runtimes.lock().await.remove(id);
+    let Some(handle) = removed else {
+        return Ok(());
+    };
+
+    // Persist the transient resume state before the worker exits. History is
+    // already durable in `session.jsonl`; this captures only the pending
+    // interactions plus the documented (currently empty) peer-message slot.
+    let resume = ResumeState {
+        pending_interactions: handle.pending_interactions(),
+        undelivered_peer_messages: Vec::new(),
+    };
+    resume.persist(&store.app_dir(id))?;
+
+    // Ask the worker to shut down cooperatively; ignore a send failure, which
+    // just means it is already gone.
+    let _ = handle.send_frame(HostToAgent::Shutdown).await;
+    tokio::time::sleep(SHUTDOWN_GRACE).await;
+
+    // The cancellation token kills the child and exits the supervision task,
+    // which tears down the App's connection inbox on its way out.
+    handle.shutdown();
+
+    // The connection inbox is torn down by the cancelled supervision task; it is
+    // referenced here only to keep the routine's shared-state signature explicit.
+    let _ = inboxes;
+
+    {
+        let mut lifecycles = lifecycles.lock().await;
+        if let Some(state) = lifecycles.remove(id) {
+            lifecycles.insert(id.clone(), state.tombstoned());
+        }
+    }
+
+    let _ = board_tx.send(BoardEvent::StatusChanged {
+        id: id.clone(),
+        status: AppStatus::Tombstoned,
+    });
+    Ok(())
 }
 
 /// The owned state of one App's supervision task: it spawns the child, awaits its
@@ -221,6 +412,15 @@ struct SupervisionTask {
     entry_tx: broadcast::Sender<EntryNotification>,
     cancel: CancellationToken,
     inboxes: Arc<Mutex<HashMap<AppId, ConnectionInbox>>>,
+    /// Shared with the supervisor so the RPC pump can record a worker-raised
+    /// interaction on this App's [`WorkerHandle`] (a `Tombstoned` suspend later
+    /// captures it in `resume.json`). See `docs/app/runtime/worker-lifecycle.md`.
+    runtimes: Arc<Mutex<HashMap<AppId, WorkerHandle>>>,
+    /// Shared with the supervisor so the RPC pump can update this App's lifecycle
+    /// activity flags from real worker events: a final entry finishes the turn,
+    /// and an interaction frame sets the pending-interaction block. The idle
+    /// sweeper reads these to decide eviction.
+    lifecycles: Arc<Mutex<HashMap<AppId, AppLifecycle>>>,
 }
 
 impl SupervisionTask {
@@ -334,6 +534,41 @@ impl SupervisionTask {
         result
     }
 
+    /// Mark this App's in-flight turn as finished in its lifecycle record,
+    /// refreshing the idle clock so the sweeper measures the window from the end
+    /// of the work. A no-op if the App has no lifecycle record yet.
+    async fn finish_turn(&self) {
+        let mut lifecycles = self.lifecycles.lock().await;
+        if let Some(state) = lifecycles.remove(&self.app_id) {
+            lifecycles.insert(
+                self.app_id.clone(),
+                state.turn_finished(std::time::Instant::now()),
+            );
+        }
+    }
+
+    /// Record a worker-raised interaction on this App's handle and set the
+    /// lifecycle pending-interaction block, so the sweeper does not evict an App
+    /// awaiting a user answer and a later suspend captures it in `resume.json`.
+    async fn capture_interaction(&self, interaction: AgentInteraction) {
+        {
+            let mut runtimes = self.runtimes.lock().await;
+            if let Some(handle) = runtimes.get_mut(&self.app_id) {
+                handle.add_interaction(interaction);
+            } else {
+                // No live handle (a race with teardown): nothing to record.
+                return;
+            }
+        }
+        let mut lifecycles = self.lifecycles.lock().await;
+        if let Some(state) = lifecycles.remove(&self.app_id) {
+            lifecycles.insert(
+                self.app_id.clone(),
+                state.with_pending_interaction(true),
+            );
+        }
+    }
+
     /// Pump the worker's RPC duplex: forward inbound `EntryNotification` frames to
     /// the per-App broadcast, forward queued outbound frames to the worker, and
     /// return when the worker disconnects, exits, or the task is cancelled.
@@ -358,9 +593,23 @@ impl SupervisionTask {
                 frame = protocol::read_message::<AgentToHost>(&mut reader) => {
                     match frame? {
                         Some(AgentToHost::EntryNotification { entry, is_final }) => {
+                            // The final entry of a turn ends the in-flight-turn
+                            // block so the idle sweeper can measure the window from
+                            // the end of the work; non-final entries are just
+                            // streamed.
+                            if is_final {
+                                self.finish_turn().await;
+                            }
                             // No active subscribers is not an error; keep draining
                             // so the worker's stream does not back up.
                             let _ = self.entry_tx.send(EntryNotification { entry, is_final });
+                        }
+                        Some(AgentToHost::Interaction { interaction }) => {
+                            // The worker is blocked on a user answer: record it on
+                            // the handle (so a suspend captures it in `resume.json`)
+                            // and set the lifecycle pending flag (so the sweeper
+                            // never evicts a blocked App).
+                            self.capture_interaction(interaction).await;
                         }
                         Some(AgentToHost::Hello { .. }) => {
                             // The routing `Hello` was already consumed by the
@@ -427,6 +676,13 @@ impl AppSupervisor for LocalSupervisor {
         let mut active = app.clone();
         active.status = AppStatus::Active;
         self.runtimes.lock().await.insert(app.id.clone(), handle);
+        self.lifecycles
+            .lock()
+            .await
+            .insert(app.id.clone(), AppLifecycle::active(std::time::Instant::now()));
+        // The originating prompt is the App's first turn: mark it in flight so the
+        // sweeper does not evict a freshly created App while it is still working.
+        self.mark_turn_started(&app.id).await;
 
         let _ = self.board_tx.send(BoardEvent::Created(active.clone()));
         Ok(active)
@@ -454,6 +710,9 @@ impl AppSupervisor for LocalSupervisor {
     }
 
     async fn send_message(&self, id: &AppId, text: String) -> Result<(), Error> {
+        // Transparently restore a tombstoned App before delivering the message,
+        // so the caller never observes the suspended gap.
+        self.ensure_active(id).await?;
         let runtimes = self.runtimes.lock().await;
         let handle = runtimes
             .get(id)
@@ -463,13 +722,21 @@ impl AppSupervisor for LocalSupervisor {
                 text,
                 telegram_message_id: None,
             })
-            .await
+            .await?;
+        drop(runtimes);
+        // An outbound user message starts a turn: block eviction until the
+        // worker's final entry finishes it in the pump.
+        self.mark_turn_started(id).await;
+        Ok(())
     }
 
     async fn subscribe_entries(
         &self,
         id: &AppId,
     ) -> Result<broadcast::Receiver<EntryNotification>, Error> {
+        // Restore first so a subscription on a tombstoned App attaches to a live
+        // worker's stream rather than failing.
+        self.ensure_active(id).await?;
         let runtimes = self.runtimes.lock().await;
         runtimes
             .get(id)
@@ -481,6 +748,7 @@ impl AppSupervisor for LocalSupervisor {
         &self,
         id: &AppId,
     ) -> Result<broadcast::Receiver<TrajectoryEvent>, Error> {
+        self.ensure_active(id).await?;
         let runtimes = self.runtimes.lock().await;
         runtimes
             .get(id)
@@ -501,6 +769,9 @@ impl AppSupervisor for LocalSupervisor {
         id: &AppId,
         response: InteractionResponse,
     ) -> Result<(), Error> {
+        // Answering an interaction on a tombstoned App restores it first so the
+        // answer reaches a live worker.
+        self.ensure_active(id).await?;
         let mut runtimes = self.runtimes.lock().await;
         let handle = runtimes
             .get_mut(id)
@@ -512,28 +783,33 @@ impl AppSupervisor for LocalSupervisor {
             .send_frame(HostToAgent::InteractionAnswer { response })
             .await?;
         handle.clear_interaction(&request_id);
+        drop(runtimes);
+        // Answering resumes the worker's turn and may clear the last pending
+        // interaction: mark the turn in flight and re-sync the pending flag from
+        // the handle's live truth so the sweeper sees the App unblocked.
+        self.mark_turn_started(id).await;
+        self.sync_pending_interaction(id).await;
         Ok(())
     }
 
     async fn suspend(&self, id: &AppId) -> Result<(), Error> {
-        let removed = self.runtimes.lock().await.remove(id);
-        if let Some(handle) = removed {
-            handle.shutdown();
-            self.announce_status(id, AppStatus::Tombstoned);
-        }
-        Ok(())
+        // Suspend follows the same persist→shutdown→kill sequence the idle
+        // sweeper uses, so manual and automatic tombstoning are identical.
+        tombstone_app(
+            id,
+            &self.runtimes,
+            &self.lifecycles,
+            &self.inboxes,
+            self.store.as_ref(),
+            &self.board_tx,
+        )
+        .await
     }
 
     async fn restore(&self, id: &AppId) -> Result<(), Error> {
-        if self.runtimes.lock().await.contains_key(id) {
-            return Ok(());
-        }
-        let app = self.require_app(id).await?;
-        let session_dir = self.app_session_dir(id);
-        let handle = self.start_worker(&app, session_dir).await;
-        self.runtimes.lock().await.insert(id.clone(), handle);
-        self.announce_status(id, AppStatus::Active);
-        Ok(())
+        // `ensure_active` is the restore mechanism: it re-runs the spawn path
+        // from the durable session plus `resume.json`. A no-op if already active.
+        self.ensure_active(id).await
     }
 
     async fn archive(&self, id: &AppId) -> Result<(), Error> {
@@ -679,5 +955,120 @@ mod tests {
     /// have a manifest to read.
     fn store_create(supervisor: &LocalSupervisor, app: &App) {
         supervisor.store.create(app).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_active_restores_and_consumes_resume_record() {
+        let (store, _dir) = temp_store();
+        let supervisor = LocalSupervisor::bind(store).await.unwrap();
+        let app = App::new(
+            AppId::now(),
+            "t".into(),
+            IconSpec { symbol: "s".into(), color: "#000000".into() },
+            BoardPosition { row: 0, column: 0 },
+        );
+        store_create(&supervisor, &app);
+
+        // Leave a resume record on disk as a prior tombstone would, so restore
+        // has transient state to consume.
+        let session_dir = supervisor.app_session_dir(&app.id);
+        ResumeState::default().persist(&session_dir).unwrap();
+        assert!(ResumeState::path_in(&session_dir).is_file());
+
+        // No live worker yet: ensure_active must restore it transparently.
+        assert!(!supervisor.runtimes.lock().await.contains_key(&app.id));
+        supervisor.ensure_active(&app.id).await.unwrap();
+
+        // Restore registers a live handle and an Active lifecycle record, and
+        // consumes the resume record so a later tombstone writes a fresh one.
+        assert!(supervisor.runtimes.lock().await.contains_key(&app.id));
+        assert!(supervisor.lifecycles.lock().await.contains_key(&app.id));
+        assert!(!ResumeState::path_in(&session_dir).is_file());
+
+        // A second call is a no-op (already active).
+        supervisor.ensure_active(&app.id).await.unwrap();
+        assert!(supervisor.runtimes.lock().await.contains_key(&app.id));
+    }
+
+    #[tokio::test]
+    async fn suspend_persists_resume_record() {
+        let (store, _dir) = temp_store();
+        let supervisor = LocalSupervisor::bind(store).await.unwrap();
+        let app = App::new(
+            AppId::now(),
+            "t".into(),
+            IconSpec { symbol: "s".into(), color: "#000000".into() },
+            BoardPosition { row: 0, column: 0 },
+        );
+        store_create(&supervisor, &app);
+        let session_dir = supervisor.app_session_dir(&app.id);
+        let handle = supervisor.start_worker(&app, session_dir.clone()).await;
+        supervisor.runtimes.lock().await.insert(app.id.clone(), handle);
+
+        supervisor.suspend(&app.id).await.unwrap();
+
+        // Tombstoning wrote a durable resume record for the next restore.
+        assert!(ResumeState::path_in(&session_dir).is_file());
+        assert!(!supervisor.runtimes.lock().await.contains_key(&app.id));
+    }
+
+    #[tokio::test]
+    async fn pending_interaction_survives_suspend_then_restore() {
+        let (store, _dir) = temp_store();
+        let supervisor = LocalSupervisor::bind(store).await.unwrap();
+        let app = App::new(
+            AppId::now(),
+            "t".into(),
+            IconSpec { symbol: "s".into(), color: "#000000".into() },
+            BoardPosition { row: 0, column: 0 },
+        );
+        store_create(&supervisor, &app);
+        let session_dir = supervisor.app_session_dir(&app.id);
+
+        // Bring the App up and record an interaction the worker is awaiting an
+        // answer for, exactly as the RPC pump would on an `Interaction` frame.
+        let mut handle = supervisor.start_worker(&app, session_dir.clone()).await;
+        handle.add_interaction(AgentInteraction::Approval {
+            request_id: "await-me".into(),
+            app_id: app.id.to_string(),
+            flavor: crate::agent::interaction::ApprovalFlavor::Permission,
+            prompt: "proceed?".into(),
+        });
+        supervisor.runtimes.lock().await.insert(app.id.clone(), handle);
+        supervisor
+            .lifecycles
+            .lock()
+            .await
+            .insert(
+                app.id.clone(),
+                AppLifecycle::active(std::time::Instant::now()).with_pending_interaction(true),
+            );
+
+        // Suspend persists the pending interaction into `resume.json`...
+        supervisor.suspend(&app.id).await.unwrap();
+        assert!(!supervisor.runtimes.lock().await.contains_key(&app.id));
+        let persisted = ResumeState::load(&session_dir);
+        assert_eq!(persisted.pending_interactions.len(), 1);
+        assert_eq!(persisted.pending_interactions[0].request_id(), "await-me");
+
+        // ...and restore re-attaches it to the new handle before clearing the
+        // record, so the interaction is not lost across the gap.
+        supervisor.ensure_active(&app.id).await.unwrap();
+        assert!(!ResumeState::path_in(&session_dir).is_file());
+        let restored = supervisor.pending_interactions(&app.id).await.unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].request_id(), "await-me");
+
+        // The restored lifecycle keeps the pending-interaction block so the
+        // sweeper will not immediately re-evict an App still awaiting an answer.
+        let blocked = {
+            let lifecycles = supervisor.lifecycles.lock().await;
+            let state = lifecycles.get(&app.id).unwrap().clone();
+            !state.is_idle_evictable(
+                std::time::Instant::now() + Duration::from_secs(10_000),
+                Duration::from_secs(300),
+            )
+        };
+        assert!(blocked, "a restored App with a pending interaction is not evictable");
     }
 }

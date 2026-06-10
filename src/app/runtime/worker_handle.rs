@@ -96,6 +96,31 @@ impl WorkerHandle {
         self.pending_interactions.clone()
     }
 
+    /// Whether any interaction is awaiting a user answer. Read by the supervisor
+    /// to keep the App's lifecycle pending-interaction flag in sync, so the idle
+    /// sweeper never evicts an App that is blocked on a user response.
+    pub fn has_pending_interaction(&self) -> bool {
+        !self.pending_interactions.is_empty()
+    }
+
+    /// Record an interaction the worker just raised, replacing any prior entry
+    /// with the same `request_id` so a re-raised interaction is not duplicated.
+    /// Called from the RPC pump when an [`AgentToHost::Interaction`] frame
+    /// arrives.
+    pub fn add_interaction(&mut self, interaction: AgentInteraction) {
+        let request_id = interaction.request_id().to_string();
+        self.pending_interactions
+            .retain(|existing| existing.request_id() != request_id);
+        self.pending_interactions.push(interaction);
+    }
+
+    /// Replace the pending interactions wholesale. Used on restore to re-attach
+    /// the interactions a tombstoned worker had been awaiting answers for, taken
+    /// from its `resume.json`, before the record is cleared.
+    pub fn set_pending_interactions(&mut self, interactions: Vec<AgentInteraction>) {
+        self.pending_interactions = interactions;
+    }
+
     /// Drop the pending interaction matching `request_id`, called when its answer
     /// has been routed back to the worker.
     pub fn clear_interaction(&mut self, request_id: &str) {
@@ -192,6 +217,46 @@ mod tests {
         assert!(!handle.cancel.is_cancelled());
         handle.shutdown();
         assert!(handle.cancel.is_cancelled());
+    }
+
+    #[test]
+    fn add_interaction_records_and_replaces_by_request_id() {
+        let (mut handle, _outbound_rx) = sample_handle();
+        assert!(!handle.has_pending_interaction());
+        let raise = |id: &str, prompt: &str| AgentInteraction::Approval {
+            request_id: id.into(),
+            app_id: "a".into(),
+            flavor: crate::agent::interaction::ApprovalFlavor::Permission,
+            prompt: prompt.into(),
+        };
+        handle.add_interaction(raise("r1", "first"));
+        assert!(handle.has_pending_interaction());
+        assert_eq!(handle.pending_interactions().len(), 1);
+        // Re-raising the same request id replaces rather than duplicates.
+        handle.add_interaction(raise("r1", "second"));
+        let pending = handle.pending_interactions();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].request_id(), "r1");
+    }
+
+    #[test]
+    fn set_pending_interactions_replaces_wholesale() {
+        let (mut handle, _outbound_rx) = sample_handle();
+        handle.add_interaction(AgentInteraction::Approval {
+            request_id: "old".into(),
+            app_id: "a".into(),
+            flavor: crate::agent::interaction::ApprovalFlavor::Permission,
+            prompt: "?".into(),
+        });
+        handle.set_pending_interactions(vec![AgentInteraction::Approval {
+            request_id: "restored".into(),
+            app_id: "a".into(),
+            flavor: crate::agent::interaction::ApprovalFlavor::Permission,
+            prompt: "?".into(),
+        }]);
+        let pending = handle.pending_interactions();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].request_id(), "restored");
     }
 
     #[test]

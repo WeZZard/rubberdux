@@ -33,13 +33,29 @@ pub struct MemberRecord {
     pub joined: bool,
 }
 
-/// One line of the append-only `merge_log.jsonl`: a record of another App's
-/// sessions being merged into this App during auto-clustering. Implementing the
-/// merge mechanism itself is out of scope here; the log shape is defined so the
-/// store can own the file from the start.
+/// The kind of clustering decision recorded in a [`MergeRecord`]. Every
+/// clusterer decision is logged, not only merges, so the cluster history is
+/// fully auditable (see `docs/app/merge/clustering.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeDecisionKind {
+    /// The source conversation was merged into this App.
+    Join,
+    /// The clusterer decided the source conversation forms a new App; logged
+    /// against that new App so the decision is recorded even without a merge.
+    New,
+}
+
+/// One line of the append-only `merge_log.jsonl`: a record of one clustering
+/// decision for a conversation. A `Join` records another App's session being
+/// absorbed into this App; a `New` records that the conversation stayed its own
+/// App. Logging both kinds keeps every clusterer decision auditable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeRecord {
-    /// The App whose sessions were absorbed.
+    /// Which decision this record captures.
+    pub kind: MergeDecisionKind,
+    /// The App whose conversation the decision concerns: the absorbed App on a
+    /// `Join`, or the App itself on a `New`.
     pub source_app_id: String,
     pub recorded_at: String,
 }
@@ -68,6 +84,12 @@ pub trait AppStore: Send + Sync {
     /// Move an App's directory under the archives subdir, removing it from
     /// `list(include_archived: false)` while keeping it addressable via `get`.
     fn archive(&self, id: &AppId) -> Result<(), Error>;
+
+    /// Bump an App's `last_active` to the current UTC instant and persist the
+    /// manifest, so a `Join` merge makes the target App genuinely
+    /// most-recently-used for board ordering. Errors if the App's manifest is
+    /// absent or unreadable. See `docs/app/merge/clustering.md`.
+    fn touch_last_active(&self, id: &AppId) -> Result<(), Error>;
 
     /// Append a membership change to the App's `members.jsonl` log.
     fn record_member(&self, id: &AppId, record: &MemberRecord) -> Result<(), Error>;
@@ -252,6 +274,26 @@ impl AppStore for FilesystemAppStore {
             fs::create_dir_all(parent).map_err(Error::Io)?;
         }
         fs::rename(&src, &dst).map_err(Error::Io)
+    }
+
+    fn touch_last_active(&self, id: &AppId) -> Result<(), Error> {
+        // Locate the App's manifest in the live directory, falling back to the
+        // archive so a touched App is found wherever it currently lives.
+        let dir = {
+            let live = self.app_dir(id);
+            if live.is_dir() {
+                live
+            } else {
+                self.archive_dir(id)
+            }
+        };
+        let path = dir.join(METADATA_FILE);
+        let raw = fs::read_to_string(&path).map_err(Error::Io)?;
+        // Read the manifest as persisted (without the startup Tombstoned
+        // override `read_manifest` applies) so only `last_active` changes.
+        let mut app: App = serde_json::from_str(&raw).map_err(Error::Json)?;
+        app.last_active = chrono::Utc::now().to_rfc3339();
+        Self::write_manifest(&dir, &app)
     }
 
     fn record_member(&self, id: &AppId, record: &MemberRecord) -> Result<(), Error> {
@@ -475,6 +517,7 @@ mod tests {
             .record_merge(
                 &app.id,
                 &MergeRecord {
+                    kind: MergeDecisionKind::Join,
                     source_app_id: "other".into(),
                     recorded_at: "2026-06-10T00:00:01Z".into(),
                 },
@@ -490,6 +533,47 @@ mod tests {
         assert!(merges.contains("\"other\""));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn touch_last_active_updates_and_persists_timestamp() {
+        let dir = temp_apps_dir();
+        let store = FilesystemAppStore::with_apps_dir(dir.clone());
+
+        // Persist an App with a stale `last_active` far in the past so any bump
+        // to the current instant is observably different.
+        let mut app = sample_app("2026-06-10-00-00-08-UTC");
+        app.last_active = "2000-01-01T00:00:00+00:00".into();
+        store.create(&app).unwrap();
+        // `create` writes the manifest from `app` as-is, preserving the stale
+        // timestamp we set above.
+        let app_dir = dir.join(app.id.as_str());
+        fs::write(
+            app_dir.join(METADATA_FILE),
+            serde_json::to_string(&app).unwrap(),
+        )
+        .unwrap();
+
+        let before = store.get(&app.id).unwrap().unwrap().last_active;
+        assert_eq!(before, "2000-01-01T00:00:00+00:00");
+
+        store.touch_last_active(&app.id).unwrap();
+
+        let after = store.get(&app.id).unwrap().unwrap().last_active;
+        assert_ne!(after, before, "last_active must change after a touch");
+        // The persisted timestamp parses as RFC 3339 and is newer than before.
+        let after_ts = chrono::DateTime::parse_from_rfc3339(&after).unwrap();
+        let before_ts = chrono::DateTime::parse_from_rfc3339(&before).unwrap();
+        assert!(after_ts > before_ts);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn touch_last_active_on_missing_app_errors() {
+        let dir = temp_apps_dir();
+        let store = FilesystemAppStore::with_apps_dir(dir.clone());
+        assert!(store.touch_last_active(&AppId("nope".into())).is_err());
     }
 
     #[test]

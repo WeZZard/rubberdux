@@ -1,75 +1,68 @@
 import XCTest
 @testable import Rubberdux
 
+/// Decode tests for `BoardEvent` against the real backend-shaped frames the
+/// gateway emits from `BoardWsMessage` in `src/gateway/apps_stream.rs`. These
+/// assert on the actual wire JSON (tag field `type`, snake_case keys), not a
+/// Swift-internal round-trip, so a drift from the backend surface fails here.
 final class BoardEventTests: XCTestCase {
 
-    private func roundTrip<T: Codable & Equatable>(_ value: T) throws -> T {
-        let data = try JSONEncoder().encode(value)
-        return try JSONDecoder().decode(T.self, from: data)
+    private func decode(_ json: String) throws -> BoardEvent {
+        try JSONDecoder().decode(BoardEvent.self, from: Data(json.utf8))
     }
 
-    private func makeApp() -> App {
-        App(
-            id: "app-1",
-            title: "Test App",
-            icon: Icon(symbol: "star", color: "#0000FF"),
-            position: BoardPosition(row: 1, column: 2),
-            status: .active,
-            summary: "A test",
-            userLocked: false,
-            lastActive: "2024-01-01T00:00:00Z"
-        )
+    func testDecodesAppCreatedFromBackendFrame() throws {
+        let json = """
+        {
+            "type": "app_created",
+            "app": {
+                "id": "2024-01-01-00-00-00-UTC",
+                "title": "Plan offsite",
+                "icon": { "symbol": "calendar", "color": "#FF6B6B" },
+                "position": { "row": 1, "column": 2 },
+                "status": "active",
+                "summary": "Planning an offsite",
+                "user_locked": false,
+                "last_active": "2024-01-01T00:00:00Z"
+            }
+        }
+        """
+        guard case .appCreated(let app) = try decode(json) else {
+            return XCTFail("expected .appCreated")
+        }
+        XCTAssertEqual(app.id, "2024-01-01-00-00-00-UTC")
+        XCTAssertEqual(app.title, "Plan offsite")
+        XCTAssertEqual(app.icon.symbol, "calendar")
+        XCTAssertEqual(app.status, .active)
     }
 
-    func testCreatedRoundTrip() throws {
-        let event = BoardEvent.created(app: makeApp())
-        XCTAssertEqual(try roundTrip(event), event)
+    func testDecodesUpdatedFromBackendFrame() throws {
+        let json = #"{ "type": "updated", "id": "app-y" }"#
+        guard case .updated(let id) = try decode(json) else {
+            return XCTFail("expected .updated")
+        }
+        XCTAssertEqual(id, "app-y")
     }
 
-    func testCreatedKindTag() throws {
-        let event = BoardEvent.created(app: makeApp())
-        let json = try JSONSerialization.jsonObject(
-            with: JSONEncoder().encode(event)
-        ) as! [String: Any]
-        XCTAssertEqual(json["kind"] as? String, "created")
+    func testDecodesArchivedFromBackendFrame() throws {
+        let json = #"{ "type": "archived", "id": "app-z" }"#
+        guard case .archived(let id) = try decode(json) else {
+            return XCTFail("expected .archived")
+        }
+        XCTAssertEqual(id, "app-z")
     }
 
-    func testStatusChangedRoundTrip() throws {
-        let event = BoardEvent.statusChanged(id: "app-1", status: .tombstoned)
-        XCTAssertEqual(try roundTrip(event), event)
+    func testDecodesBadgeFromBackendFrame() throws {
+        let json = #"{ "type": "badge", "app_id": "app-x", "count": 2 }"#
+        guard case .badge(let appId, let count) = try decode(json) else {
+            return XCTFail("expected .badge")
+        }
+        XCTAssertEqual(appId, "app-x")
+        XCTAssertEqual(count, 2)
     }
 
-    func testStatusChangedKindTag() throws {
-        let event = BoardEvent.statusChanged(id: "app-1", status: .active)
-        let json = try JSONSerialization.jsonObject(
-            with: JSONEncoder().encode(event)
-        ) as! [String: Any]
-        XCTAssertEqual(json["kind"] as? String, "status_changed")
-    }
-
-    func testMovedRoundTrip() throws {
-        let event = BoardEvent.moved(id: "app-1", position: BoardPosition(row: 3, column: 4))
-        XCTAssertEqual(try roundTrip(event), event)
-    }
-
-    func testMovedKindTag() throws {
-        let event = BoardEvent.moved(id: "app-1", position: BoardPosition(row: 0, column: 0))
-        let json = try JSONSerialization.jsonObject(
-            with: JSONEncoder().encode(event)
-        ) as! [String: Any]
-        XCTAssertEqual(json["kind"] as? String, "moved")
-    }
-
-    func testArchivedRoundTrip() throws {
-        let event = BoardEvent.archived(id: "app-1")
-        XCTAssertEqual(try roundTrip(event), event)
-    }
-
-    func testArchivedKindTag() throws {
-        let event = BoardEvent.archived(id: "app-1")
-        let json = try JSONSerialization.jsonObject(
-            with: JSONEncoder().encode(event)
-        ) as! [String: Any]
-        XCTAssertEqual(json["kind"] as? String, "archived")
+    func testRejectsUnknownType() {
+        let json = #"{ "type": "moved", "id": "app-1" }"#
+        XCTAssertThrowsError(try decode(json))
     }
 }

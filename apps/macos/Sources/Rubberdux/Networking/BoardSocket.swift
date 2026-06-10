@@ -5,7 +5,8 @@ import Foundation
 
 /// A WebSocket subscription to the board-level event stream
 /// (`/api/v1/ws/board`). Emits `BoardEvent` values whenever the backend
-/// broadcasts a lifecycle change (app created, moved, archived, status changed).
+/// broadcasts a board frame (app created, updated, archived, or a badge count
+/// change). Mirrors `BoardWsMessage` in `src/gateway/apps_stream.rs`.
 ///
 /// Callers obtain a `BoardSocket` from `AppSocketRegistry`; the registry
 /// ref-counts open/close so the underlying task is shared when multiple

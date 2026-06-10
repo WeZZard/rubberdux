@@ -10,6 +10,7 @@
 // The subprocess supervisor reuses the host's `Hello`-routed accept path
 // (`crate::host`), which is itself gated on the `host` feature; gate the
 // supervisor the same way so an agent-only build still compiles.
+pub mod lifecycle;
 #[cfg(feature = "host")]
 pub mod local_supervisor;
 pub mod worker;

@@ -26,6 +26,11 @@ use tokio::sync::broadcast;
 use crate::agent::interaction::{AgentInteraction, InteractionResponse};
 use crate::agent::runtime::port::EntryNotification;
 use crate::app::identity::derive_identity;
+use crate::app::merge::clustering::LlmClusterer;
+use crate::app::merge::{ClusterCandidate, ClusterDecision, Clusterer};
+use crate::app::registry::store::{
+    AppStore, FilesystemAppStore, MemberRecord, MergeDecisionKind, MergeRecord,
+};
 use crate::app::supervisor::{AppSupervisor, CreateAppRequest};
 use crate::app::{App, AppId, BoardPosition, IconSpec};
 use crate::error::Error;
@@ -361,6 +366,14 @@ async fn list_apps(
 /// App with a heuristic identity; deriving the title + icon from the task hits
 /// the LLM, so it runs on a background task per the root convention that the
 /// chat handler must never block. The created App is returned right away.
+///
+/// Auto-merge clustering also runs off this path on a background task: it
+/// consults the [`Clusterer`] against the other (non-`user_locked`) Apps and,
+/// when the new conversation clearly belongs with an existing App, routes the
+/// originating task into that App's worker, bumps its `last_active`, and records
+/// the merge in `merge_log.jsonl`. The decision never blocks the request, and a
+/// `Join` is additive — the freshly created tile is still returned. See
+/// `docs/app/merge/clustering.md`.
 async fn create_app(
     State(state): State<Arc<GatewayState>>,
     Json(body): Json<CreateAppBody>,
@@ -400,7 +413,114 @@ async fn create_app(
         });
     }
 
+    // Consult the clusterer off the request path. Reuses the gateway's existing
+    // identity client (a `MoonshotClient`) — no new state field — and the
+    // supervisor already in state. See `docs/app/merge/clustering.md`.
+    if let (Some(client), Some(supervisor)) =
+        (state.identity_client.clone(), state.supervisor.clone())
+    {
+        let new_app_id = app.id.clone();
+        let summary = body.task.clone();
+        tokio::spawn(async move {
+            consult_clusterer(supervisor, client, new_app_id, summary).await;
+        });
+    }
+
     Ok((StatusCode::CREATED, Json(app.into())))
+}
+
+/// Run the auto-merge decision for a just-created App and apply it. Lists the
+/// other non-`user_locked` Apps as candidates, classifies via the
+/// [`LlmClusterer`], and on a `Join` routes the originating task into the
+/// matched App's worker (which makes the merged App the most-recently-active,
+/// the live `last_active` bump), records the merge in `merge_log.jsonl`, and
+/// records the merged session as a new member. Every branch is best-effort and
+/// non-fatal: this runs on a background task, so failures are logged, not
+/// propagated. See `docs/app/merge/clustering.md`.
+async fn consult_clusterer(
+    supervisor: Arc<dyn DynAppSupervisor>,
+    client: Arc<crate::provider::moonshot::MoonshotClient>,
+    new_app_id: AppId,
+    summary: String,
+) {
+    let apps = match supervisor.list().await {
+        Ok(apps) => apps,
+        Err(e) => {
+            log::warn!("clustering: failed to list candidate Apps: {e}");
+            return;
+        }
+    };
+
+    // Candidates exclude the just-created App and every `user_locked` App: the
+    // clusterer must never override a user's pin.
+    let candidates: Vec<ClusterCandidate> = apps
+        .into_iter()
+        .filter(|a| a.id != new_app_id && !a.user_locked)
+        .map(|a| ClusterCandidate {
+            app_id: a.id.0,
+            summary: a.summary,
+        })
+        .collect();
+
+    let clusterer = LlmClusterer::new(client);
+    let decision = clusterer.classify(&summary, &candidates).await;
+
+    // Every decision is recorded so the cluster history is auditable. The store
+    // resolves `RUBBERDUX_HOME` the same way the supervisor's does, so it sees
+    // the same on-disk Apps.
+    let store = FilesystemAppStore::new();
+    let now = chrono::Utc::now().to_rfc3339();
+    match decision {
+        ClusterDecision::Join { app_id } => {
+            let target = AppId(app_id);
+            log::info!("clustering: merging App `{new_app_id}` into `{target}`");
+
+            // Route the originating conversation into the existing App's worker.
+            if let Err(e) = supervisor.send_message(&target, summary.clone()).await {
+                log::warn!("clustering: failed to route merged message into `{target}`: {e}");
+            }
+
+            // Bump and persist the target App's `last_active` so the merge makes
+            // it genuinely most-recently-used in board ordering, independent of
+            // any worker-side effect of routing the message.
+            if let Err(e) = store.touch_last_active(&target) {
+                log::warn!("clustering: failed to bump last_active for `{target}`: {e}");
+            }
+
+            // Record the merge in the target's append-only logs so the cluster's
+            // history is auditable.
+            let merge = MergeRecord {
+                kind: MergeDecisionKind::Join,
+                source_app_id: new_app_id.0.clone(),
+                recorded_at: now.clone(),
+            };
+            if let Err(e) = store.record_merge(&target, &merge) {
+                log::warn!("clustering: failed to append merge_log for `{target}`: {e}");
+            }
+            let member = MemberRecord {
+                session_id: new_app_id.0.clone(),
+                recorded_at: now,
+                joined: true,
+            };
+            if let Err(e) = store.record_member(&target, &member) {
+                log::warn!("clustering: failed to append members log for `{target}`: {e}");
+            }
+        }
+        ClusterDecision::New => {
+            log::info!("clustering: App `{new_app_id}` stays a new app");
+
+            // A `New` decision is logged against the new App itself, so every
+            // clusterer decision — not only merges — is recorded.
+            let record = MergeRecord {
+                kind: MergeDecisionKind::New,
+                source_app_id: new_app_id.0.clone(),
+                recorded_at: now,
+            };
+            if let Err(e) = store.record_merge(&new_app_id, &record) {
+                log::warn!("clustering: failed to append merge_log for `{new_app_id}`: {e}");
+            }
+        }
+    }
 }
 
 async fn get_app(
@@ -617,6 +737,11 @@ mod tests {
     use crate::provider::moonshot::MoonshotClient;
     use crate::session::SessionManager;
 
+    /// Serializes tests that mutate the process-global `RUBBERDUX_HOME` so the
+    /// clusterer's `FilesystemAppStore::new()` resolves to the same temp home its
+    /// supervisor uses, without racing other tests on the env var.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn dummy_input_port() -> InputPort {
         let (tx, _rx) = tokio::sync::mpsc::channel::<LoopEvent>(8);
         InputPort::new(tx)
@@ -775,5 +900,166 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A `Join` decision must genuinely bump and persist the target App's
+    /// `last_active`, so MRU board ordering reflects the merge. Drives
+    /// `consult_clusterer` directly with the lexical fallback forced to `Join`
+    /// (the dummy client points at an unreachable URL, and the candidate's
+    /// summary is identical to the new conversation's, so Jaccard is 1.0).
+    #[tokio::test]
+    async fn join_merge_bumps_and_persists_last_active() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // The clusterer's `FilesystemAppStore::new()` resolves `RUBBERDUX_HOME`;
+        // point it at the same temp home the supervisor's store roots under so
+        // both see the same Apps on disk.
+        let home = tempfile::tempdir().unwrap().into_path();
+        let prev = std::env::var("RUBBERDUX_HOME").ok();
+        // Edition 2024 marks env mutation `unsafe`; `ENV_LOCK` keeps it serialized.
+        unsafe {
+            std::env::set_var("RUBBERDUX_HOME", &home);
+        }
+
+        let session_manager = Arc::new(SessionManager {
+            home_dir: home.clone(),
+            sessions_dir: home.join("sessions"),
+            latest_link: home.join("latest"),
+        });
+        let store: Arc<dyn AppStore> =
+            Arc::new(FilesystemAppStore::with_apps_dir(home.join("apps")));
+
+        // The existing target App the new conversation should merge into, with a
+        // stale `last_active` far in the past so any bump is observable.
+        let target_id = AppId("2026-06-10-00-00-00-UTC".into());
+        let mut target = App::new(
+            target_id.clone(),
+            "Plan the trip".into(),
+            IconSpec {
+                symbol: "airplane".into(),
+                color: "#3478F6".into(),
+            },
+            BoardPosition { row: 1, column: 1 },
+        );
+        target.summary = "plan the tokyo trip itinerary".into();
+        target.last_active = "2000-01-01T00:00:00+00:00".into();
+        store.create(&target).unwrap();
+        // `create` wrote the manifest; ensure the stale timestamp is on disk.
+        let target_dir = home.join("apps").join(target_id.as_str());
+        std::fs::write(
+            target_dir.join("metadata.json"),
+            serde_json::to_string(&target).unwrap(),
+        )
+        .unwrap();
+
+        let supervisor: Arc<dyn DynAppSupervisor> = Arc::new(MemorySupervisor::new(
+            dummy_client(),
+            session_manager,
+            store.clone(),
+        ));
+
+        // The just-created App whose conversation we are clustering. Its summary
+        // matches the target's exactly, so the offline lexical fallback joins it.
+        let new_id = AppId("2026-06-10-00-01-00-UTC".into());
+        let mut new_app = target.clone();
+        new_app.id = new_id.clone();
+        new_app.last_active = chrono::Utc::now().to_rfc3339();
+        store.create(&new_app).unwrap();
+
+        let before = store.get(&target_id).unwrap().unwrap().last_active;
+        assert_eq!(before, "2000-01-01T00:00:00+00:00");
+
+        consult_clusterer(
+            supervisor,
+            dummy_client(),
+            new_id.clone(),
+            "plan the tokyo trip itinerary".into(),
+        )
+        .await;
+
+        // The target App's `last_active` was bumped and persisted.
+        let after = store.get(&target_id).unwrap().unwrap().last_active;
+        assert_ne!(after, before, "Join must bump the target's last_active");
+        let after_ts = chrono::DateTime::parse_from_rfc3339(&after).unwrap();
+        let before_ts = chrono::DateTime::parse_from_rfc3339(&before).unwrap();
+        assert!(after_ts > before_ts);
+
+        // The Join was recorded in the target's merge log.
+        let merge_log =
+            std::fs::read_to_string(target_dir.join("merge_log.jsonl")).unwrap();
+        assert!(merge_log.contains("\"join\""));
+        assert!(merge_log.contains(new_id.as_str()));
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("RUBBERDUX_HOME", v),
+                None => std::env::remove_var("RUBBERDUX_HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A `New` decision must still be recorded, so every clusterer decision is
+    /// auditable. With no candidates, the clusterer chooses `New`; the record is
+    /// logged against the new App itself.
+    #[tokio::test]
+    async fn new_decision_is_recorded_in_merge_log() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let home = tempfile::tempdir().unwrap().into_path();
+        let prev = std::env::var("RUBBERDUX_HOME").ok();
+        unsafe {
+            std::env::set_var("RUBBERDUX_HOME", &home);
+        }
+
+        let session_manager = Arc::new(SessionManager {
+            home_dir: home.clone(),
+            sessions_dir: home.join("sessions"),
+            latest_link: home.join("latest"),
+        });
+        let store: Arc<dyn AppStore> =
+            Arc::new(FilesystemAppStore::with_apps_dir(home.join("apps")));
+
+        // The only App on disk is the new one, so the candidate set is empty and
+        // the decision is `New`.
+        let new_id = AppId("2026-06-10-00-02-00-UTC".into());
+        let new_app = App::new(
+            new_id.clone(),
+            "Standalone task".into(),
+            IconSpec {
+                symbol: "doc".into(),
+                color: "#8E8E93".into(),
+            },
+            BoardPosition { row: 2, column: 2 },
+        );
+        store.create(&new_app).unwrap();
+
+        let supervisor: Arc<dyn DynAppSupervisor> =
+            Arc::new(MemorySupervisor::new(dummy_client(), session_manager, store));
+
+        consult_clusterer(
+            supervisor,
+            dummy_client(),
+            new_id.clone(),
+            "an entirely unrelated standalone task".into(),
+        )
+        .await;
+
+        let merge_log = std::fs::read_to_string(
+            home.join("apps")
+                .join(new_id.as_str())
+                .join("merge_log.jsonl"),
+        )
+        .unwrap();
+        assert!(merge_log.contains("\"new\""));
+        assert!(merge_log.contains(new_id.as_str()));
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("RUBBERDUX_HOME", v),
+                None => std::env::remove_var("RUBBERDUX_HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

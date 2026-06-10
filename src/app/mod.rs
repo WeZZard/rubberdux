@@ -9,6 +9,7 @@
 //! `docs/app/whiteboard-backend.md`.
 
 pub mod identity;
+pub mod merge;
 pub mod registry;
 pub mod runtime;
 pub mod supervisor;
