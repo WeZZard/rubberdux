@@ -75,6 +75,9 @@ pub fn router() -> axum::Router<Arc<GatewayState>> {
         .route("/api/v1/prompts/system", get(get_system_prompt))
         .route("/api/v1/prompts/identity", get(get_identity_prompt))
         .route("/api/v1/prompts/soul", get(get_soul_prompt))
+        // The multi-App board REST surface is additive to the single-agent
+        // endpoints above. See `docs/gateway/apps.md`.
+        .merge(super::apps::router())
 }
 
 // ---------------------------------------------------------------------------

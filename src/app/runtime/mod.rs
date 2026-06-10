@@ -7,4 +7,10 @@
 //! that process is designed and implemented separately. The lifecycle rationale
 //! is in `docs/app/runtime/worker-lifecycle.md`.
 
+// The subprocess supervisor reuses the host's `Hello`-routed accept path
+// (`crate::host`), which is itself gated on the `host` feature; gate the
+// supervisor the same way so an agent-only build still compiles.
+#[cfg(feature = "host")]
+pub mod local_supervisor;
 pub mod worker;
+pub mod worker_handle;

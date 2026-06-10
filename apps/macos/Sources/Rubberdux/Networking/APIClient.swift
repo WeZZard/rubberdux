@@ -2,8 +2,8 @@ import Foundation
 
 final class APIClient {
     let baseURL: URL
-    private let session: URLSession
-    private let decoder: JSONDecoder
+    let session: URLSession
+    let decoder: JSONDecoder
 
     init(baseURL: URL = URL(string: "http://localhost:19385")!) {
         self.baseURL = baseURL

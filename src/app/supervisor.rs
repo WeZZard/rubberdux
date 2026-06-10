@@ -65,66 +65,79 @@ pub enum BoardEvent {
 ///
 /// Methods take `&self`: a supervisor is shared behind an `Arc` and serializes
 /// its own mutable state internally, so callers never need a `&mut` handle.
-#[allow(async_fn_in_trait)]
 pub trait AppSupervisor: Send + Sync {
     /// Create, persist, and (for an in-process supervisor) start a new App.
     /// `initial_prompt` is the originating task message delivered to the new
     /// worker as the first user turn.
-    async fn create_app(
+    fn create_app(
         &self,
         request: CreateAppRequest,
         initial_prompt: String,
-    ) -> Result<App, Error>;
+    ) -> impl std::future::Future<Output = Result<App, Error>> + Send;
 
     /// List Apps on the board. Archived Apps are omitted.
-    async fn list(&self) -> Result<Vec<App>, Error>;
+    fn list(&self) -> impl std::future::Future<Output = Result<Vec<App>, Error>> + Send;
 
     /// Fetch a single App by id, or `None` if it does not exist.
-    async fn get(&self, id: &AppId) -> Result<Option<App>, Error>;
+    fn get(
+        &self,
+        id: &AppId,
+    ) -> impl std::future::Future<Output = Result<Option<App>, Error>> + Send;
 
     /// Deliver a user message to a running App's worker. Errors if the App has
     /// no active worker (it must be restored first).
-    async fn send_message(&self, id: &AppId, text: String) -> Result<(), Error>;
+    fn send_message(
+        &self,
+        id: &AppId,
+        text: String,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
     /// Subscribe to an App's history-entry stream. Errors if the App has no
     /// active worker.
-    async fn subscribe_entries(
+    fn subscribe_entries(
         &self,
         id: &AppId,
-    ) -> Result<broadcast::Receiver<EntryNotification>, Error>;
+    ) -> impl std::future::Future<Output = Result<broadcast::Receiver<EntryNotification>, Error>> + Send;
 
     /// Subscribe to an App's trajectory-event stream. Errors if the App has no
     /// active worker.
-    async fn subscribe_trajectory(
+    fn subscribe_trajectory(
         &self,
         id: &AppId,
-    ) -> Result<broadcast::Receiver<TrajectoryEvent>, Error>;
+    ) -> impl std::future::Future<Output = Result<broadcast::Receiver<TrajectoryEvent>, Error>> + Send;
 
     /// The interactions an App's worker has raised and is awaiting a response
     /// for. Errors if the App has no active worker.
-    async fn pending_interactions(&self, id: &AppId) -> Result<Vec<AgentInteraction>, Error>;
+    fn pending_interactions(
+        &self,
+        id: &AppId,
+    ) -> impl std::future::Future<Output = Result<Vec<AgentInteraction>, Error>> + Send;
 
     /// Answer a pending interaction raised by an App's worker. Errors if the
     /// App has no active worker.
-    async fn respond_to_interaction(
+    fn respond_to_interaction(
         &self,
         id: &AppId,
         response: InteractionResponse,
-    ) -> Result<(), Error>;
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
     /// Suspend a running App: stop its worker and mark it `Tombstoned`. A no-op
     /// if the App is already suspended.
-    async fn suspend(&self, id: &AppId) -> Result<(), Error>;
+    fn suspend(&self, id: &AppId) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
     /// Restore a suspended App: start its worker again and mark it `Active`. A
     /// no-op if the App is already active.
-    async fn restore(&self, id: &AppId) -> Result<(), Error>;
+    fn restore(&self, id: &AppId) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
     /// Archive an App: suspend any worker and move it off the default board.
-    async fn archive(&self, id: &AppId) -> Result<(), Error>;
+    fn archive(&self, id: &AppId) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
     /// Move an App to a new board position.
-    async fn move_app(&self, id: &AppId, position: BoardPosition) -> Result<(), Error>;
+    fn move_app(
+        &self,
+        id: &AppId,
+        position: BoardPosition,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
     /// Subscribe to the board's App-lifecycle event stream.
     fn subscribe_board(&self) -> broadcast::Receiver<BoardEvent>;

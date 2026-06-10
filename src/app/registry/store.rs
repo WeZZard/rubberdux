@@ -59,6 +59,12 @@ pub trait AppStore: Send + Sync {
     /// Fetch a single App by id, searching the live directory then the archive.
     fn get(&self, id: &AppId) -> Result<Option<App>, Error>;
 
+    /// The App's on-disk home directory: the root a native worker is told to
+    /// place its session data under via `--app-session-dir`, so all of an App's
+    /// data lives inside the App's own directory. See
+    /// `docs/app/runtime/worker-lifecycle.md`.
+    fn app_dir(&self, id: &AppId) -> PathBuf;
+
     /// Move an App's directory under the archives subdir, removing it from
     /// `list(include_archived: false)` while keeping it addressable via `get`.
     fn archive(&self, id: &AppId) -> Result<(), Error>;
@@ -104,10 +110,6 @@ impl FilesystemAppStore {
                     .unwrap_or_else(|| PathBuf::from("."))
                     .join(".rubberdux")
             })
-    }
-
-    fn app_dir(&self, id: &AppId) -> PathBuf {
-        self.apps_dir.join(id.as_str())
     }
 
     fn archive_dir(&self, id: &AppId) -> PathBuf {
@@ -222,6 +224,10 @@ impl AppStore for FilesystemAppStore {
             apps.extend(Self::list_dir(&self.apps_dir.join(ARCHIVES_DIR))?);
         }
         Ok(apps)
+    }
+
+    fn app_dir(&self, id: &AppId) -> PathBuf {
+        self.apps_dir.join(id.as_str())
     }
 
     fn get(&self, id: &AppId) -> Result<Option<App>, Error> {
