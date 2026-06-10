@@ -42,4 +42,7 @@ pub enum Error {
 
     #[error("app error: {0}")]
     App(String),
+
+    #[error("peer error: {0}")]
+    Peer(String),
 }

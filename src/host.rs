@@ -12,6 +12,157 @@ use crate::vm::manager::VMManager;
 
 const DEFAULT_RPC_PORT: u16 = 19384;
 
+// ---------------------------------------------------------------------------
+// Peer broker: the directory + relay (a switch, not an orchestrator)
+// ---------------------------------------------------------------------------
+
+/// A live delivery sink for one local App worker: the channel the broker writes a
+/// resolved [`PeerDeliver`](crate::protocol::HostToAgent::PeerDeliver) frame into.
+/// Held only while the worker is running; absent for a tombstoned or archived App,
+/// for which the broker queues to the inbox instead. The broker treats the sink as
+/// opaque — it forwards an envelope and makes no decision about its contents.
+pub type PeerSink = tokio::sync::mpsc::Sender<crate::protocol::HostToAgent>;
+
+/// The host's peer broker: a directory + relay that resolves a
+/// [`PeerId`](crate::app::peer::PeerId) to a connection and forwards opaque
+/// message envelopes. It is a **switch, not an orchestrator** (design decision
+/// D5, `docs/app/peer/decentralized-messaging.md`): it makes no routing or
+/// coordination decisions beyond "is this target's worker live right now?".
+///
+/// - If the target peer has a live sink, the broker delivers the envelope to it
+///   directly (the directory is refreshed on every such delivery, keeping the
+///   most-recently-used ordering current).
+/// - Otherwise the target is offline (tombstoned or human-archived — both are
+///   still addressable): the broker queues the envelope to the target's
+///   `inbox.jsonl` and signals that the App should be woken, so a restore drains
+///   it. Archiving is human-facing and does **not** gate addressability.
+///
+/// The same resolution works for a remote peer once the broker federates over the
+/// general TCP transport: a non-local [`PeerId`] is forwarded to the node that
+/// owns it. That path is not wired here, but the addressing model already carries
+/// the node identity so adding it later changes no call site.
+pub struct PeerBroker {
+    store: Arc<dyn crate::app::registry::store::AppStore>,
+    directory: Mutex<crate::app::peer::directory::PeerDirectory>,
+    /// Live delivery sinks keyed by peer id. A present entry means the peer's
+    /// worker is running and can be delivered to directly.
+    sinks: Mutex<HashMap<crate::app::peer::PeerId, PeerSink>>,
+}
+
+/// What the broker decided for one `PeerSend`: either it was delivered to a live
+/// worker, or it was queued to the offline target's inbox (and the target should
+/// be woken so a restore drains it). Returned so the caller — the supervisor —
+/// performs the side effect it owns (restoring the App) without the broker
+/// reaching into supervision: the broker stays a switch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerRouteOutcome {
+    /// The envelope was handed to the target's live delivery sink.
+    Delivered,
+    /// The target's worker was not running; the envelope was queued to its inbox.
+    /// The supervisor should restore the target so the inbox is drained to it.
+    Queued { wake: crate::app::peer::PeerId },
+    /// The sender tried to address a peer it may not (itself); nothing was sent.
+    Rejected,
+}
+
+impl PeerBroker {
+    /// A broker backed by the given App store, with an empty directory and no
+    /// live sinks. The store is consulted only for an App's on-disk directory
+    /// (`app_dir`) when queueing to an inbox; routing decisions stay minimal.
+    pub fn new(store: Arc<dyn crate::app::registry::store::AppStore>) -> Self {
+        Self {
+            store,
+            directory: Mutex::new(crate::app::peer::directory::PeerDirectory::new()),
+            sinks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Register a live worker's delivery sink and admit it to the directory,
+    /// called when an App's worker becomes active. Makes the App both reachable
+    /// (listed by `peer_list`) and directly deliverable.
+    pub async fn register(&self, id: crate::app::peer::PeerId, sink: PeerSink) {
+        self.directory.lock().await.register(id.clone());
+        self.sinks.lock().await.insert(id, sink);
+    }
+
+    /// Remove a worker's sink and drop it from the directory, called when the
+    /// App's worker stops (tombstone/suspend/archive). The App stays addressable:
+    /// a later `PeerSend` to it is queued to its inbox.
+    pub async fn unregister(&self, id: &crate::app::peer::PeerId) {
+        self.sinks.lock().await.remove(id);
+        self.directory.lock().await.unregister(id);
+    }
+
+    /// The peers `from` may address right now, in most-recently-used order. The
+    /// answer to a worker's `PeerList`. Refreshes `from`'s own recency since
+    /// asking is itself activity.
+    pub async fn list_for(&self, from: &crate::app::peer::PeerId) -> Vec<crate::app::peer::PeerId> {
+        let mut directory = self.directory.lock().await;
+        directory.touch(from);
+        directory.addressable_by(from)
+    }
+
+    /// Relay one peer message from `from` to `to`. The broker's whole job: resolve
+    /// `to` to a live sink and deliver, or queue to its inbox if offline. It makes
+    /// no decision about the payload — it forwards the envelope verbatim. Returns
+    /// the [`PeerRouteOutcome`] so the supervisor performs any wake it owns.
+    pub async fn relay(
+        &self,
+        from: crate::app::peer::PeerId,
+        to: crate::app::peer::PeerId,
+        payload: serde_json::Value,
+    ) -> Result<PeerRouteOutcome, Error> {
+        // The single policy gate: an App may not address itself.
+        {
+            let directory = self.directory.lock().await;
+            if !directory.may_send(&from, &to) {
+                return Ok(PeerRouteOutcome::Rejected);
+            }
+        }
+
+        // Sending is activity: refresh the sender's most-recently-used position.
+        self.directory.lock().await.touch(&from);
+
+        // Try a live delivery first.
+        let sink = self.sinks.lock().await.get(&to).cloned();
+        if let Some(sink) = sink {
+            let frame = crate::protocol::HostToAgent::PeerDeliver {
+                // The protocol `from` names the sending App; the node identity
+                // lives in the directory/envelope, not in this user-facing field.
+                from: from.app_id.to_string(),
+                // Clone so the envelope survives for the inbox fall-through if the
+                // sink turns out to be closed; the common case delivers and drops
+                // the original below.
+                payload: payload.clone(),
+            };
+            if sink.send(frame).await.is_ok() {
+                // A delivered-to peer is active: refresh its recency too.
+                self.directory.lock().await.touch(&to);
+                return Ok(PeerRouteOutcome::Delivered);
+            }
+            // The sink was closed out from under us (the worker is stopping):
+            // fall through to the inbox so the message is not lost.
+            self.unregister(&to).await;
+        }
+
+        // The target is offline (tombstoned or archived) or its sink just closed:
+        // queue to its inbox and ask the caller to wake it. Both states are still
+        // addressable — archiving is human-facing, orthogonal to addressability.
+        let envelope = crate::app::peer::mailbox::PeerEnvelope {
+            from,
+            payload,
+        };
+        // Queue into the target's *real* addressable home (live or archive), not
+        // unconditionally the live directory: an archived App lives under the
+        // archive, and writing an inbox to a fresh live directory would shadow its
+        // manifest. `addressable_home` resolves the correct directory so the
+        // restore drains exactly what was queued.
+        let app_dir = self.store.addressable_home(&to.app_id);
+        crate::app::peer::mailbox::Mailbox::in_dir(&app_dir).enqueue(&envelope)?;
+        Ok(PeerRouteOutcome::Queued { wake: to })
+    }
+}
+
 /// The read/write halves of an accepted worker socket, paired so a caller can
 /// keep streaming after the routing decision has been made.
 pub struct WorkerStream {
@@ -218,8 +369,16 @@ pub async fn run(config: HostConfig, bot: Bot) {
         }
         Err(e) => {
             log::warn!("Failed to bind RPC listener on port {}: {} (VM isolation disabled)", config.rpc_port, e);
-            // Continue without VM support — isolate=true will return an error
-            Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("Failed to bind fallback listener"))
+            // Continue without VM support — isolate=true will return an error.
+            // If even the loopback fallback cannot bind, the host has no RPC
+            // transport at all: log and abort startup rather than panicking.
+            match TcpListener::bind("127.0.0.1:0").await {
+                Ok(l) => Arc::new(l),
+                Err(e) => {
+                    log::error!("Failed to bind fallback RPC listener: {e}; aborting host startup");
+                    return;
+                }
+            }
         }
     };
 
@@ -236,9 +395,13 @@ pub async fn run(config: HostConfig, bot: Bot) {
     // Initialize session manager and create new session
     let session_manager = Arc::new(crate::session::SessionManager::new());
     let model = std::env::var("RUBBERDUX_LLM_MODEL").unwrap_or_else(|_| "kimi-for-coding".into());
-    let (session_id, session_dir) = session_manager
-        .create_session(model)
-        .expect("Failed to create session");
+    let (session_id, session_dir) = match session_manager.create_session(model) {
+        Ok(session) => session,
+        Err(e) => {
+            log::error!("Failed to create session: {e}; aborting host startup");
+            return;
+        }
+    };
 
     log::info!(
         "Created session: {} at {}",
@@ -255,12 +418,18 @@ pub async fn run(config: HostConfig, bot: Bot) {
     }
 
     let mindset = Arc::new(crate::mindset::Mindset::new());
-    mindset.ensure_dirs().expect("Failed to initialize mindset");
+    if let Err(e) = mindset.ensure_dirs() {
+        log::error!("Failed to initialize mindset: {e}; aborting host startup");
+        return;
+    }
     mindset.seed_defaults_if_empty(&project_root.join("prompts"));
     log::info!("Mindset root: {}", mindset.root.display());
 
     let workspace = Arc::new(crate::workspace::Workspace::new());
-    workspace.ensure_dirs().expect("Failed to initialize workspace");
+    if let Err(e) = workspace.ensure_dirs() {
+        log::error!("Failed to initialize workspace: {e}; aborting host startup");
+        return;
+    }
 
     log::info!("Workspace root: {}", workspace.root.display());
 
@@ -669,6 +838,101 @@ mod tests {
         let cmd = build_agent_command(&config, Some("task-123"));
         assert!(cmd.contains("--task-id"));
         assert!(cmd.contains("task-123"));
+    }
+
+    // -- PeerBroker: directory + relay (a switch, not an orchestrator) --------
+
+    fn broker_store() -> Arc<dyn crate::app::registry::store::AppStore> {
+        let dir = tempfile::tempdir().unwrap().into_path();
+        Arc::new(crate::app::registry::store::FilesystemAppStore::with_apps_dir(dir))
+    }
+
+    fn peer(app: &str) -> crate::app::peer::PeerId {
+        crate::app::peer::PeerId::local(crate::app::AppId(app.into()))
+    }
+
+    #[tokio::test]
+    async fn relay_delivers_to_a_live_sink() {
+        let broker = PeerBroker::new(broker_store());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        broker.register(peer("b"), tx).await;
+
+        let outcome = broker
+            .relay(peer("a"), peer("b"), serde_json::json!({"text": "ping"}))
+            .await
+            .unwrap();
+        assert_eq!(outcome, PeerRouteOutcome::Delivered);
+
+        match rx.recv().await.unwrap() {
+            crate::protocol::HostToAgent::PeerDeliver { from, payload } => {
+                assert_eq!(from, "a");
+                assert_eq!(payload["text"], "ping");
+            }
+            other => panic!("expected PeerDeliver, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_queues_to_inbox_when_target_offline() {
+        let store = broker_store();
+        let broker = PeerBroker::new(store.clone());
+        // No sink registered for `b`: it is offline (tombstoned or archived).
+        let outcome = broker
+            .relay(peer("a"), peer("b"), serde_json::json!({"text": "later"}))
+            .await
+            .unwrap();
+        assert_eq!(outcome, PeerRouteOutcome::Queued { wake: peer("b") });
+
+        // The envelope landed in b's inbox, ready to drain on restore.
+        let app_dir = store.app_dir(&crate::app::AppId("b".into()));
+        let queued = crate::app::peer::mailbox::Mailbox::in_dir(&app_dir)
+            .drain()
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].from, peer("a"));
+        assert_eq!(queued[0].payload["text"], "later");
+    }
+
+    #[tokio::test]
+    async fn relay_rejects_self_addressing() {
+        let broker = PeerBroker::new(broker_store());
+        let outcome = broker
+            .relay(peer("a"), peer("a"), serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(outcome, PeerRouteOutcome::Rejected);
+    }
+
+    #[tokio::test]
+    async fn list_for_excludes_self_and_is_mru_ordered() {
+        let broker = PeerBroker::new(broker_store());
+        let (tx_b, _rx_b) = tokio::sync::mpsc::channel(1);
+        let (tx_c, _rx_c) = tokio::sync::mpsc::channel(1);
+        broker.register(peer("a"), tokio::sync::mpsc::channel(1).0).await;
+        broker.register(peer("b"), tx_b).await;
+        broker.register(peer("c"), tx_c).await;
+
+        let listed = broker.list_for(&peer("a")).await;
+        assert!(!listed.contains(&peer("a")), "must not list self");
+        // c registered most recently among the others.
+        assert_eq!(listed, vec![peer("c"), peer("b")]);
+    }
+
+    #[tokio::test]
+    async fn unregister_keeps_app_addressable_via_inbox() {
+        let store = broker_store();
+        let broker = PeerBroker::new(store.clone());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        broker.register(peer("b"), tx).await;
+        broker.unregister(&peer("b")).await;
+
+        // Gone from the directory, but still addressable: the message is queued.
+        assert!(!broker.list_for(&peer("a")).await.contains(&peer("b")));
+        let outcome = broker
+            .relay(peer("a"), peer("b"), serde_json::json!({"text": "x"}))
+            .await
+            .unwrap();
+        assert_eq!(outcome, PeerRouteOutcome::Queued { wake: peer("b") });
     }
 
     #[test]

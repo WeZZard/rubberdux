@@ -37,7 +37,9 @@ use crate::app::{App, AppId, AppStatus, BoardPosition};
 use crate::agent::interaction::{AgentInteraction, InteractionResponse};
 use crate::agent::runtime::port::EntryNotification;
 use crate::error::Error;
-use crate::host::{AcceptedWorker, WorkerStream, accept_worker};
+use crate::app::peer::PeerId;
+use crate::app::peer::mailbox::Mailbox;
+use crate::host::{AcceptedWorker, PeerBroker, WorkerStream, accept_worker};
 use crate::protocol::{self, AgentToHost, HostToAgent};
 use crate::trajectory::TrajectoryEvent;
 
@@ -103,6 +105,12 @@ pub struct LocalSupervisor {
     inboxes: Arc<Mutex<HashMap<AppId, ConnectionInbox>>>,
     /// Board lifecycle event fan-out, kept alive for the supervisor's lifetime.
     board_tx: broadcast::Sender<BoardEvent>,
+    /// The peer broker: the directory + relay that resolves a `PeerSend` by
+    /// `PeerId` and forwards opaque envelopes (a switch, not an orchestrator). The
+    /// supervisor registers each active worker's delivery sink here, hands the
+    /// pump frames to it, and wakes an offline target after the broker queues to
+    /// its inbox. See `docs/app/peer/decentralized-messaging.md`.
+    peer_broker: Arc<PeerBroker>,
 }
 
 impl LocalSupervisor {
@@ -118,6 +126,7 @@ impl LocalSupervisor {
 
         Self::spawn_accept_router(listener, inboxes.clone());
 
+        let peer_broker = Arc::new(PeerBroker::new(store.clone()));
         let supervisor = Self {
             store,
             rpc_addr,
@@ -125,6 +134,7 @@ impl LocalSupervisor {
             lifecycles: Arc::new(Mutex::new(HashMap::new())),
             inboxes,
             board_tx,
+            peer_broker,
         };
         supervisor.spawn_idle_sweeper();
         Ok(supervisor)
@@ -197,6 +207,13 @@ impl LocalSupervisor {
             .await
             .insert(app.id.clone(), conn_tx);
 
+        // Make this App reachable on the peer network and directly deliverable:
+        // register a clone of its outbound sink with the broker. The broker uses
+        // it to relay a `PeerDeliver` to this live worker.
+        self.peer_broker
+            .register(PeerId::local(app.id.clone()), outbound_tx.clone())
+            .await;
+
         let task = SupervisionTask {
             app_id: app.id.clone(),
             rpc_addr: self.rpc_addr,
@@ -206,6 +223,7 @@ impl LocalSupervisor {
             inboxes: self.inboxes.clone(),
             runtimes: self.runtimes.clone(),
             lifecycles: self.lifecycles.clone(),
+            peer_broker: self.peer_broker.clone(),
         };
         tokio::spawn(task.run(conn_rx, outbound_rx));
 
@@ -299,7 +317,51 @@ impl LocalSupervisor {
                 .with_pending_interaction(has_pending),
         );
         self.announce_status(id, AppStatus::Active);
+
+        // Drain any peer messages queued to this App while it was offline. A
+        // tombstoned or human-archived App is still addressable: the broker
+        // queued envelopes to its `inbox.jsonl`, and restore delivers them in
+        // arrival order as `PeerDeliver` frames so the worker reacts to them.
+        // See docs/app/peer/decentralized-messaging.md.
+        self.drain_peer_inbox(id).await;
         Ok(())
+    }
+
+    /// Deliver every peer message queued to `id`'s inbox to its now-live worker,
+    /// in arrival order, then clear the inbox. A no-op when the inbox is empty.
+    /// Called on restore so an offline target's messages are not lost.
+    ///
+    /// The inbox is read from the App's *addressable home* (live or archive), the
+    /// same directory the broker queued into. An archived App's inbox lives under
+    /// the archive, so draining the live session directory alone would strand it.
+    /// See `docs/app/peer/decentralized-messaging.md`.
+    async fn drain_peer_inbox(&self, id: &AppId) {
+        let home = self.store.addressable_home(id);
+        let mailbox = Mailbox::in_dir(&home);
+        let envelopes = match mailbox.drain() {
+            Ok(envelopes) => envelopes,
+            Err(e) => {
+                log::warn!("failed to drain peer inbox for App `{id}`: {e}");
+                return;
+            }
+        };
+        if envelopes.is_empty() {
+            return;
+        }
+        let runtimes = self.runtimes.lock().await;
+        let Some(handle) = runtimes.get(id) else {
+            return;
+        };
+        for envelope in envelopes {
+            let frame = HostToAgent::PeerDeliver {
+                from: envelope.from.app_id.to_string(),
+                payload: envelope.payload,
+            };
+            if let Err(e) = handle.send_frame(frame).await {
+                log::warn!("failed to deliver queued peer message to App `{id}`: {e}");
+                break;
+            }
+        }
     }
 
     /// Start the background idle sweeper: a tokio task that periodically
@@ -313,6 +375,7 @@ impl LocalSupervisor {
         let inboxes = self.inboxes.clone();
         let store = self.store.clone();
         let board_tx = self.board_tx.clone();
+        let peer_broker = self.peer_broker.clone();
         tokio::spawn(async move {
             let window = idle_window();
             let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
@@ -335,6 +398,7 @@ impl LocalSupervisor {
                         &inboxes,
                         store.as_ref(),
                         &board_tx,
+                        &peer_broker,
                     )
                     .await
                     {
@@ -360,11 +424,18 @@ async fn tombstone_app(
     inboxes: &Mutex<HashMap<AppId, ConnectionInbox>>,
     store: &dyn AppStore,
     board_tx: &broadcast::Sender<BoardEvent>,
+    peer_broker: &PeerBroker,
 ) -> Result<(), Error> {
     let removed = runtimes.lock().await.remove(id);
     let Some(handle) = removed else {
         return Ok(());
     };
+
+    // Drop this worker's live delivery sink from the broker so a later `PeerSend`
+    // to a now-offline App is queued to its inbox rather than written to a dead
+    // channel. The App stays addressable — archiving/tombstoning never removes it
+    // from the peer network; it only changes the delivery path to inbox-queue.
+    peer_broker.unregister(&PeerId::local(id.clone())).await;
 
     // Persist the transient resume state before the worker exits. History is
     // already durable in `session.jsonl`; this captures only the pending
@@ -421,6 +492,11 @@ struct SupervisionTask {
     /// and an interaction frame sets the pending-interaction block. The idle
     /// sweeper reads these to decide eviction.
     lifecycles: Arc<Mutex<HashMap<AppId, AppLifecycle>>>,
+    /// The peer broker the pump relays this worker's `PeerSend`/`PeerList` frames
+    /// through. The pump hands the broker the envelope and writes the broker's
+    /// `PeerListResult` back; the broker makes the routing decision (deliver vs.
+    /// queue), keeping the pump a thin conduit.
+    peer_broker: Arc<PeerBroker>,
 }
 
 impl SupervisionTask {
@@ -615,6 +691,40 @@ impl SupervisionTask {
                             // The routing `Hello` was already consumed by the
                             // accept router; a second one is unexpected. Ignore.
                         }
+                        Some(AgentToHost::PeerSend { to, payload }) => {
+                            // Relay through the broker, which resolves the target
+                            // and decides deliver-vs-queue. The pump makes no
+                            // routing decision of its own (the host is a switch).
+                            // `to` is an App id on the local node for now; the
+                            // PeerId carries the node so federation needs no change
+                            // here. See docs/app/peer/decentralized-messaging.md.
+                            let from = PeerId::local(self.app_id.clone());
+                            let to_peer = PeerId::local(AppId(to));
+                            match self.peer_broker.relay(from, to_peer, payload).await {
+                                Ok(outcome) => log::debug!(
+                                    "[app-worker:{}] peer_send routed: {outcome:?}",
+                                    self.app_id
+                                ),
+                                Err(e) => log::warn!(
+                                    "[app-worker:{}] peer_send relay failed: {e}",
+                                    self.app_id
+                                ),
+                            }
+                        }
+                        Some(AgentToHost::PeerList) => {
+                            // Answer "who can I talk to right now?" from the
+                            // broker's dynamic directory, most-recently-used first.
+                            let from = PeerId::local(self.app_id.clone());
+                            let peers = self
+                                .peer_broker
+                                .list_for(&from)
+                                .await
+                                .into_iter()
+                                .map(|id| id.app_id.to_string())
+                                .collect();
+                            let result = HostToAgent::PeerListResult { peers };
+                            protocol::write_message(&mut writer, &result).await?;
+                        }
                         Some(other) => {
                             log::debug!(
                                 "[app-worker:{}] unhandled worker frame: {other:?}",
@@ -802,6 +912,7 @@ impl AppSupervisor for LocalSupervisor {
             &self.inboxes,
             self.store.as_ref(),
             &self.board_tx,
+            &self.peer_broker,
         )
         .await
     }

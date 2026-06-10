@@ -10,6 +10,7 @@
 
 pub mod identity;
 pub mod merge;
+pub mod peer;
 pub mod registry;
 pub mod runtime;
 pub mod supervisor;

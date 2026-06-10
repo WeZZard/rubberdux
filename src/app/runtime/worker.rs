@@ -32,6 +32,7 @@ use crate::error::Error;
 use crate::protocol::{self, AgentToHost, HostToAgent};
 use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
 use crate::session::SessionManager;
+use crate::tool::peer_message::{PeerChannel, PeerRequest};
 
 /// Run a native app worker: connect to the host, announce the App with a
 /// `Hello` frame, then drive a real `AgentLoop` while bridging entries out and
@@ -80,10 +81,20 @@ async fn run_app_worker_inner(
         .create_session(client.model().to_owned())
         .map_err(|e| Error::App(format!("create session for App `{app_id}`: {e}")))?;
 
+    // The peer-messaging transport: the `peer_list`/`peer_send` tools push
+    // requests through this channel; the bridge loop below services them by
+    // writing the matching `AgentToHost` frame and correlating `PeerListResult`.
+    // See docs/app/peer/decentralized-messaging.md.
+    let (peer_tx, peer_rx) = tokio::sync::mpsc::channel::<PeerRequest>(PEER_CHANNEL_CAPACITY);
+    let peer_channel = PeerChannel::new(peer_tx);
+
     // The App worker runs the same builder shape as the in-process supervisor
     // worker (crate::app::supervisor::MemorySupervisor::spawn_worker): a real
-    // AgentLoop whose entries are observed, here forwarded over RPC.
-    let builder = AgentLoopBuilder::new(String::new(), session_manager).with_session_id(session_id);
+    // AgentLoop whose entries are observed, here forwarded over RPC. The peer
+    // channel makes the peer tools available — only an App worker has one.
+    let builder = AgentLoopBuilder::new(String::new(), session_manager)
+        .with_session_id(session_id)
+        .with_peer_channel(peer_channel);
     let (agent_loop, input_port, _context_tx) = builder.build(client).await;
 
     // Subscribe before run() so no entry is missed between spawn and the first
@@ -113,14 +124,66 @@ async fn run_app_worker_inner(
         agent_loop.run().await;
     });
 
-    // Bridge host → worker: feed user messages into the loop's InputPort and
-    // honor shutdown. Interaction and peer frames are declared by the protocol;
-    // their host-side brokers are wired in later tasks.
-    bridge_host_messages(&mut reader, &input_port, app_id).await;
+    // Pending `peer_list` replies, correlated FIFO: a `PeerList` frame carries no
+    // request id, and the worker issues them one at a time per tool call, so the
+    // oldest unanswered request matches the next `PeerListResult`.
+    let pending_lists: PendingLists = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+
+    // Worker → host for peer frames: drain the peer-tool requests, writing each as
+    // an `AgentToHost` frame. A `List` also records its reply oneshot so the
+    // bridge can fulfill it when `PeerListResult` arrives.
+    let peer_writer = writer.clone();
+    let peer_app_id = app_id.to_string();
+    let peer_pending = pending_lists.clone();
+    let peer_task = tokio::spawn(async move {
+        forward_peer_requests(peer_rx, peer_writer, peer_pending, &peer_app_id).await;
+    });
+
+    // Bridge host → worker: feed user messages into the loop's InputPort, deliver
+    // peer messages as peer-origin turns, fulfill peer_list answers, and honor
+    // shutdown.
+    bridge_host_messages(&mut reader, &input_port, app_id, &pending_lists).await;
 
     entry_task.abort();
     loop_task.abort();
+    peer_task.abort();
     Ok(())
+}
+
+/// Capacity of the worker's peer-request channel. Peer tool calls are serviced
+/// promptly by the forwarder task, so a small buffer absorbs bursts.
+const PEER_CHANNEL_CAPACITY: usize = 32;
+
+/// Shared queue of `peer_list` reply channels awaiting their `PeerListResult`,
+/// correlated first-in-first-out. Shared between the peer-request forwarder
+/// (which enqueues) and the host-message bridge (which dequeues on a result).
+type PendingLists = Arc<Mutex<std::collections::VecDeque<tokio::sync::oneshot::Sender<Vec<String>>>>>;
+
+/// Drain the peer-tool request channel, writing each request to the host as the
+/// matching `AgentToHost` frame. For a `List`, the reply oneshot is recorded in
+/// `pending` first so the bridge can fulfill it on the host's `PeerListResult`.
+async fn forward_peer_requests(
+    mut peer_rx: tokio::sync::mpsc::Receiver<PeerRequest>,
+    writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    pending: PendingLists,
+    app_id: &str,
+) {
+    while let Some(request) = peer_rx.recv().await {
+        let frame = match request {
+            PeerRequest::Send { to, payload } => AgentToHost::PeerSend { to, payload },
+            PeerRequest::List { reply } => {
+                // Record the reply before sending so a fast `PeerListResult` is
+                // never observed before its waiter is enqueued.
+                pending.lock().await.push_back(reply);
+                AgentToHost::PeerList
+            }
+        };
+        let mut w = writer.lock().await;
+        if let Err(e) = protocol::write_message(&mut w, &frame).await {
+            log::error!("[app-worker:{}] failed to forward peer frame: {}", app_id, e);
+            break;
+        }
+    }
 }
 
 /// Build a [`SessionManager`] rooted at `home`, honoring the `--app-session-dir`
@@ -136,13 +199,16 @@ fn session_manager_at(home: PathBuf) -> SessionManager {
     }
 }
 
-/// Read host frames until disconnect or shutdown, bridging `UserMessage` into
-/// the worker's loop. Unhandled frames (peer/interaction answers) are logged;
-/// their handling lands with the brokers that produce them.
+/// Read host frames until disconnect or shutdown, bridging them into the worker:
+/// a `UserMessage` becomes a user turn; a `PeerDeliver` becomes a peer-origin
+/// turn (so the App reacts to a peer message, attributed to the sending App); a
+/// `PeerListResult` fulfills the oldest pending `peer_list`. Other frames are
+/// logged.
 async fn bridge_host_messages(
     reader: &mut OwnedReadHalf,
     input_port: &crate::agent::runtime::port::InputPort,
     app_id: &str,
+    pending_lists: &PendingLists,
 ) {
     loop {
         match protocol::read_message::<HostToAgent>(reader).await {
@@ -156,6 +222,39 @@ async fn bridge_host_messages(
                 {
                     log::error!("[app-worker:{}] failed to enqueue user message: {}", app_id, e);
                     break;
+                }
+            }
+            Ok(Some(HostToAgent::PeerDeliver { from, payload })) => {
+                // A peer message is delivered as a turn the App reacts to, marked
+                // with the sending App's id so it is attributable to its origin
+                // rather than to a human user. The payload's `text` is the
+                // message body; an opaque payload without text is rendered as-is.
+                let text = payload
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| payload.to_string());
+                let message = Message::User {
+                    content: UserContent::Text(text),
+                };
+                if let Err(e) = input_port
+                    .send_user_message(message, EntryOrigin::Peer { app_id: from.clone() })
+                    .await
+                {
+                    log::error!(
+                        "[app-worker:{}] failed to enqueue peer message from {}: {}",
+                        app_id, from, e
+                    );
+                    break;
+                }
+            }
+            Ok(Some(HostToAgent::PeerListResult { peers })) => {
+                // Fulfill the oldest unanswered peer_list. A result with no waiter
+                // (a late/duplicate answer) is dropped.
+                if let Some(reply) = pending_lists.lock().await.pop_front() {
+                    let _ = reply.send(peers);
+                } else {
+                    log::debug!("[app-worker:{}] PeerListResult with no waiter", app_id);
                 }
             }
             Ok(Some(HostToAgent::Shutdown)) => {

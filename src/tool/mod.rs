@@ -5,6 +5,7 @@ pub mod glob;
 pub mod grep;
 pub mod interaction;
 pub mod interaction_respond;
+pub mod peer_message;
 pub mod project;
 pub mod read;
 pub mod task;

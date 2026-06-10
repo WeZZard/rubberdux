@@ -81,6 +81,23 @@ pub trait AppStore: Send + Sync {
     /// `docs/app/runtime/worker-lifecycle.md`.
     fn app_dir(&self, id: &AppId) -> PathBuf;
 
+    /// The App's *real* addressable home: the directory where the App actually
+    /// lives right now — the live directory if present, otherwise the archive
+    /// directory of an archived App. This is the directory the peer broker queues
+    /// an inbox into and the supervisor drains from, so a message to an archived
+    /// App lands in the same directory the App is restored from rather than in a
+    /// freshly created live directory that would shadow the archived manifest in
+    /// [`get`](Self::get). For a brand-new (not-yet-created) target it falls back
+    /// to the live directory, the default home a future `create` would use. See
+    /// `docs/app/peer/decentralized-messaging.md`.
+    ///
+    /// The default returns [`app_dir`](Self::app_dir): a store with no archive
+    /// concept addresses every App at its sole directory. A store that relocates
+    /// archived Apps overrides this to point at the archive when appropriate.
+    fn addressable_home(&self, id: &AppId) -> PathBuf {
+        self.app_dir(id)
+    }
+
     /// Move an App's directory under the archives subdir, removing it from
     /// `list(include_archived: false)` while keeping it addressable via `get`.
     fn archive(&self, id: &AppId) -> Result<(), Error>;
@@ -252,16 +269,37 @@ impl AppStore for FilesystemAppStore {
         self.apps_dir.join(id.as_str())
     }
 
-    fn get(&self, id: &AppId) -> Result<Option<App>, Error> {
+    fn addressable_home(&self, id: &AppId) -> PathBuf {
+        // Point at the archive only when the App is genuinely archived: the
+        // archive directory carries the App's manifest while the live directory
+        // does not. This keeps an inbox queued to an archived App in the archive
+        // directory the App is restored from, and never relocates a live App.
         let live = self.app_dir(id);
-        if live.is_dir() {
-            return Ok(Self::read_manifest(&live));
+        if Self::read_manifest(&live).is_some() {
+            return live;
         }
         let archived = self.archive_dir(id);
-        if archived.is_dir() {
-            return Ok(Self::read_manifest(&archived));
+        if Self::read_manifest(&archived).is_some() {
+            return archived;
         }
-        Ok(None)
+        // Neither directory holds a manifest (a brand-new target, or an
+        // inbox-only live directory): the live directory is the App's eventual
+        // home, so address it there.
+        live
+    }
+
+    fn get(&self, id: &AppId) -> Result<Option<App>, Error> {
+        // Read the live directory's manifest first, but fall through to the
+        // archive when the live directory exists yet has no readable manifest.
+        // The peer broker may have created an inbox-only live directory for an
+        // archived target (queueing a `PeerSend`); without this fall-through that
+        // empty live directory would shadow the archived App's manifest and make
+        // an archived App un-fetchable/un-restorable. See
+        // `docs/app/peer/decentralized-messaging.md`.
+        if let Some(app) = Self::read_manifest(&self.app_dir(id)) {
+            return Ok(Some(app));
+        }
+        Ok(Self::read_manifest(&self.archive_dir(id)))
     }
 
     fn archive(&self, id: &AppId) -> Result<(), Error> {
@@ -447,6 +485,100 @@ mod tests {
         assert_eq!(with_archived[0].id, app.id);
         // Still addressable by id.
         assert_eq!(store.get(&app.id).unwrap().unwrap().id, app.id);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn addressable_home_points_at_the_archive_for_an_archived_app() {
+        let dir = temp_apps_dir();
+        let store = FilesystemAppStore::with_apps_dir(dir.clone());
+        let app = sample_app("2026-06-10-00-00-09-UTC");
+        store.create(&app).unwrap();
+
+        // A live App is addressed at its live directory.
+        assert_eq!(store.addressable_home(&app.id), store.app_dir(&app.id));
+
+        store.archive(&app.id).unwrap();
+
+        // Once archived, its addressable home is the archive directory — the same
+        // directory `restore`/`get` read its manifest from — so an inbox queued
+        // here is the inbox restore drains.
+        let home = store.addressable_home(&app.id);
+        assert_eq!(home, dir.join(ARCHIVES_DIR).join(app.id.as_str()));
+        assert!(home.join(METADATA_FILE).is_file());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn addressable_home_falls_back_to_live_for_an_unknown_app() {
+        let dir = temp_apps_dir();
+        let store = FilesystemAppStore::with_apps_dir(dir.clone());
+        let id = AppId("2026-06-10-00-00-10-UTC".into());
+        // A target that has never been created has no manifest anywhere; its
+        // addressable home is the live directory it would eventually be created in.
+        assert_eq!(store.addressable_home(&id), store.app_dir(&id));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_falls_through_to_archive_when_live_dir_has_no_manifest() {
+        let dir = temp_apps_dir();
+        let store = FilesystemAppStore::with_apps_dir(dir.clone());
+        let app = sample_app("2026-06-10-00-00-11-UTC");
+        store.create(&app).unwrap();
+        store.archive(&app.id).unwrap();
+
+        // Simulate the broker having created an inbox-only live directory for the
+        // archived target (queueing a peer message). It holds no manifest.
+        let live = store.app_dir(&app.id);
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("inbox.jsonl"), b"").unwrap();
+        assert!(live.is_dir());
+        assert!(!live.join(METADATA_FILE).is_file());
+
+        // `get` must not let the inbox-only live directory shadow the archived
+        // manifest: it falls through to the archive and still finds the App.
+        let fetched = store.get(&app.id).unwrap();
+        assert!(fetched.is_some(), "archived App must stay fetchable behind an inbox-only live dir");
+        assert_eq!(fetched.unwrap().id, app.id);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archived_target_queue_then_restore_drain_round_trip() {
+        use crate::app::peer::PeerId;
+        use crate::app::peer::mailbox::{Mailbox, PeerEnvelope};
+
+        let dir = temp_apps_dir();
+        let store = FilesystemAppStore::with_apps_dir(dir.clone());
+        let app = sample_app("2026-06-10-00-00-12-UTC");
+        store.create(&app).unwrap();
+        store.archive(&app.id).unwrap();
+
+        // A peer message is addressed to the archived App: the broker resolves its
+        // addressable home (the archive) and queues the envelope there.
+        let home = store.addressable_home(&app.id);
+        let envelope = PeerEnvelope {
+            from: PeerId::local(AppId("sender".into())),
+            payload: serde_json::json!({ "text": "hello archived peer" }),
+        };
+        Mailbox::in_dir(&home).enqueue(&envelope).unwrap();
+
+        // The archived App stays fetchable — the inbox did not shadow its manifest.
+        assert_eq!(store.get(&app.id).unwrap().unwrap().id, app.id);
+
+        // On restore, the App is drained from the same addressable home and the
+        // queued envelope is delivered in arrival order.
+        let drained = Mailbox::in_dir(&store.addressable_home(&app.id))
+            .drain()
+            .unwrap();
+        assert_eq!(drained.len(), 1, "the queued envelope must drain on restore");
+        assert_eq!(drained[0].payload["text"], "hello archived peer");
+        assert_eq!(drained[0].from, PeerId::local(AppId("sender".into())));
 
         let _ = fs::remove_dir_all(&dir);
     }

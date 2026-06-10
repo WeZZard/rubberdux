@@ -9,6 +9,11 @@ pub enum EntryOrigin {
     Assistant,
     ToolCall,
     User { channel: String },
+    /// A message delivered from a peer App over the peer-messaging network. The
+    /// `app_id` names the sending App so a delivered peer message is attributable
+    /// to its origin in the conversation, distinct from a human user turn. See
+    /// `docs/app/peer/decentralized-messaging.md`.
+    Peer { app_id: String },
 }
 
 impl Default for EntryOrigin {
@@ -432,6 +437,20 @@ mod tests {
         // Round-trip
         let restored: EntryOrigin = serde_json::from_value(serde_json::json!({"type": "user", "channel": "gateway"})).unwrap();
         assert_eq!(restored, EntryOrigin::User { channel: "gateway".into() });
+    }
+
+    #[test]
+    fn test_entry_origin_peer_serialization() {
+        let peer = EntryOrigin::Peer { app_id: "2026-06-10-00-00-00-UTC".into() };
+        let json = serde_json::to_value(&peer).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"type": "peer", "app_id": "2026-06-10-00-00-00-UTC"})
+        );
+        let restored: EntryOrigin = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, peer);
+        // A peer origin is distinct from a user turn.
+        assert_ne!(peer, EntryOrigin::User { channel: "board".into() });
     }
 
     #[test]

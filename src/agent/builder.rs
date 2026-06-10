@@ -35,6 +35,11 @@ pub struct AgentLoopBuilder {
     pub guardrails: Option<crate::guardrail::GuardrailChain>,
     pub external_cwd: Option<std::path::PathBuf>,
     pub interaction_queue: Option<Arc<crate::agent::external::interaction_queue::InteractionQueue>>,
+    /// The peer-messaging transport, set only by a native App worker. When
+    /// present, the `peer_list`/`peer_send` tools are registered; otherwise they
+    /// are absent (a non-App agent has no peer network to talk to). See
+    /// `docs/app/peer/decentralized-messaging.md`.
+    pub peer_channel: Option<crate::tool::peer_message::PeerChannel>,
     #[cfg(feature = "host")]
     pub vm_manager: Option<std::sync::Arc<tokio::sync::Mutex<crate::vm::manager::VMManager>>>,
     #[cfg(feature = "host")]
@@ -58,6 +63,7 @@ impl AgentLoopBuilder {
             guardrails: None,
             external_cwd: None,
             interaction_queue: None,
+            peer_channel: None,
             #[cfg(feature = "host")]
             vm_manager: None,
             #[cfg(feature = "host")]
@@ -124,6 +130,16 @@ impl AgentLoopBuilder {
         self
     }
 
+    /// Attach the peer-messaging transport so this agent's `peer_list`/`peer_send`
+    /// tools can reach the host's broker. Set only by a native App worker.
+    pub fn with_peer_channel(
+        mut self,
+        channel: crate::tool::peer_message::PeerChannel,
+    ) -> Self {
+        self.peer_channel = Some(channel);
+        self
+    }
+
     #[cfg(feature = "host")]
     pub fn with_vm_infrastructure(
         mut self,
@@ -142,9 +158,14 @@ impl AgentLoopBuilder {
         self,
         client: Arc<MoonshotClient>,
     ) -> (AgentLoop, InputPort, broadcast::Sender<ContextEvent>) {
+        // Fall back to a freshly generated session id rather than panicking when
+        // a caller builds without one: a missing id names "this run's session",
+        // so a new timestamped id is a correct default and keeps `build`
+        // non-panicking. Callers that need a specific session still set it via
+        // `with_session_id`.
         let session_id = self
             .session_id
-            .expect("session_id must be set before building");
+            .unwrap_or_else(crate::session::SessionId::now);
         let main_agent_dir = self.session_manager.main_agent_dir(&session_id);
         let tool_results_dir = main_agent_dir.join("tool_results");
 
@@ -177,6 +198,13 @@ impl AgentLoopBuilder {
 
             if let Some(ref queue) = self.interaction_queue {
                 r.register(Box::new(crate::tool::interaction_respond::InteractionRespondTool::new(queue.clone())));
+            }
+
+            // The peer-messaging tools exist only in an App worker, which is the
+            // only agent with a peer transport into the host's broker.
+            if let Some(ref channel) = self.peer_channel {
+                r.register(Box::new(crate::tool::peer_message::PeerListTool::new(channel.clone())));
+                r.register(Box::new(crate::tool::peer_message::PeerSendTool::new(channel.clone())));
             }
 
             if self.with_agent_tool {
