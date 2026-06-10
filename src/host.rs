@@ -495,15 +495,53 @@ pub async fn run(config: HostConfig, bot: Bot) {
     // Subscribe to entry broadcasts for the Telegram adapter
     let entry_rx = agent_loop.subscribe_output().into_receiver();
 
+    // Bring up the multi-App board subsystem additively: the default
+    // subprocess-backed `AppSupervisor` (`LocalSupervisor`) owns the
+    // `Hello`-routing accept loop, the peer broker, and the idle sweeper, all set
+    // up by `bind`. Apps load `Tombstoned` from the filesystem store at startup;
+    // no worker spawns until an App is used. The supervisor is `None` when binding
+    // fails, in which case the board surface is simply absent while the rest of
+    // the host comes up unaffected. See `docs/app/runtime/worker-lifecycle.md`.
+    let app_store: Arc<dyn crate::app::registry::store::AppStore> =
+        Arc::new(crate::app::registry::store::FilesystemAppStore::new());
+    let app_supervisor = match crate::app::runtime::local_supervisor::LocalSupervisor::bind(
+        app_store.clone(),
+    )
+    .await
+    {
+        Ok(supervisor) => {
+            match app_store.list(false) {
+                Ok(apps) => log::info!(
+                    "App board ready: {} App(s) loaded Tombstoned at startup",
+                    apps.len()
+                ),
+                Err(e) => log::warn!("Failed to enumerate Apps at startup: {e}"),
+            }
+            Some(Arc::new(supervisor))
+        }
+        Err(e) => {
+            log::warn!("Failed to bind App supervisor: {e}; board surface disabled");
+            None
+        }
+    };
+
     // Set up the gateway server
     let _gateway_handle = {
         let output_port = agent_loop.subscribe_output();
         let identity = std::fs::read_to_string(mindset.identity_path()).unwrap_or_default();
         let soul = std::fs::read_to_string(mindset.soul_path()).unwrap_or_default();
-        let gateway_state = Arc::new(crate::gateway::state::GatewayState::with_trajectory_tx(
+        let mut gateway_state = crate::gateway::state::GatewayState::with_trajectory_tx(
             gateway_system_prompt, identity, soul, trajectory_tx, input_port.clone(),
             Some(gateway_events_path),
-        ));
+        );
+        // Light up the board REST + WS routes against the supervisor while keeping
+        // the single-agent surface above. The identity client derives an App's
+        // title + icon as a background task on creation. See `docs/gateway/apps.md`.
+        if let Some(supervisor) = app_supervisor {
+            let identity_client = Arc::new(crate::provider::moonshot::MoonshotClient::from_env());
+            gateway_state.attach_apps(supervisor, identity_client);
+        }
+        let gateway_state = Arc::new(gateway_state);
         let state_clone = gateway_state.clone();
         tokio::spawn(crate::gateway::stream::mirror_entries(output_port, state_clone));
         tokio::spawn(crate::gateway::server::run(gateway_state))

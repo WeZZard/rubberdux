@@ -157,6 +157,47 @@ impl GatewayState {
         }
     }
 
+    /// Attach the multi-App board surface to a gateway state that already carries
+    /// the single-agent endpoints (built via [`with_trajectory_tx`]). This is the
+    /// additive seam the host uses to serve both surfaces from one process: the
+    /// single-agent entry/trajectory streams stay live, and the board REST + WS
+    /// routes light up against the supplied [`AppSupervisor`]. It mirrors the
+    /// supervisor/identity/board wiring of [`with_apps`] but preserves an existing
+    /// `trajectory_tx` and `events_path` rather than defaulting them. See
+    /// `docs/gateway/apps.md`.
+    ///
+    /// [`with_trajectory_tx`]: GatewayState::with_trajectory_tx
+    /// [`with_apps`]: GatewayState::with_apps
+    pub fn attach_apps<S>(&mut self, supervisor: Arc<S>, identity_client: Arc<MoonshotClient>)
+    where
+        S: AppSupervisor + 'static,
+    {
+        // The object-safe `DynAppSupervisor` view stored below does not expose
+        // `subscribe_board`, so capture one board subscription off the concrete
+        // supervisor here and forward every event into the gateway's own board
+        // fan-out, which the board WebSocket renders from. See
+        // `docs/gateway/apps_stream.md`.
+        let mut source_board = supervisor.subscribe_board();
+        let board_forward = self.board_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match source_board.recv().await {
+                    Ok(event) => {
+                        // No active board clients right now is not an error.
+                        let _ = board_forward.send(event);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        // Coerce the concrete supervisor into the object-safe view the gateway
+        // stores. See `docs/gateway/apps.md`.
+        self.supervisor = Some(supervisor as Arc<dyn DynAppSupervisor>);
+        self.identity_client = Some(identity_client);
+    }
+
     /// Publish an App interaction lifecycle event onto the gateway's
     /// interaction fan-out. The board and per-App interaction WebSocket
     /// handlers render their `badge` and `interaction_raised`/`resolved`
