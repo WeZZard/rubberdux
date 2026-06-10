@@ -25,7 +25,7 @@ class MainSplitViewController: NSSplitViewController, ConversationViewDelegate {
         sidebarItem.maximumThickness = 300
         addSplitViewItem(sidebarItem)
 
-        contentContainer.show(contentController(for: .conversation))
+        contentContainer.show(contentController(for: .whiteboard))
         let contentItem = NSSplitViewItem(viewController: contentContainer)
         addSplitViewItem(contentItem)
 
@@ -56,6 +56,8 @@ class MainSplitViewController: NSSplitViewController, ConversationViewDelegate {
         }
         let vc: NSViewController
         switch item {
+        case .whiteboard:
+            vc = WhiteboardViewController(apiClient: apiClient)
         case .conversation:
             let conversationVC = ConversationViewController(apiClient: apiClient, webSocketClient: webSocketClient)
             conversationVC.delegate = self

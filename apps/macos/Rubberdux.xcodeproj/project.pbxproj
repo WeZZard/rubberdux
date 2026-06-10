@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		03C5C65C2942E0BA6EA4B6B0 /* EntryRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1727678AD41624C70F4EC0D /* EntryRowView.swift */; };
+		04F1731B74733524A3DFAA8F /* BoardAppStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4E337D74EC9D7D5CB0B7AE9 /* BoardAppStore.swift */; };
 		0A556ACA98E918E574B0A916 /* BackendProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = B78506F81EA78CA4F33700D9 /* BackendProvider.swift */; };
 		0AADD896613E495FA7E6C28A /* AppearanceModeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF5A56514C5DF9AC2DD7F714 /* AppearanceModeTests.swift */; };
 		10199606D81AD96901160080 /* AppPaletteTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C55EDAA078756C6C4C217448 /* AppPaletteTests.swift */; };
@@ -44,7 +45,10 @@
 		B4DC432399F654D409CB4A93 /* AppearanceMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8D6C4814B54EA20D8A1A47C /* AppearanceMode.swift */; };
 		B7F2244B8F673DE71808B6B7 /* BuildTypeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A08D36EECACAB5D58224AB84 /* BuildTypeTests.swift */; };
 		C03E403991B5D63C31CF2376 /* BoardEvent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A64FBD1AAAB2D2CD0B54247F /* BoardEvent.swift */; };
+		CCD680102BF5689481A14C80 /* WhiteboardViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 005EDD664060D94AB3B64F35 /* WhiteboardViewController.swift */; };
 		CDBD3624C59E9CBE06CCB9FD /* BuildType.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3D3B9BAF69B12E50FC42E9E /* BuildType.swift */; };
+		CEB0F9E4A7A8D39BDAFCD07C /* BoardAppStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E69F9C6A957008B33A86C457 /* BoardAppStoreTests.swift */; };
+		D90ED0A32664D71D58BEFEF1 /* CreateAppController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FA9B89FF62BA3AEAA497959 /* CreateAppController.swift */; };
 		D9E015F90509FFB6A690EE11 /* AppSocketRegistryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2037B6EDC360F841D1E25190 /* AppSocketRegistryTests.swift */; };
 		DA2644BF6945D79C0A486DA2 /* Entry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18CA102FA96D3C6D277E2680 /* Entry.swift */; };
 		DB484900F7A96BF65D670FA6 /* ToolCall.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C3233B15B96791DA42AD9A3 /* ToolCall.swift */; };
@@ -69,6 +73,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		005EDD664060D94AB3B64F35 /* WhiteboardViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhiteboardViewController.swift; sourceTree = "<group>"; };
 		0210C107A49B07BB12386701 /* DotLatticeRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DotLatticeRenderer.swift; sourceTree = "<group>"; };
 		066E01291BAF81CE00F93AF1 /* APIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClient.swift; sourceTree = "<group>"; };
 		144E051B1C0BCB1EDFFC0CF5 /* AppModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelTests.swift; sourceTree = "<group>"; };
@@ -92,6 +97,7 @@
 		7ADCD81BF6C626762993A50A /* MainSplitViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainSplitViewController.swift; sourceTree = "<group>"; };
 		7B1DDC213AFA26B00C4010A9 /* Rubberdux.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Rubberdux.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		7D79ECC0715CB0F50DD237B0 /* AppIconLayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppIconLayer.swift; sourceTree = "<group>"; };
+		7FA9B89FF62BA3AEAA497959 /* CreateAppController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CreateAppController.swift; sourceTree = "<group>"; };
 		81AEF085B55ADCB39BF1CC27 /* Distribute.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Distribute.xcconfig; sourceTree = "<group>"; };
 		820F327E80F33842336A2D6A /* RubberduxTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RubberduxTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		8DC7A0AAA58E5949DB469DD3 /* BinaryLocator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BinaryLocator.swift; sourceTree = "<group>"; };
@@ -101,6 +107,7 @@
 		A08D36EECACAB5D58224AB84 /* BuildTypeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BuildTypeTests.swift; sourceTree = "<group>"; };
 		A1501B69109F7144E391AD9C /* Debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Debug.xcconfig; sourceTree = "<group>"; };
 		A355F86747A5E6CC01F794C7 /* BoardEventTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoardEventTests.swift; sourceTree = "<group>"; };
+		A4E337D74EC9D7D5CB0B7AE9 /* BoardAppStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoardAppStore.swift; sourceTree = "<group>"; };
 		A64FBD1AAAB2D2CD0B54247F /* BoardEvent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoardEvent.swift; sourceTree = "<group>"; };
 		A88837041D398CF945A6192A /* EntryDetailViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EntryDetailViewController.swift; sourceTree = "<group>"; };
 		AACB5596AA7840E92E1D63B8 /* Rubberdux.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Rubberdux.entitlements; sourceTree = "<group>"; };
@@ -115,6 +122,7 @@
 		D8F035A757E471B50AB22A6A /* SettingsWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsWindowController.swift; sourceTree = "<group>"; };
 		DE2526B8F30010077BF8B099 /* MainWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindowController.swift; sourceTree = "<group>"; };
 		E475850BD6C0C8D03E54CF33 /* SettingsViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsViewController.swift; sourceTree = "<group>"; };
+		E69F9C6A957008B33A86C457 /* BoardAppStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoardAppStoreTests.swift; sourceTree = "<group>"; };
 		E7EF2967E4B365CF852E3DF3 /* BoardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoardView.swift; sourceTree = "<group>"; };
 		EABDB3E694F798F13078EA3A /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
 		F00DE865008B82D1FFC40D3B /* BoardSocket.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoardSocket.swift; sourceTree = "<group>"; };
@@ -153,9 +161,12 @@
 			isa = PBXGroup;
 			children = (
 				7D79ECC0715CB0F50DD237B0 /* AppIconLayer.swift */,
+				A4E337D74EC9D7D5CB0B7AE9 /* BoardAppStore.swift */,
 				FF6E6244D50CA66E5CCBFF26 /* BoardGeometry.swift */,
 				E7EF2967E4B365CF852E3DF3 /* BoardView.swift */,
+				7FA9B89FF62BA3AEAA497959 /* CreateAppController.swift */,
 				0210C107A49B07BB12386701 /* DotLatticeRenderer.swift */,
+				005EDD664060D94AB3B64F35 /* WhiteboardViewController.swift */,
 				7273B4A622C46B50AB5EF669 /* Icon */,
 			);
 			path = Whiteboard;
@@ -215,6 +226,7 @@
 				144E051B1C0BCB1EDFFC0CF5 /* AppModelTests.swift */,
 				C55EDAA078756C6C4C217448 /* AppPaletteTests.swift */,
 				2037B6EDC360F841D1E25190 /* AppSocketRegistryTests.swift */,
+				E69F9C6A957008B33A86C457 /* BoardAppStoreTests.swift */,
 				A355F86747A5E6CC01F794C7 /* BoardEventTests.swift */,
 				35B5469E130139DD9C8620A7 /* BoardGeometryTests.swift */,
 				A08D36EECACAB5D58224AB84 /* BuildTypeTests.swift */,
@@ -424,12 +436,14 @@
 				B4DC432399F654D409CB4A93 /* AppearanceMode.swift in Sources */,
 				0A556ACA98E918E574B0A916 /* BackendProvider.swift in Sources */,
 				9DA0103A21544B36C70947D6 /* BinaryLocator.swift in Sources */,
+				04F1731B74733524A3DFAA8F /* BoardAppStore.swift in Sources */,
 				C03E403991B5D63C31CF2376 /* BoardEvent.swift in Sources */,
 				738E81FBCB93475BA9A880BA /* BoardGeometry.swift in Sources */,
 				4FB832E1DFF385EF65909686 /* BoardSocket.swift in Sources */,
 				9B8BED583536D4A18067E7A7 /* BoardView.swift in Sources */,
 				CDBD3624C59E9CBE06CCB9FD /* BuildType.swift in Sources */,
 				E57B06C4A16A28CB2F84F088 /* ConversationViewController.swift in Sources */,
+				D90ED0A32664D71D58BEFEF1 /* CreateAppController.swift in Sources */,
 				43620B74F9CE5A811EFA8F54 /* DotLatticeRenderer.swift in Sources */,
 				DA2644BF6945D79C0A486DA2 /* Entry.swift in Sources */,
 				73187BE1C874226A3ABA2734 /* EntryDetailViewController.swift in Sources */,
@@ -451,6 +465,7 @@
 				DB484900F7A96BF65D670FA6 /* ToolCall.swift in Sources */,
 				E120EE1E7DDF1679B64E7FFB /* TrajectoryEvent.swift in Sources */,
 				E912E27CB9CE8D8E085A0292 /* WebSocketClient.swift in Sources */,
+				CCD680102BF5689481A14C80 /* WhiteboardViewController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -463,6 +478,7 @@
 				10199606D81AD96901160080 /* AppPaletteTests.swift in Sources */,
 				D9E015F90509FFB6A690EE11 /* AppSocketRegistryTests.swift in Sources */,
 				0AADD896613E495FA7E6C28A /* AppearanceModeTests.swift in Sources */,
+				CEB0F9E4A7A8D39BDAFCD07C /* BoardAppStoreTests.swift in Sources */,
 				A13D0052F047BA5D4E4936DF /* BoardEventTests.swift in Sources */,
 				FD3C2534C7FEAC64DAF80901 /* BoardGeometryTests.swift in Sources */,
 				B7F2244B8F673DE71808B6B7 /* BuildTypeTests.swift in Sources */,

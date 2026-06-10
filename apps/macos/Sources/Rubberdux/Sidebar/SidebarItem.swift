@@ -1,6 +1,10 @@
 import Foundation
 
 enum SidebarItem: Hashable, CustomStringConvertible {
+    /// The dot-grid whiteboard; the primary content surface and default
+    /// selection. The remaining items are the debug views, kept reachable.
+    case whiteboard
+
     case conversation
     case systemPrompts
     case identityPrompt
@@ -11,6 +15,7 @@ enum SidebarItem: Hashable, CustomStringConvertible {
 
     var description: String {
         switch self {
+        case .whiteboard: return "Whiteboard"
         case .conversation: return "Conversation"
         case .systemPrompts: return "System"
         case .identityPrompt: return "Identity"
@@ -35,7 +40,7 @@ enum SidebarItem: Hashable, CustomStringConvertible {
     }
 
     static var topLevel: [SidebarItem] {
-        [.conversation, .systemPrompts, .liveEvents]
+        [.whiteboard, .conversation, .systemPrompts, .liveEvents]
     }
 
 }
