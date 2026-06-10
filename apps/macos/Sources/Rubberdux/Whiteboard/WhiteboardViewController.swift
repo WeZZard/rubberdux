@@ -29,6 +29,25 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
 
     private var cancellables: Set<AnyCancellable> = []
 
+    // MARK: - Observation panel
+
+    /// Shared, ref-counted per-app stream registry handed to the observation
+    /// panel so its panes open/close per-app sockets without leaking.
+    private lazy var socketRegistry = AppSocketRegistry(baseURL: apiClient.baseURL)
+
+    /// The trailing observation panel. It streams the selected apps' conversation
+    /// and trajectory; it is hidden (collapsing the split) when the selection is
+    /// empty and shown (shrinking the board) when one or more apps are selected.
+    private lazy var observationPanel = ObservationPanelViewController(
+        apiClient: apiClient,
+        registry: socketRegistry
+    )
+
+    /// The split that places the board on the leading side and the observation
+    /// panel on the trailing side. Collapsing the trailing item gives the board
+    /// the full width.
+    private let splitView = NSSplitView()
+
     // MARK: - Selection
 
     /// The currently selected app ids. The board view paints a single selection
@@ -72,20 +91,45 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
         boardView.delegate = self
         boardView.translatesAutoresizingMaskIntoConstraints = false
 
-        let container = NSView()
-        container.addSubview(boardView)
+        // The board lives inside its own container so the split view manages only
+        // the two top-level panes (board container, observation panel).
+        let boardContainer = NSView()
+        boardContainer.addSubview(boardView)
         NSLayoutConstraint.activate([
-            boardView.topAnchor.constraint(equalTo: container.topAnchor),
-            boardView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            boardView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            boardView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            boardView.topAnchor.constraint(equalTo: boardContainer.topAnchor),
+            boardView.bottomAnchor.constraint(equalTo: boardContainer.bottomAnchor),
+            boardView.leadingAnchor.constraint(equalTo: boardContainer.leadingAnchor),
+            boardView.trailingAnchor.constraint(equalTo: boardContainer.trailingAnchor),
         ])
 
         let recognizer = NSPanGestureRecognizer(target: self, action: #selector(handleDrag(_:)))
         boardView.addGestureRecognizer(recognizer)
         dragRecognizer = recognizer
 
+        // Wrap the board and the observation panel in a horizontal split. The
+        // panel is the trailing, collapsible pane; collapsing it (empty
+        // selection) lets the board occupy the full width.
+        addChild(observationPanel)
+        splitView.isVertical = true
+        splitView.dividerStyle = .thin
+        splitView.translatesAutoresizingMaskIntoConstraints = false
+        splitView.addArrangedSubview(boardContainer)
+        splitView.addArrangedSubview(observationPanel.view)
+        splitView.setHoldingPriority(.defaultLow, forSubviewAt: 0)
+        splitView.setHoldingPriority(.defaultHigh, forSubviewAt: 1)
+
+        let container = NSView()
+        container.addSubview(splitView)
+        NSLayoutConstraint.activate([
+            splitView.topAnchor.constraint(equalTo: container.topAnchor),
+            splitView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            splitView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            splitView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+        ])
+
         view = container
+        // Start collapsed: nothing is selected on load.
+        applyObservationVisibility()
     }
 
     override func viewDidLoad() {
@@ -154,6 +198,10 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
     private func resyncBoard() {
         boardView.setApps(store.apps)
         reapplySelection()
+        // A full snapshot may have removed a selected App; keep the panel honest.
+        if isViewLoaded {
+            syncObservationPanel()
+        }
     }
 
     /// Map a single store change onto the board view incrementally.
@@ -168,6 +216,9 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
             // icon layer.
             boardView.setApps(store.apps)
             reapplySelection()
+            // A removed App may be in the selection; let the panel prune and
+            // collapse if needed.
+            syncObservationPanel()
         case .unchanged:
             break
         }
@@ -175,6 +226,36 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
 
     private func reapplySelection() {
         boardView.selectApp(selectedAppIDs.first)
+    }
+
+    // MARK: - Observation panel sync
+
+    /// Reconcile the observation panel against the current selection and the
+    /// board's app order, then collapse or expand its split pane. Drops any
+    /// selected ids that no longer exist on the board so the panel never streams
+    /// a removed App.
+    private func syncObservationPanel() {
+        let liveIDs = Set(store.apps.map(\.id))
+        let pruned = selectedAppIDs.intersection(liveIDs)
+        if pruned != selectedAppIDs {
+            selectedAppIDs = pruned
+        }
+        observationPanel.update(
+            selection: selectedAppIDs,
+            order: store.apps.map(\.id)
+        )
+        applyObservationVisibility()
+    }
+
+    /// Show the observation pane when the selection is non-empty and collapse it
+    /// otherwise, giving the board the full width when nothing is observed.
+    private func applyObservationVisibility() {
+        let panelView = observationPanel.view
+        let shouldShow = !selectedAppIDs.isEmpty
+        let isCollapsed = splitView.isSubviewCollapsed(panelView)
+        guard shouldShow == isCollapsed else { return }
+        panelView.isHidden = !shouldShow
+        splitView.adjustSubviews()
     }
 
     // MARK: - BoardViewDelegate
@@ -191,6 +272,7 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
             selectedAppIDs = [appID]
         }
         boardView.selectApp(selectedAppIDs.contains(appID) ? appID : selectedAppIDs.first)
+        syncObservationPanel()
     }
 
     func boardView(_ boardView: BoardView, didActivateEmptyCell cell: GridCell) {

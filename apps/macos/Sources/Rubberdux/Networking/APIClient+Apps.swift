@@ -143,6 +143,20 @@ extension APIClient {
         return try decoder.decode(AppTrajectoryResponse.self, from: data).events
     }
 
+    // MARK: - Tasks
+
+    /// Deliver a free-form user message to the App's running worker.
+    /// Mirrors `POST /api/v1/apps/{id}/tasks` (body `{ "text": ... }`).
+    func sendTask(appID: String, text: String) async throws {
+        struct Body: Encodable {
+            let text: String
+        }
+        try await postVoid(
+            path: "/api/v1/apps/\(appID)/tasks",
+            body: Body(text: text)
+        )
+    }
+
     // MARK: - Interactions
 
     /// List pending interactions for an App.
