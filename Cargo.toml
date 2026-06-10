@@ -76,6 +76,15 @@ regex = "1"
 name = "telegram_channel_agent"
 path = "tests/system/telegram_channel_agent.rs"
 
+# System tests for the subprocess-backed App runtime (LocalSupervisor + a real
+# `rubberduxd --agent` worker). `harness = false`: the target's own `main`
+# re-enters worker mode when LocalSupervisor spawns it with `--agent`. The
+# cases are the human-run live suite, gated on RUBBERDUX_LLM_* credentials.
+[[test]]
+name = "app_system"
+path = "tests/system/app/main.rs"
+harness = false
+
 [[test]]
 name = "e2e"
 path = "tests/e2e/runner.rs"

@@ -2,6 +2,8 @@ pub mod agent_loop_harness;
 pub mod artifact;
 #[path = "../../support/artifacts.rs"]
 pub mod artifacts;
+#[path = "../../support/live_gate.rs"]
+pub mod live_gate;
 pub mod log_capture;
 pub mod mock_channel_processor;
 pub mod mock_tools;
