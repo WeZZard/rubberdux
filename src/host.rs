@@ -359,7 +359,7 @@ fn shell_quote(s: &str) -> String {
 ///
 /// The host runs the AgentLoop locally and bridges Telegram ↔ AgentLoop
 /// via the broadcast-based adapter.
-pub async fn run(config: HostConfig, bot: Bot) {
+pub async fn run(config: HostConfig, bot: Option<Bot>) {
     use crate::agent::builder::AgentLoopBuilder;
 
     let rpc_listener = match TcpListener::bind(("0.0.0.0", config.rpc_port)).await {
@@ -473,23 +473,27 @@ pub async fn run(config: HostConfig, bot: Bot) {
     let gateway_system_prompt = system_prompt.clone();
     let telegram_chat_id: std::sync::Arc<tokio::sync::Mutex<Option<i64>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(None));
-    let telegram_processor = std::sync::Arc::new(
-        crate::channel::adapter::telegram::TelegramChannelProcessor::new(
-            bot.clone(),
-            telegram_chat_id.clone(),
-        )
-        .with_interaction_queue(interaction_queue.clone()),
-    );
-    let builder = AgentLoopBuilder::new(system_prompt, session_manager)
+    let mut builder = AgentLoopBuilder::new(system_prompt, session_manager)
         .with_session_id(session_id)
         .with_workspace(workspace)
         .with_mindset(mindset.clone())
-        .with_channel_processor("telegram", telegram_processor)
         .with_guardrails(guardrails)
         .with_recorder(broadcast_recorder)
         .with_external_cwd(project_root.clone())
         .with_interaction_queue(interaction_queue.clone())
         .with_vm_infrastructure(vm_manager, rpc_listener, host_config);
+    // Register the Telegram channel processor only when a bot is configured; the
+    // gateway and app-board channels function without it.
+    if let Some(bot) = bot.as_ref() {
+        let telegram_processor = std::sync::Arc::new(
+            crate::channel::adapter::telegram::TelegramChannelProcessor::new(
+                bot.clone(),
+                telegram_chat_id.clone(),
+            )
+            .with_interaction_queue(interaction_queue.clone()),
+        );
+        builder = builder.with_channel_processor("telegram", telegram_processor);
+    }
     let (agent_loop, input_port, _context_tx) = builder.build(client).await;
 
     // Subscribe to entry broadcasts for the Telegram adapter
@@ -552,8 +556,27 @@ pub async fn run(config: HostConfig, bot: Bot) {
         agent_loop.run().await;
     });
 
-    // Run Telegram adapter (blocks until dispatcher shuts down)
-    crate::channel::adapter::telegram::run(bot, input_port, entry_rx, telegram_chat_id, interaction_queue).await;
+    match bot {
+        // Run the Telegram adapter (blocks until the dispatcher shuts down).
+        Some(bot) => {
+            crate::channel::adapter::telegram::run(
+                bot,
+                input_port,
+                entry_rx,
+                telegram_chat_id,
+                interaction_queue,
+            )
+            .await;
+        }
+        // No Telegram bridge: keep the host alive so the gateway, app board, and
+        // agent loop keep serving until the process is interrupted.
+        None => {
+            log::info!("Host ready (Telegram bridge disabled). Press Ctrl-C to stop.");
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                log::error!("Failed to listen for shutdown signal: {e}");
+            }
+        }
+    }
 
     log::info!("Host shutdown complete.");
 }

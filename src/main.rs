@@ -105,12 +105,20 @@ async fn main() {
 async fn run_host() {
     log::info!("Starting rubberdux in HOST mode...");
 
-    let bot_token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_else(|_| {
-        log::error!("TELEGRAM_BOT_TOKEN is not set");
-        std::process::exit(1);
-    });
+    // The Telegram bridge is optional: without a token the host still serves the
+    // gateway and the app board (which is all the desktop GUI needs). Only build
+    // the bot when a non-empty token is provided.
+    let bot = std::env::var("TELEGRAM_BOT_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+        .map(Bot::new);
+    if bot.is_none() {
+        log::warn!(
+            "TELEGRAM_BOT_TOKEN is not set; starting without the Telegram bridge \
+             (the gateway and app board are still served)."
+        );
+    }
 
-    let bot = Bot::new(bot_token);
     let host_config = host::HostConfig::from_env();
     host::run(host_config, bot).await;
 }
