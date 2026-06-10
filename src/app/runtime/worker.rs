@@ -88,13 +88,26 @@ async fn run_app_worker_inner(
     let (peer_tx, peer_rx) = tokio::sync::mpsc::channel::<PeerRequest>(PEER_CHANNEL_CAPACITY);
     let peer_channel = PeerChannel::new(peer_tx);
 
+    // The interaction queue the raise tools enqueue onto. Its observer receiver
+    // feeds the forwarding pump below, which surfaces each raised interaction to
+    // the host; the host's answer comes back as `HostToAgent::InteractionAnswer`
+    // and is routed into the queue to resolve the blocked tool. See
+    // docs/agent/interaction.md.
+    let (interaction_queue, interaction_observer) =
+        crate::agent::external::interaction_queue::InteractionQueue::with_observer();
+    let interaction_queue = Arc::new(interaction_queue);
+
     // The App worker runs the same builder shape as the in-process supervisor
     // worker (crate::app::supervisor::MemorySupervisor::spawn_worker): a real
     // AgentLoop whose entries are observed, here forwarded over RPC. The peer
-    // channel makes the peer tools available — only an App worker has one.
-    let builder = AgentLoopBuilder::new(String::new(), session_manager)
+    // channel makes the peer tools available — only an App worker has one. The
+    // app id and interaction queue enable the interaction-raise tools.
+    let builder = AgentLoopBuilder::new(app_worker_system_prompt(), session_manager)
         .with_session_id(session_id)
-        .with_peer_channel(peer_channel);
+        .with_peer_channel(peer_channel)
+        .with_interaction_queue(interaction_queue.clone())
+        .with_app_id(app_id.to_string())
+        .with_recorder(crate::trajectory::noop_recorder());
     let (agent_loop, input_port, _context_tx) = builder.build(client).await;
 
     // Subscribe before run() so no entry is missed between spawn and the first
@@ -120,6 +133,16 @@ async fn run_app_worker_inner(
         }
     });
 
+    // Worker → host for raised interactions: drain the queue's observer and write
+    // each as an `AgentToHost::Interaction` frame. The legacy `UIInteractionRequest`
+    // is mapped to the unified `AgentInteraction` the host pump expects. Mirrors
+    // the entry-forwarding pump above.
+    let interaction_writer = writer.clone();
+    let interaction_app_id = app_id.to_string();
+    let interaction_task = tokio::spawn(async move {
+        forward_interactions(interaction_observer, interaction_writer, &interaction_app_id).await;
+    });
+
     let loop_task = tokio::spawn(async move {
         agent_loop.run().await;
     });
@@ -140,14 +163,54 @@ async fn run_app_worker_inner(
     });
 
     // Bridge host → worker: feed user messages into the loop's InputPort, deliver
-    // peer messages as peer-origin turns, fulfill peer_list answers, and honor
-    // shutdown.
-    bridge_host_messages(&mut reader, &input_port, app_id, &pending_lists).await;
+    // peer messages as peer-origin turns, fulfill peer_list answers, route
+    // interaction answers back into the queue, and honor shutdown.
+    bridge_host_messages(
+        &mut reader,
+        &input_port,
+        app_id,
+        &pending_lists,
+        &interaction_queue,
+    )
+    .await;
 
     entry_task.abort();
+    interaction_task.abort();
     loop_task.abort();
     peer_task.abort();
     Ok(())
+}
+
+/// The base system prompt for a native App worker. It must be non-empty: the
+/// model provider rejects a request whose leading system message is empty. It
+/// also steers the agent to drive user interactions through the dedicated
+/// raise tools (`request_approval`, `ask_question`, `offer_choice`,
+/// `present_preview`) rather than asking in plain assistant text, because only a
+/// tool call surfaces a structured interaction the user can answer on the board.
+/// See `docs/tool/interaction.md`.
+fn app_worker_system_prompt() -> String {
+    "You are an App agent collaborating with a user through a shared board.\n\n\
+     The ONLY way to reach the user is by calling an interaction tool. Plain \
+     assistant text is NOT shown to the user as an answerable prompt, so writing \
+     out a question or an approval request in text accomplishes nothing — you \
+     MUST call the matching tool instead:\n\
+     - `request_approval` — get explicit approval before taking an action \
+     (flavor \"permission\") or before committing to a plan (flavor \"plan\").\n\
+     - `ask_question` — ask an open question.\n\
+     - `offer_choice` — make the user pick one of several options.\n\
+     - `present_preview` — show a generated artifact for acknowledgement.\n\n\
+     When the user asks you to request approval, ask a question, offer a choice, \
+     or present a preview, your FIRST action MUST be to call the matching tool — \
+     do not reply with an acknowledgement first. If the user tells you to ask for \
+     approval before proceeding, immediately call `request_approval` (flavor \
+     \"permission\") with a prompt describing what you are about to do, and wait \
+     for the answer before doing anything else. Even when no concrete action has \
+     been named yet, do NOT reply in plain text to confirm the arrangement — \
+     instead call `request_approval` right away (for example, asking permission \
+     to begin working) so the user has a real interaction to answer. Never \
+     describe in text what you would ask; always raise the interaction by calling \
+     the tool."
+        .to_string()
 }
 
 /// Capacity of the worker's peer-request channel. Peer tool calls are serviced
@@ -186,6 +249,44 @@ async fn forward_peer_requests(
     }
 }
 
+/// Drain the interaction queue's observer, forwarding each raised request to the
+/// host as an [`AgentToHost::Interaction`] frame. The legacy `UIInteractionRequest`
+/// is converted to the unified `AgentInteraction` the host pump consumes. A
+/// `Lagged` notice is logged and skipped; a closed channel ends the pump.
+async fn forward_interactions(
+    mut observer: tokio::sync::broadcast::Receiver<
+        crate::agent::external::UIInteractionRequest,
+    >,
+    writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    app_id: &str,
+) {
+    loop {
+        match observer.recv().await {
+            Ok(request) => {
+                let interaction: crate::agent::interaction::AgentInteraction = request.into();
+                let frame = AgentToHost::Interaction { interaction };
+                let mut w = writer.lock().await;
+                if let Err(e) = protocol::write_message(&mut w, &frame).await {
+                    log::error!(
+                        "[app-worker:{}] failed to forward interaction: {}",
+                        app_id,
+                        e
+                    );
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                log::warn!(
+                    "[app-worker:{}] interaction observer lagged, skipped {} requests",
+                    app_id,
+                    skipped
+                );
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 /// Build a [`SessionManager`] rooted at `home`, honoring the `--app-session-dir`
 /// flag without mutating process-global environment. Mirrors
 /// [`SessionManager::new`]'s directory layout.
@@ -209,6 +310,7 @@ async fn bridge_host_messages(
     input_port: &crate::agent::runtime::port::InputPort,
     app_id: &str,
     pending_lists: &PendingLists,
+    interaction_queue: &Arc<crate::agent::external::interaction_queue::InteractionQueue>,
 ) {
     loop {
         match protocol::read_message::<HostToAgent>(reader).await {
@@ -255,6 +357,21 @@ async fn bridge_host_messages(
                     let _ = reply.send(peers);
                 } else {
                     log::debug!("[app-worker:{}] PeerListResult with no waiter", app_id);
+                }
+            }
+            Ok(Some(HostToAgent::InteractionAnswer { response })) => {
+                // The host answered a raised interaction. Convert the unified
+                // response back to the legacy shape the queue resolves on, then
+                // unblock the awaiting raise tool by its request id. A miss means
+                // the interaction already cleared (late/duplicate answer).
+                let request_id = response.request_id().to_string();
+                let legacy: crate::agent::external::UIInteractionResponse = response.into();
+                if !interaction_queue.resolve(&request_id, legacy) {
+                    log::debug!(
+                        "[app-worker:{}] InteractionAnswer for unknown request {}",
+                        app_id,
+                        request_id
+                    );
                 }
             }
             Ok(Some(HostToAgent::Shutdown)) => {

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
 
 use super::{UIInteractionRequest, UIInteractionResponse};
 
@@ -12,16 +12,41 @@ pub struct PendingInteraction {
 
 pub struct InteractionQueue {
     pending: Mutex<HashMap<String, PendingInteraction>>,
+    /// Broadcasts each newly enqueued request so an out-of-loop owner (the app
+    /// worker) can forward it to the host. Absent on the single-agent host path,
+    /// which drains the queue directly without observation. See
+    /// `docs/agent/interaction.md`.
+    observe: Option<broadcast::Sender<UIInteractionRequest>>,
 }
 
 impl InteractionQueue {
     pub fn new() -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
+            observe: None,
         }
     }
 
+    /// Build a queue that also broadcasts every enqueued request on the returned
+    /// receiver. The app worker subscribes to forward raised interactions to the
+    /// host as [`crate::protocol::AgentToHost::Interaction`]; the in-loop raise
+    /// tools enqueue through the same `add` path, so they need no awareness of the
+    /// observer.
+    pub fn with_observer() -> (Self, broadcast::Receiver<UIInteractionRequest>) {
+        let (tx, rx) = broadcast::channel(64);
+        let queue = Self {
+            pending: Mutex::new(HashMap::new()),
+            observe: Some(tx),
+        };
+        (queue, rx)
+    }
+
     pub fn add(&self, request_id: String, interaction: PendingInteraction) {
+        if let Some(ref observe) = self.observe {
+            // A dropped receiver (no live worker subscriber) is not an error: the
+            // request is still enqueued and resolvable by id.
+            let _ = observe.send(interaction.request.clone());
+        }
         self.pending.lock().unwrap().insert(request_id, interaction);
     }
 

@@ -508,26 +508,31 @@ pub async fn run(config: HostConfig, bot: Option<Bot>) {
     // the host comes up unaffected. See `docs/app/runtime/worker-lifecycle.md`.
     let app_store: Arc<dyn crate::app::registry::store::AppStore> =
         Arc::new(crate::app::registry::store::FilesystemAppStore::new());
-    let app_supervisor = match crate::app::runtime::local_supervisor::LocalSupervisor::bind(
-        app_store.clone(),
-    )
-    .await
-    {
-        Ok(supervisor) => {
-            match app_store.list(false) {
-                Ok(apps) => log::info!(
-                    "App board ready: {} App(s) loaded Tombstoned at startup",
-                    apps.len()
-                ),
-                Err(e) => log::warn!("Failed to enumerate Apps at startup: {e}"),
+    // `bind_shared` returns the supervisor already in an `Arc` so each App's
+    // supervision pump holds a live `Weak<Self>` and can wake an offline target
+    // through `ensure_active` when a `PeerSend` is queued to its inbox. See
+    // `docs/app/peer/decentralized-messaging.md`.
+    let app_supervisor =
+        match crate::app::runtime::local_supervisor::LocalSupervisor::bind_shared(
+            app_store.clone(),
+        )
+        .await
+        {
+            Ok(supervisor) => {
+                match app_store.list(false) {
+                    Ok(apps) => log::info!(
+                        "App board ready: {} App(s) loaded Tombstoned at startup",
+                        apps.len()
+                    ),
+                    Err(e) => log::warn!("Failed to enumerate Apps at startup: {e}"),
+                }
+                Some(supervisor)
             }
-            Some(Arc::new(supervisor))
-        }
-        Err(e) => {
-            log::warn!("Failed to bind App supervisor: {e}; board surface disabled");
-            None
-        }
-    };
+            Err(e) => {
+                log::warn!("Failed to bind App supervisor: {e}; board surface disabled");
+                None
+            }
+        };
 
     // Set up the gateway server
     let _gateway_handle = {

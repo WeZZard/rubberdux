@@ -25,6 +25,7 @@
 mod live_gate;
 
 mod idle_tombstone_restore;
+mod interaction_round_trip;
 mod peer_send_tombstoned_target;
 mod subprocess_crash_restart;
 mod support;
@@ -59,6 +60,9 @@ fn main() {
         }),
         ("peer_send_tombstoned_target", || {
             Box::pin(peer_send_tombstoned_target::run())
+        }),
+        ("interaction_round_trip", || {
+            Box::pin(interaction_round_trip::run())
         }),
     ];
 

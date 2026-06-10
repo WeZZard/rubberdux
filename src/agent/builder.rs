@@ -35,6 +35,11 @@ pub struct AgentLoopBuilder {
     pub guardrails: Option<crate::guardrail::GuardrailChain>,
     pub external_cwd: Option<std::path::PathBuf>,
     pub interaction_queue: Option<Arc<crate::agent::external::interaction_queue::InteractionQueue>>,
+    /// The App id stamped onto interactions this agent raises. Set only by a
+    /// native App worker; the four interaction-raise tools are registered only
+    /// when both this and `interaction_queue` are present, because a raised
+    /// interaction must name the App it belongs to. See `docs/tool/interaction.md`.
+    pub app_id: Option<String>,
     /// The peer-messaging transport, set only by a native App worker. When
     /// present, the `peer_list`/`peer_send` tools are registered; otherwise they
     /// are absent (a non-App agent has no peer network to talk to). See
@@ -63,6 +68,7 @@ impl AgentLoopBuilder {
             guardrails: None,
             external_cwd: None,
             interaction_queue: None,
+            app_id: None,
             peer_channel: None,
             #[cfg(feature = "host")]
             vm_manager: None,
@@ -127,6 +133,13 @@ impl AgentLoopBuilder {
         queue: Arc<crate::agent::external::interaction_queue::InteractionQueue>,
     ) -> Self {
         self.interaction_queue = Some(queue);
+        self
+    }
+
+    /// Set the App id stamped onto interactions this agent raises. Enables the
+    /// interaction-raise tools when an `interaction_queue` is also present.
+    pub fn with_app_id(mut self, app_id: impl Into<String>) -> Self {
+        self.app_id = Some(app_id.into());
         self
     }
 
@@ -198,6 +211,23 @@ impl AgentLoopBuilder {
 
             if let Some(ref queue) = self.interaction_queue {
                 r.register(Box::new(crate::tool::interaction_respond::InteractionRespondTool::new(queue.clone())));
+
+                // The interaction-raise tools need both the queue and an App id to
+                // stamp onto the interactions they raise. Only a native App worker
+                // sets `app_id`, so only there are these tools registered.
+                if let Some(ref app_id) = self.app_id {
+                    use crate::tool::interaction::{
+                        AskQuestionTool, OfferChoiceTool, PresentPreviewTool, RequestApprovalTool,
+                    };
+                    let recorder = self
+                        .recorder
+                        .clone()
+                        .unwrap_or_else(crate::trajectory::noop_recorder);
+                    r.register(Box::new(RequestApprovalTool::new(queue.clone(), recorder.clone(), app_id.clone())));
+                    r.register(Box::new(AskQuestionTool::new(queue.clone(), recorder.clone(), app_id.clone())));
+                    r.register(Box::new(OfferChoiceTool::new(queue.clone(), recorder.clone(), app_id.clone())));
+                    r.register(Box::new(PresentPreviewTool::new(queue.clone(), recorder, app_id.clone())));
+                }
             }
 
             // The peer-messaging tools exist only in an App worker, which is the

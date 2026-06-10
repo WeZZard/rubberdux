@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -39,7 +39,7 @@ use crate::agent::runtime::port::EntryNotification;
 use crate::error::Error;
 use crate::app::peer::PeerId;
 use crate::app::peer::mailbox::Mailbox;
-use crate::host::{AcceptedWorker, PeerBroker, WorkerStream, accept_worker};
+use crate::host::{AcceptedWorker, PeerBroker, PeerRouteOutcome, WorkerStream, accept_worker};
 use crate::protocol::{self, AgentToHost, HostToAgent};
 use crate::trajectory::TrajectoryEvent;
 
@@ -111,6 +111,43 @@ pub struct LocalSupervisor {
     /// pump frames to it, and wakes an offline target after the broker queues to
     /// its inbox. See `docs/app/peer/decentralized-messaging.md`.
     peer_broker: Arc<PeerBroker>,
+    /// A self-reference handed to each per-App supervision pump so the pump can
+    /// call back into the supervisor's restore path (`ensure_active`) when the
+    /// broker reports a `PeerSend` was `Queued` to an offline target's inbox.
+    /// Empty (a dangling `Weak`) for a supervisor built with `bind`; populated
+    /// when built with `bind_shared`, which the host uses. A pump whose upgrade
+    /// fails (no live `Arc<Self>`) skips the wake and the message drains on the
+    /// target's next restore. See `docs/app/peer/decentralized-messaging.md`.
+    me: Weak<LocalSupervisor>,
+}
+
+/// The async-bound parts of a [`LocalSupervisor`], produced by `assemble` before
+/// the choice of self-reference (`Weak<LocalSupervisor>`) is known. Exists so the
+/// async listener/router setup happens once and is then finished into a
+/// supervisor either by value (`bind`) or inside `Arc::new_cyclic` (`bind_shared`).
+struct SupervisorParts {
+    store: Arc<dyn AppStore>,
+    rpc_addr: std::net::SocketAddr,
+    inboxes: Arc<Mutex<HashMap<AppId, ConnectionInbox>>>,
+    board_tx: broadcast::Sender<BoardEvent>,
+    peer_broker: Arc<PeerBroker>,
+}
+
+impl SupervisorParts {
+    /// Finish the assembled parts into a supervisor with the given self-reference.
+    /// `me` is empty for `bind` and the live `Weak` for `bind_shared`.
+    fn into_supervisor(self, me: Weak<LocalSupervisor>) -> LocalSupervisor {
+        LocalSupervisor {
+            store: self.store,
+            rpc_addr: self.rpc_addr,
+            runtimes: Arc::new(Mutex::new(HashMap::new())),
+            lifecycles: Arc::new(Mutex::new(HashMap::new())),
+            inboxes: self.inboxes,
+            board_tx: self.board_tx,
+            peer_broker: self.peer_broker,
+            me,
+        }
+    }
 }
 
 impl LocalSupervisor {
@@ -118,6 +155,35 @@ impl LocalSupervisor {
     /// ready supervisor. The router lives for the process lifetime, routing every
     /// worker `Hello` to the matching App's supervision task.
     pub async fn bind(store: Arc<dyn AppStore>) -> Result<Self, Error> {
+        // No self-reference: a supervisor moved by value cannot hand its pumps a
+        // live `Arc<Self>`, so the peer-send wake degrades to a no-op (the queued
+        // message drains on the target's next restore). The host uses
+        // `bind_shared` to get the active wake.
+        let parts = Self::assemble(store).await?;
+        let supervisor = parts.into_supervisor(Weak::new());
+        supervisor.spawn_idle_sweeper();
+        Ok(supervisor)
+    }
+
+    /// Bind a supervisor already wrapped in an `Arc`, with each supervision pump
+    /// holding a live `Weak<Self>` so a `PeerSend` queued to an offline target
+    /// wakes that target through `ensure_active`. The host uses this so the
+    /// peer-send wake is active; `bind` is the by-value variant for callers that
+    /// do not need the wake. See `docs/app/peer/decentralized-messaging.md`.
+    pub async fn bind_shared(store: Arc<dyn AppStore>) -> Result<Arc<Self>, Error> {
+        // `assemble` does the async listener/router setup; the `Arc` is then
+        // built cyclically so every pump captures the supervisor's own `Weak` and
+        // can call back into `ensure_active`.
+        let parts = Self::assemble(store).await?;
+        let shared = Arc::new_cyclic(|me| parts.into_supervisor(me.clone()));
+        shared.spawn_idle_sweeper();
+        Ok(shared)
+    }
+
+    /// Bind the listener, start the accept router, and create the broker and board
+    /// channel — the async setup shared by `bind` and `bind_shared`. The returned
+    /// parts are finished into a `LocalSupervisor` with a chosen self-reference.
+    async fn assemble(store: Arc<dyn AppStore>) -> Result<SupervisorParts, Error> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let rpc_addr = listener.local_addr()?;
         let (board_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
@@ -127,17 +193,13 @@ impl LocalSupervisor {
         Self::spawn_accept_router(listener, inboxes.clone());
 
         let peer_broker = Arc::new(PeerBroker::new(store.clone()));
-        let supervisor = Self {
+        Ok(SupervisorParts {
             store,
             rpc_addr,
-            runtimes: Arc::new(Mutex::new(HashMap::new())),
-            lifecycles: Arc::new(Mutex::new(HashMap::new())),
             inboxes,
             board_tx,
             peer_broker,
-        };
-        supervisor.spawn_idle_sweeper();
-        Ok(supervisor)
+        })
     }
 
     /// The address worker children connect back on, e.g. for tests that spawn a
@@ -195,39 +257,50 @@ impl LocalSupervisor {
     /// restarts a crash with backoff), and return the handle the supervisor
     /// keeps. `app_session_dir` roots the worker's `SessionManager` under the
     /// App's directory.
-    async fn start_worker(&self, app: &App, app_session_dir: PathBuf) -> WorkerHandle {
-        let (entry_tx, _) = broadcast::channel::<EntryNotification>(CHANNEL_CAPACITY);
-        let (trajectory_tx, _) = broadcast::channel::<TrajectoryEvent>(CHANNEL_CAPACITY);
-        let (outbound_tx, outbound_rx) = mpsc::channel::<HostToAgent>(OUTBOUND_CAPACITY);
-        let (conn_tx, conn_rx) = mpsc::channel::<WorkerStream>(1);
-        let cancel = CancellationToken::new();
+    /// A restored worker's pump can wake a peer via `ensure_active`, which calls
+    /// back into `start_worker`. Returning a boxed (named) future instead of an
+    /// `async fn`'s opaque future breaks that otherwise-cyclic type inference:
+    /// the concrete `Pin<Box<dyn Future>>` is the cut point in the cycle.
+    fn start_worker<'a>(
+        &'a self,
+        app: &'a App,
+        app_session_dir: PathBuf,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = WorkerHandle> + Send + 'a>> {
+        Box::pin(async move {
+            let (entry_tx, _) = broadcast::channel::<EntryNotification>(CHANNEL_CAPACITY);
+            let (trajectory_tx, _) = broadcast::channel::<TrajectoryEvent>(CHANNEL_CAPACITY);
+            let (outbound_tx, outbound_rx) = mpsc::channel::<HostToAgent>(OUTBOUND_CAPACITY);
+            let (conn_tx, conn_rx) = mpsc::channel::<WorkerStream>(1);
+            let cancel = CancellationToken::new();
 
-        self.inboxes
-            .lock()
-            .await
-            .insert(app.id.clone(), conn_tx);
+            self.inboxes
+                .lock()
+                .await
+                .insert(app.id.clone(), conn_tx);
 
-        // Make this App reachable on the peer network and directly deliverable:
-        // register a clone of its outbound sink with the broker. The broker uses
-        // it to relay a `PeerDeliver` to this live worker.
-        self.peer_broker
-            .register(PeerId::local(app.id.clone()), outbound_tx.clone())
-            .await;
+            // Make this App reachable on the peer network and directly deliverable:
+            // register a clone of its outbound sink with the broker. The broker uses
+            // it to relay a `PeerDeliver` to this live worker.
+            self.peer_broker
+                .register(PeerId::local(app.id.clone()), outbound_tx.clone())
+                .await;
 
-        let task = SupervisionTask {
-            app_id: app.id.clone(),
-            rpc_addr: self.rpc_addr,
-            app_session_dir,
-            entry_tx: entry_tx.clone(),
-            cancel: cancel.clone(),
-            inboxes: self.inboxes.clone(),
-            runtimes: self.runtimes.clone(),
-            lifecycles: self.lifecycles.clone(),
-            peer_broker: self.peer_broker.clone(),
-        };
-        tokio::spawn(task.run(conn_rx, outbound_rx));
+            let task = SupervisionTask {
+                app_id: app.id.clone(),
+                rpc_addr: self.rpc_addr,
+                app_session_dir,
+                entry_tx: entry_tx.clone(),
+                cancel: cancel.clone(),
+                inboxes: self.inboxes.clone(),
+                runtimes: self.runtimes.clone(),
+                lifecycles: self.lifecycles.clone(),
+                peer_broker: self.peer_broker.clone(),
+                supervisor: self.me.clone(),
+            };
+            tokio::spawn(task.run(conn_rx, outbound_rx));
 
-        WorkerHandle::new(outbound_tx, entry_tx, trajectory_tx, cancel)
+            WorkerHandle::new(outbound_tx, entry_tx, trajectory_tx, cancel)
+        })
     }
 
     /// Look up the live App from the store, erroring if it does not exist.
@@ -497,6 +570,12 @@ struct SupervisionTask {
     /// `PeerListResult` back; the broker makes the routing decision (deliver vs.
     /// queue), keeping the pump a thin conduit.
     peer_broker: Arc<PeerBroker>,
+    /// A `Weak` back to the supervisor that owns this pump, so a `PeerSend` the
+    /// broker reports as `Queued` to an offline target can wake that target
+    /// through the supervisor's `ensure_active` restore path. Empty when the
+    /// supervisor was built by value (`bind`), in which case the wake is skipped
+    /// and the message drains on the target's next restore.
+    supervisor: Weak<LocalSupervisor>,
 }
 
 impl SupervisionTask {
@@ -701,8 +780,53 @@ impl SupervisionTask {
                             let from = PeerId::local(self.app_id.clone());
                             let to_peer = PeerId::local(AppId(to));
                             match self.peer_broker.relay(from, to_peer, payload).await {
-                                Ok(outcome) => log::debug!(
-                                    "[app-worker:{}] peer_send routed: {outcome:?}",
+                                Ok(PeerRouteOutcome::Delivered) => log::debug!(
+                                    "[app-worker:{}] peer_send delivered",
+                                    self.app_id
+                                ),
+                                Ok(PeerRouteOutcome::Queued { wake }) => {
+                                    // The target's worker is offline; the broker
+                                    // queued the envelope to its inbox. Restore the
+                                    // target through the supervisor's own restore
+                                    // path (`ensure_active`, which drains the inbox)
+                                    // so it picks the message up. The broker owns no
+                                    // supervision, so the wake happens here. If the
+                                    // owning supervisor is gone, skip the wake and
+                                    // let the next restore drain the inbox.
+                                    log::debug!(
+                                        "[app-worker:{}] peer_send queued, waking {}",
+                                        self.app_id,
+                                        wake.app_id
+                                    );
+                                    match self.supervisor.upgrade() {
+                                        Some(supervisor) => {
+                                            // Run the restore on its own task: the
+                                            // restore spawns the target's pump, so
+                                            // awaiting it inline would make this
+                                            // pump's future recursively reference
+                                            // itself. Detaching keeps both pumps
+                                            // independent and the pump non-blocking.
+                                            let source = self.app_id.clone();
+                                            let target = wake.app_id.clone();
+                                            tokio::spawn(async move {
+                                                if let Err(e) =
+                                                    supervisor.ensure_active(&target).await
+                                                {
+                                                    log::warn!(
+                                                        "[app-worker:{source}] peer_send wake of {target} failed: {e}"
+                                                    );
+                                                }
+                                            });
+                                        }
+                                        None => log::debug!(
+                                            "[app-worker:{}] peer_send queued to {} but supervisor is gone; drains on next restore",
+                                            self.app_id,
+                                            wake.app_id
+                                        ),
+                                    }
+                                }
+                                Ok(PeerRouteOutcome::Rejected) => log::debug!(
+                                    "[app-worker:{}] peer_send rejected",
                                     self.app_id
                                 ),
                                 Err(e) => log::warn!(
