@@ -26,6 +26,12 @@ targets:
       base:
         PRODUCT_NAME: "$(inherited)"
         PRODUCT_BUNDLE_IDENTIFIER: "$(inherited)"
+        # Pin the Swift module name independently of PRODUCT_NAME, which carries a
+        # " (Debug)"/" (Release)" suffix. Otherwise the module name sanitizes to
+        # e.g. Rubberdux__Debug_ and (a) collides with the test target's module
+        # ("Multiple commands produce …swiftmodule") and (b) breaks the tests'
+        # `@testable import Rubberdux`.
+        PRODUCT_MODULE_NAME: Rubberdux
   RubberduxTests:
     type: bundle.unit-test
     platform: macOS
@@ -37,3 +43,27 @@ targets:
       base:
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/$(PRODUCT_NAME).app/Contents/MacOS/$(PRODUCT_NAME)"
         BUNDLE_LOADER: "$(TEST_HOST)"
+        # Distinct module name so the test bundle does not emit the same
+        # .swiftmodule as the app target. PRODUCT_NAME stays inherited so
+        # TEST_HOST still resolves to the "Rubberdux (Debug)" app product.
+        PRODUCT_MODULE_NAME: RubberduxTests
+        # The project base sets INFOPLIST_FILE to the APP's Info.plist, which
+        # declares NSPrincipalClass=NSApplication. A test bundle must NOT inherit
+        # that — loading it into the host app would instantiate a SECOND
+        # NSApplication ("More than one NSApplication instance was created").
+        # Generate a default test-bundle Info.plist instead, and don't inherit
+        # the app's entitlements.
+        GENERATE_INFOPLIST_FILE: true
+        INFOPLIST_FILE: ""
+        CODE_SIGN_ENTITLEMENTS: ""
+schemes:
+  Rubberdux:
+    build:
+      targets:
+        Rubberdux: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - RubberduxTests

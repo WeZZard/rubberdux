@@ -36,6 +36,7 @@ cargo xtask app build              # debug build: cargo build + xcodebuild
 cargo xtask app build --release    # release build
 cargo xtask app run                # build + launch the app
 cargo xtask app run --release      # release build + launch
+cargo xtask app test               # build backend + run the macOS XCTest target
 
 # Full stack (provision VMs, build, launch backend with Telegram)
 cargo xtask launch                 # release build + launch rubberduxd --host

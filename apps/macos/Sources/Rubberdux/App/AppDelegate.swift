@@ -15,6 +15,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Under XCTest the app process is only a unit-test host: do not launch
+        // the backend or any UI. Otherwise hosting the tests would spawn the
+        // real rubberduxd daemon, hit the network, and fight the test runner's
+        // app lifecycle (modal alert / terminate during bootstrapping).
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+            return
+        }
+
         cleanupStaleLaunchAgents()
         statusBarController.onShowWindow = { [weak self] in self?.showMainWindow() }
         statusBarController.onShowSettings = { [weak self] in self?.showSettings() }

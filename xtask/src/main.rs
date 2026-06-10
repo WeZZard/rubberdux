@@ -73,6 +73,8 @@ enum AppCommands {
         #[arg(long)]
         release: bool,
     },
+    /// Build the Rust backend + run the macOS app's XCTest target
+    Test,
 }
 
 #[derive(Subcommand)]
@@ -148,6 +150,12 @@ async fn main() {
             AppCommands::Run { release } => {
                 if let Err(e) = app::run(release) {
                     eprintln!("App run failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            AppCommands::Test => {
+                if let Err(e) = app::test() {
+                    eprintln!("App test failed: {}", e);
                     std::process::exit(1);
                 }
             }

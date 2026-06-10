@@ -142,3 +142,42 @@ pub fn run(release: bool) -> Result<(), String> {
 
     Ok(())
 }
+
+/// Run the macOS app's XCTest target through the generated Xcode project.
+/// Tests are orchestrated by cargo per the project convention (never bare
+/// `xcodebuild`); this builds the Rust backend, regenerates the project, and
+/// runs the `Rubberdux` scheme's test action (which hosts `RubberduxTests`).
+pub fn test() -> Result<(), String> {
+    let root = project_root()?;
+    let app_dir = macos_app_dir(&root);
+
+    build_rust_backend(false)?;
+    generate_xcode_project(&app_dir)?;
+    test_xcode_project(&app_dir)?;
+
+    println!("Tests complete.");
+    Ok(())
+}
+
+fn test_xcode_project(app_dir: &PathBuf) -> Result<(), String> {
+    println!("Running macOS app tests (Debug)...");
+    let status = Command::new("xcodebuild")
+        .current_dir(app_dir)
+        .args([
+            "-project",
+            "Rubberdux.xcodeproj",
+            "-scheme",
+            "Rubberdux",
+            "-configuration",
+            "Debug",
+            "-destination",
+            "platform=macOS",
+            "test",
+        ])
+        .status()
+        .map_err(|e| format!("xcodebuild test failed: {}", e))?;
+    if !status.success() {
+        return Err("xcodebuild test failed".into());
+    }
+    Ok(())
+}
