@@ -118,6 +118,16 @@ final class BoardView: NSView {
         iconLayers[appID]?.badgeCount = count
     }
 
+    /// The view-space rect of `appID`'s icon tile, clamped to the board's visible
+    /// bounds so a popover anchored to it never points off-screen. Returns `nil`
+    /// when no icon exists for `appID`. Used to anchor the interaction popover and
+    /// the pending-list pop-out to an icon.
+    func iconRect(forAppID appID: String) -> NSRect? {
+        guard let layer = iconLayers[appID] else { return nil }
+        let clamped = layer.frame.intersection(bounds)
+        return clamped.isNull ? layer.frame : clamped
+    }
+
     /// Select an app icon (or clear selection with `nil`), updating rings.
     func selectApp(_ appID: String?) {
         if let current = selectedAppID, let layer = iconLayers[current] {

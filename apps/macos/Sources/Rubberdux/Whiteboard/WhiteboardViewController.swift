@@ -66,6 +66,32 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
     private var dragRecognizer: NSPanGestureRecognizer?
     private var draggingAppID: String?
 
+    // MARK: - Interaction surfaces
+
+    /// The pending interactions every shown App is awaiting. Drives both the icon
+    /// badge counts and the pop-out pending list.
+    private var pendingInteractions = PendingInteractionsStore()
+
+    /// One open interaction socket per shown App, keyed by app id. Opened when an
+    /// App appears on the board and closed when it leaves, so raised/resolved
+    /// events reach the board without a manual selection.
+    private var interactionSockets: [String: InteractionSocket] = [:]
+
+    /// Per-socket subscription tokens, released alongside the socket.
+    private var interactionCancellables: [String: AnyCancellable] = [:]
+
+    /// The popover shown when an interaction is raised while the board window is
+    /// front. Reused across raises.
+    private let interactionPopover = InteractionPopoverController()
+
+    /// The pop-out pending list, presented when the user clicks a badged icon.
+    private var pendingListController: PendingInteractionsController?
+
+    /// Whether the board window is the front, key surface. When `true` a raised
+    /// interaction is presented as a popover; when `false` it only updates the
+    /// icon badge and the pending list. Tracked via window/app notifications.
+    private var isBoardFront: Bool = false
+
     // MARK: - Init
 
     init(apiClient: APIClient, boardSocket: BoardSocket) {
@@ -135,6 +161,7 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
     override func viewDidLoad() {
         super.viewDidLoad()
         subscribeToBoard()
+        observeFrontSurface()
         loadApps()
     }
 
@@ -165,8 +192,12 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
     /// Apply a live board event to the store and reflect it on the board view.
     private func handle(_ event: BoardEvent) {
         switch event {
-        case let .badge(appId, count):
-            boardView.setBadge(count, forAppID: appId)
+        case .badge:
+            // The per-App interaction socket (`InteractionSocket`) is the
+            // authoritative source of badge counts, derived from
+            // `PendingInteractionsStore`. The board-level badge frame is ignored
+            // here so it never clobbers the precise per-App count.
+            break
         case .updated(let id):
             // The event carries only an id; refetch the single App and upsert.
             refetchAndUpsert(id: id)
@@ -198,9 +229,11 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
     private func resyncBoard() {
         boardView.setApps(store.apps)
         reapplySelection()
+        reapplyBadges()
         // A full snapshot may have removed a selected App; keep the panel honest.
         if isViewLoaded {
             syncObservationPanel()
+            reconcileInteractionSockets()
         }
     }
 
@@ -216,9 +249,11 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
             // icon layer.
             boardView.setApps(store.apps)
             reapplySelection()
+            reapplyBadges()
             // A removed App may be in the selection; let the panel prune and
             // collapse if needed.
             syncObservationPanel()
+            reconcileInteractionSockets()
         case .unchanged:
             break
         }
@@ -261,6 +296,12 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
     // MARK: - BoardViewDelegate
 
     func boardView(_ boardView: BoardView, didSelectAppID appID: String) {
+        // A click on a badged icon opens its pending-interactions pop-out (the
+        // badge surface), rather than only selecting the icon. Selection still
+        // proceeds so the observation panel tracks it.
+        if pendingInteractions.hasPending(forAppID: appID) {
+            presentPendingList(forAppID: appID)
+        }
         let extending = NSEvent.modifierFlags.contains(.command) || NSEvent.modifierFlags.contains(.shift)
         if extending {
             if selectedAppIDs.contains(appID) {
@@ -393,6 +434,152 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
             return cell
         }
         return fallback
+    }
+
+    // MARK: - Interaction surfaces
+
+    /// Open an interaction socket for every App now on the board and close
+    /// sockets for Apps that have left, so raised/resolved events reach the board
+    /// without requiring the App to be selected. Idempotent: an App that is
+    /// already subscribed is left untouched.
+    private func reconcileInteractionSockets() {
+        let liveIDs = Set(store.apps.filter { $0.status == .active }.map(\.id))
+        let currentIDs = Set(interactionSockets.keys)
+
+        for id in currentIDs.subtracting(liveIDs) {
+            interactionSockets.removeValue(forKey: id)?.disconnect()
+            interactionCancellables.removeValue(forKey: id)
+            pendingInteractions.replace(appID: id, with: [])
+        }
+
+        for id in liveIDs.subtracting(currentIDs) {
+            let socket = InteractionSocket(appID: id, baseURL: apiClient.baseURL)
+            interactionCancellables[id] = socket.eventSubject
+                .receive(on: RunLoop.main)
+                .sink { [weak self] event in
+                    self?.handleInteractionEvent(event, appID: id)
+                }
+            interactionSockets[id] = socket
+            socket.connect()
+        }
+    }
+
+    /// Apply one live interaction event to the pending model and the board's
+    /// surfaces: a raise lights the badge and (if the board is front) shows the
+    /// popover; a resolve clears the badge and dismisses any surface showing it.
+    private func handleInteractionEvent(_ event: InteractionSocketEvent, appID: String) {
+        switch event {
+        case let .raised(interaction):
+            pendingInteractions.raise(interaction)
+            boardView.setBadge(pendingInteractions.badgeCount(forAppID: appID), forAppID: appID)
+            refreshPendingList(forAppID: appID)
+            if isBoardFront {
+                presentInteractionPopover(interaction, appID: appID)
+            }
+        case let .resolved(requestId):
+            pendingInteractions.resolve(appID: appID, requestId: requestId)
+            boardView.setBadge(pendingInteractions.badgeCount(forAppID: appID), forAppID: appID)
+            interactionPopover.dismiss(ifShowing: requestId)
+            refreshPendingList(forAppID: appID)
+        }
+    }
+
+    /// Present the interaction popover anchored to `appID`'s icon. Responses are
+    /// sent over the App's interaction socket (with a POST fallback) and clear the
+    /// interaction optimistically.
+    private func presentInteractionPopover(_ interaction: AgentInteraction, appID: String) {
+        guard let rect = boardView.iconRect(forAppID: appID) else { return }
+        interactionPopover.present(interaction, relativeTo: rect, of: boardView) { [weak self] response in
+            self?.respond(response, appID: appID)
+            self?.interactionPopover.dismiss()
+        }
+    }
+
+    /// Open the pop-out pending list anchored to `appID`'s badged icon.
+    private func presentPendingList(forAppID appID: String) {
+        guard let rect = boardView.iconRect(forAppID: appID) else { return }
+        let controller = PendingInteractionsController()
+        controller.onRespond = { [weak self] response in
+            self?.respond(response, appID: appID)
+        }
+        controller.setInteractions(pendingInteractions.interactions(forAppID: appID))
+        pendingListController = controller
+        controller.present(relativeTo: rect, of: boardView)
+    }
+
+    /// Push the latest pending interactions into the open pop-out list, if it is
+    /// showing.
+    private func refreshPendingList(forAppID appID: String) {
+        pendingListController?.setInteractions(pendingInteractions.interactions(forAppID: appID))
+    }
+
+    /// Deliver `response` to the backend over the App's interaction socket when
+    /// open, otherwise via the REST fallback, and clear it from the pending model
+    /// so the badge decrements and the request leaves the list. The authoritative
+    /// `resolved` event from the backend confirms the same clearing.
+    private func respond(_ response: InteractionResponse, appID: String) {
+        if let socket = interactionSockets[appID] {
+            socket.respond(response)
+        } else {
+            Task { @MainActor in
+                do {
+                    try await apiClient.respondToInteraction(
+                        appID: appID,
+                        requestID: response.requestId,
+                        response: response
+                    )
+                } catch {
+                    log("Failed to respond to interaction \(response.requestId): \(error)")
+                }
+            }
+        }
+        pendingInteractions.resolve(appID: appID, requestId: response.requestId)
+        boardView.setBadge(pendingInteractions.badgeCount(forAppID: appID), forAppID: appID)
+        refreshPendingList(forAppID: appID)
+    }
+
+    /// Reapply badge counts from the pending model after a board resync, so a
+    /// `setApps` that recreates icon layers does not lose their badges.
+    private func reapplyBadges() {
+        for app in store.apps {
+            boardView.setBadge(pendingInteractions.badgeCount(forAppID: app.id), forAppID: app.id)
+        }
+    }
+
+    // MARK: - Front-surface tracking
+
+    /// Observe window key/main and app activation notifications so the board can
+    /// choose the popover surface (board is front) versus the badge surface
+    /// (board is not front) when an interaction is raised.
+    private func observeFrontSurface() {
+        let center = NotificationCenter.default
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didBecomeMainNotification] {
+            center.publisher(for: name)
+                .receive(on: RunLoop.main)
+                .sink { [weak self] _ in self?.updateFrontSurface() }
+                .store(in: &cancellables)
+        }
+        for name in [NSWindow.didResignKeyNotification, NSWindow.didResignMainNotification] {
+            center.publisher(for: name)
+                .receive(on: RunLoop.main)
+                .sink { [weak self] _ in self?.updateFrontSurface() }
+                .store(in: &cancellables)
+        }
+        center.publisher(for: NSApplication.didResignActiveNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateFrontSurface() }
+            .store(in: &cancellables)
+        center.publisher(for: NSApplication.didBecomeActiveNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateFrontSurface() }
+            .store(in: &cancellables)
+        updateFrontSurface()
+    }
+
+    /// Recompute whether the board window is the front, key surface.
+    private func updateFrontSurface() {
+        let window = view.window
+        isBoardFront = NSApp.isActive && (window?.isKeyWindow == true || window?.isMainWindow == true)
     }
 
     // MARK: - Logging
