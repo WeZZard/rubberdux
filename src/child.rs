@@ -15,6 +15,14 @@ fn find_share_dir() -> PathBuf {
     }
 }
 
+/// Run the native app-worker path: a real `AgentLoop` for a single App, bridged
+/// to the host over RPC. Delegates to
+/// [`crate::app::runtime::worker::run_app_worker`], which sends `Hello{app_id}`
+/// first and then streams entries. See `docs/app/runtime/worker-lifecycle.md`.
+pub async fn run_app_child(rpc_host: String, app_id: String, app_session_dir: PathBuf) {
+    crate::app::runtime::worker::run_app_worker(rpc_host, app_id, app_session_dir).await;
+}
+
 pub async fn run_child(rpc_host: String, task_id: String) {
     let share_dir = find_share_dir();
 

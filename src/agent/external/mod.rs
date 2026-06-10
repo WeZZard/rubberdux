@@ -46,6 +46,227 @@ pub enum UIInteractionResponse {
     PermissionDenied { request_id: String, reason: String },
 }
 
+/// Lossless bridge from the legacy external-agent request vocabulary to the
+/// unified [`AgentInteraction`] vocabulary. The external agent's
+/// `agent_task_id` is the unified `app_id`. See `docs/agent/interaction.md`
+/// for the full mapping table; this conversion preserves Claude Code / Codex
+/// behavior by speaking the one vocabulary downstream without information loss.
+impl From<UIInteractionRequest> for crate::agent::interaction::AgentInteraction {
+    fn from(request: UIInteractionRequest) -> Self {
+        use crate::agent::interaction::{AgentInteraction, ApprovalFlavor, ChoiceOption};
+        match request {
+            UIInteractionRequest::Question {
+                request_id,
+                agent_task_id,
+                text,
+                options,
+            } => AgentInteraction::Question {
+                request_id,
+                app_id: agent_task_id,
+                text,
+                options: options.into_iter().map(ChoiceOption::from).collect(),
+            },
+            UIInteractionRequest::PlanApproval {
+                request_id,
+                agent_task_id,
+                plan_text,
+            } => AgentInteraction::Approval {
+                request_id,
+                app_id: agent_task_id,
+                flavor: ApprovalFlavor::Plan,
+                prompt: plan_text,
+            },
+            UIInteractionRequest::PermissionRequest {
+                request_id,
+                agent_task_id,
+                description,
+            } => AgentInteraction::Approval {
+                request_id,
+                app_id: agent_task_id,
+                flavor: ApprovalFlavor::Permission,
+                prompt: description,
+            },
+        }
+    }
+}
+
+impl From<QuestionOption> for crate::agent::interaction::ChoiceOption {
+    fn from(option: QuestionOption) -> Self {
+        crate::agent::interaction::ChoiceOption {
+            label: option.label,
+            description: option.description,
+        }
+    }
+}
+
+impl From<crate::agent::interaction::ChoiceOption> for QuestionOption {
+    fn from(option: crate::agent::interaction::ChoiceOption) -> Self {
+        QuestionOption {
+            label: option.label,
+            description: option.description,
+        }
+    }
+}
+
+/// Lossless bridge from the unified [`AgentInteraction`] vocabulary back to the
+/// legacy external-agent request vocabulary. Only the three legacy-mapped
+/// variants (`Approval`/`Question`) occur on the external-agent path; the new
+/// `Choice` and `Preview` primitives have no legacy counterpart, so they are
+/// degraded to the closest legacy shape (`Choice` → `Question`, `Preview` →
+/// `PermissionRequest`) rather than dropped. See `docs/agent/interaction.md`.
+impl From<crate::agent::interaction::AgentInteraction> for UIInteractionRequest {
+    fn from(interaction: crate::agent::interaction::AgentInteraction) -> Self {
+        use crate::agent::interaction::{AgentInteraction, ApprovalFlavor};
+        match interaction {
+            AgentInteraction::Approval {
+                request_id,
+                app_id,
+                flavor: ApprovalFlavor::Plan,
+                prompt,
+            } => UIInteractionRequest::PlanApproval {
+                request_id,
+                agent_task_id: app_id,
+                plan_text: prompt,
+            },
+            AgentInteraction::Approval {
+                request_id,
+                app_id,
+                flavor: ApprovalFlavor::Permission,
+                prompt,
+            } => UIInteractionRequest::PermissionRequest {
+                request_id,
+                agent_task_id: app_id,
+                description: prompt,
+            },
+            AgentInteraction::Question {
+                request_id,
+                app_id,
+                text,
+                options,
+            } => UIInteractionRequest::Question {
+                request_id,
+                agent_task_id: app_id,
+                text,
+                options: options.into_iter().map(QuestionOption::from).collect(),
+            },
+            AgentInteraction::Choice {
+                request_id,
+                app_id,
+                prompt,
+                options,
+            } => UIInteractionRequest::Question {
+                request_id,
+                agent_task_id: app_id,
+                text: prompt,
+                options: options.into_iter().map(QuestionOption::from).collect(),
+            },
+            AgentInteraction::Preview {
+                request_id,
+                app_id,
+                prompt,
+                ..
+            } => UIInteractionRequest::PermissionRequest {
+                request_id,
+                agent_task_id: app_id,
+                description: prompt,
+            },
+        }
+    }
+}
+
+/// Lossless bridge from the legacy external-agent response vocabulary to the
+/// unified [`InteractionResponse`] vocabulary. See `docs/agent/interaction.md`.
+impl From<UIInteractionResponse> for crate::agent::interaction::InteractionResponse {
+    fn from(response: UIInteractionResponse) -> Self {
+        use crate::agent::interaction::{ApprovalFlavor, InteractionResponse};
+        match response {
+            UIInteractionResponse::SelectedOption { request_id, index } => {
+                InteractionResponse::Answered {
+                    request_id,
+                    selected: Some(index),
+                    reply: None,
+                }
+            }
+            UIInteractionResponse::PlanApproved { request_id } => InteractionResponse::Approved {
+                request_id,
+                flavor: ApprovalFlavor::Plan,
+            },
+            UIInteractionResponse::PlanRejected {
+                request_id,
+                feedback,
+            } => InteractionResponse::Declined {
+                request_id,
+                flavor: ApprovalFlavor::Plan,
+                reason: feedback,
+            },
+            UIInteractionResponse::PermissionGranted { request_id } => {
+                InteractionResponse::Approved {
+                    request_id,
+                    flavor: ApprovalFlavor::Permission,
+                }
+            }
+            UIInteractionResponse::PermissionDenied { request_id, reason } => {
+                InteractionResponse::Declined {
+                    request_id,
+                    flavor: ApprovalFlavor::Permission,
+                    reason,
+                }
+            }
+        }
+    }
+}
+
+/// Lossless bridge from the unified [`InteractionResponse`] vocabulary back to
+/// the legacy external-agent response vocabulary. `Approved` / `Declined` carry
+/// an [`ApprovalFlavor`] so the exact legacy variant is reconstructed:
+/// `Permission` → `PermissionGranted` / `PermissionDenied`, `Plan` →
+/// `PlanApproved` / `PlanRejected`. `Answered` maps back to `SelectedOption`
+/// when an option index was chosen; the unified-only shapes with no legacy
+/// counterpart degrade to the closest legacy shape exactly as the request-side
+/// reverse `From` does: an `Answered` with a free-form `reply` (and no selected
+/// index) degrades to `SelectedOption { index: 0 }`, and `Acknowledged`
+/// (a `Preview` acknowledgement, which the external-agent path never raises)
+/// degrades to `PermissionGranted`. See `docs/agent/interaction.md`.
+impl From<crate::agent::interaction::InteractionResponse> for UIInteractionResponse {
+    fn from(response: crate::agent::interaction::InteractionResponse) -> Self {
+        use crate::agent::interaction::{ApprovalFlavor, InteractionResponse};
+        match response {
+            InteractionResponse::Approved {
+                request_id,
+                flavor: ApprovalFlavor::Permission,
+            } => UIInteractionResponse::PermissionGranted { request_id },
+            InteractionResponse::Approved {
+                request_id,
+                flavor: ApprovalFlavor::Plan,
+            } => UIInteractionResponse::PlanApproved { request_id },
+            InteractionResponse::Declined {
+                request_id,
+                flavor: ApprovalFlavor::Permission,
+                reason,
+            } => UIInteractionResponse::PermissionDenied { request_id, reason },
+            InteractionResponse::Declined {
+                request_id,
+                flavor: ApprovalFlavor::Plan,
+                reason,
+            } => UIInteractionResponse::PlanRejected {
+                request_id,
+                feedback: reason,
+            },
+            InteractionResponse::Answered {
+                request_id,
+                selected,
+                ..
+            } => UIInteractionResponse::SelectedOption {
+                request_id,
+                index: selected.unwrap_or(0),
+            },
+            InteractionResponse::Acknowledged { request_id } => {
+                UIInteractionResponse::PermissionGranted { request_id }
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ExternalAgentEvent {
     UIInteraction(UIInteractionRequest),
@@ -259,7 +480,252 @@ pub fn spawn_external_agent_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::interaction::{
+        AgentInteraction, ApprovalFlavor, ChoiceOption, InteractionResponse,
+    };
     use tokio::sync::mpsc;
+
+    #[test]
+    fn test_legacy_permission_request_maps_losslessly() {
+        let legacy = UIInteractionRequest::PermissionRequest {
+            request_id: "p1".into(),
+            agent_task_id: "task-1".into(),
+            description: "rm -rf".into(),
+        };
+        let unified: AgentInteraction = legacy.into();
+        assert_eq!(
+            unified,
+            AgentInteraction::Approval {
+                request_id: "p1".into(),
+                app_id: "task-1".into(),
+                flavor: ApprovalFlavor::Permission,
+                prompt: "rm -rf".into(),
+            }
+        );
+        // Round-trip back to legacy.
+        let back: UIInteractionRequest = unified.into();
+        assert!(matches!(
+            back,
+            UIInteractionRequest::PermissionRequest { ref request_id, ref agent_task_id, ref description }
+                if request_id == "p1" && agent_task_id == "task-1" && description == "rm -rf"
+        ));
+    }
+
+    #[test]
+    fn test_legacy_plan_approval_maps_losslessly() {
+        let legacy = UIInteractionRequest::PlanApproval {
+            request_id: "pl1".into(),
+            agent_task_id: "task-2".into(),
+            plan_text: "step 1; step 2".into(),
+        };
+        let unified: AgentInteraction = legacy.into();
+        assert_eq!(
+            unified,
+            AgentInteraction::Approval {
+                request_id: "pl1".into(),
+                app_id: "task-2".into(),
+                flavor: ApprovalFlavor::Plan,
+                prompt: "step 1; step 2".into(),
+            }
+        );
+        let back: UIInteractionRequest = unified.into();
+        assert!(matches!(
+            back,
+            UIInteractionRequest::PlanApproval { ref request_id, ref agent_task_id, ref plan_text }
+                if request_id == "pl1" && agent_task_id == "task-2" && plan_text == "step 1; step 2"
+        ));
+    }
+
+    #[test]
+    fn test_legacy_question_maps_losslessly() {
+        let legacy = UIInteractionRequest::Question {
+            request_id: "q1".into(),
+            agent_task_id: "task-3".into(),
+            text: "which db?".into(),
+            options: vec![QuestionOption {
+                label: "pg".into(),
+                description: "postgres".into(),
+            }],
+        };
+        let unified: AgentInteraction = legacy.into();
+        assert_eq!(
+            unified,
+            AgentInteraction::Question {
+                request_id: "q1".into(),
+                app_id: "task-3".into(),
+                text: "which db?".into(),
+                options: vec![ChoiceOption {
+                    label: "pg".into(),
+                    description: "postgres".into(),
+                }],
+            }
+        );
+        let back: UIInteractionRequest = unified.into();
+        assert!(matches!(
+            back,
+            UIInteractionRequest::Question { ref request_id, ref agent_task_id, ref text, ref options }
+                if request_id == "q1"
+                    && agent_task_id == "task-3"
+                    && text == "which db?"
+                    && options.len() == 1
+                    && options[0].label == "pg"
+                    && options[0].description == "postgres"
+        ));
+    }
+
+    #[test]
+    fn test_legacy_response_selected_option_maps() {
+        let legacy = UIInteractionResponse::SelectedOption {
+            request_id: "q1".into(),
+            index: 2,
+        };
+        let unified: InteractionResponse = legacy.into();
+        assert_eq!(
+            unified,
+            InteractionResponse::Answered {
+                request_id: "q1".into(),
+                selected: Some(2),
+                reply: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_legacy_response_plan_approved_maps() {
+        let unified: InteractionResponse = UIInteractionResponse::PlanApproved {
+            request_id: "pl1".into(),
+        }
+        .into();
+        assert_eq!(
+            unified,
+            InteractionResponse::Approved {
+                request_id: "pl1".into(),
+                flavor: ApprovalFlavor::Plan,
+            }
+        );
+    }
+
+    #[test]
+    fn test_legacy_response_plan_rejected_maps() {
+        let unified: InteractionResponse = UIInteractionResponse::PlanRejected {
+            request_id: "pl1".into(),
+            feedback: "no good".into(),
+        }
+        .into();
+        assert_eq!(
+            unified,
+            InteractionResponse::Declined {
+                request_id: "pl1".into(),
+                flavor: ApprovalFlavor::Plan,
+                reason: "no good".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_legacy_response_permission_granted_maps() {
+        let unified: InteractionResponse = UIInteractionResponse::PermissionGranted {
+            request_id: "p1".into(),
+        }
+        .into();
+        assert_eq!(
+            unified,
+            InteractionResponse::Approved {
+                request_id: "p1".into(),
+                flavor: ApprovalFlavor::Permission,
+            }
+        );
+    }
+
+    #[test]
+    fn test_legacy_response_permission_denied_maps() {
+        let unified: InteractionResponse = UIInteractionResponse::PermissionDenied {
+            request_id: "p1".into(),
+            reason: "unsafe".into(),
+        }
+        .into();
+        assert_eq!(
+            unified,
+            InteractionResponse::Declined {
+                request_id: "p1".into(),
+                flavor: ApprovalFlavor::Permission,
+                reason: "unsafe".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_legacy_response_selected_option_round_trips() {
+        let legacy = UIInteractionResponse::SelectedOption {
+            request_id: "q1".into(),
+            index: 3,
+        };
+        let unified: InteractionResponse = legacy.into();
+        let back: UIInteractionResponse = unified.into();
+        assert!(matches!(
+            back,
+            UIInteractionResponse::SelectedOption { ref request_id, index }
+                if request_id == "q1" && index == 3
+        ));
+    }
+
+    #[test]
+    fn test_legacy_response_plan_approved_round_trips() {
+        let legacy = UIInteractionResponse::PlanApproved {
+            request_id: "pl1".into(),
+        };
+        let unified: InteractionResponse = legacy.into();
+        let back: UIInteractionResponse = unified.into();
+        assert!(matches!(
+            back,
+            UIInteractionResponse::PlanApproved { ref request_id }
+                if request_id == "pl1"
+        ));
+    }
+
+    #[test]
+    fn test_legacy_response_plan_rejected_round_trips() {
+        let legacy = UIInteractionResponse::PlanRejected {
+            request_id: "pl1".into(),
+            feedback: "no good".into(),
+        };
+        let unified: InteractionResponse = legacy.into();
+        let back: UIInteractionResponse = unified.into();
+        assert!(matches!(
+            back,
+            UIInteractionResponse::PlanRejected { ref request_id, ref feedback }
+                if request_id == "pl1" && feedback == "no good"
+        ));
+    }
+
+    #[test]
+    fn test_legacy_response_permission_granted_round_trips() {
+        let legacy = UIInteractionResponse::PermissionGranted {
+            request_id: "p1".into(),
+        };
+        let unified: InteractionResponse = legacy.into();
+        let back: UIInteractionResponse = unified.into();
+        assert!(matches!(
+            back,
+            UIInteractionResponse::PermissionGranted { ref request_id }
+                if request_id == "p1"
+        ));
+    }
+
+    #[test]
+    fn test_legacy_response_permission_denied_round_trips() {
+        let legacy = UIInteractionResponse::PermissionDenied {
+            request_id: "p1".into(),
+            reason: "unsafe".into(),
+        };
+        let unified: InteractionResponse = legacy.into();
+        let back: UIInteractionResponse = unified.into();
+        assert!(matches!(
+            back,
+            UIInteractionResponse::PermissionDenied { ref request_id, ref reason }
+                if request_id == "p1" && reason == "unsafe"
+        ));
+    }
 
     fn dummy_input_port() -> crate::agent::runtime::port::InputPort {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);

@@ -1,4 +1,5 @@
 mod agent;
+mod app;
 #[cfg(feature = "host")]
 mod channel;
 mod child;
@@ -24,6 +25,20 @@ use teloxide::prelude::*;
 enum RunMode {
     Host,
     Agent { rpc_host: String, task_id: String },
+    /// Native app worker: runs a real `AgentLoop` for a single App and bridges
+    /// it to the host over RPC. Selected when `--app-session-dir` is present
+    /// alongside `--agent`. See `docs/app/runtime/worker-lifecycle.md`.
+    AppWorker {
+        rpc_host: String,
+        app_id: String,
+        app_session_dir: std::path::PathBuf,
+    },
+}
+
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find(|w| w[0] == flag)
+        .map(|w| w[1].as_str())
 }
 
 fn parse_mode(args: &[String]) -> RunMode {
@@ -31,17 +46,22 @@ fn parse_mode(args: &[String]) -> RunMode {
         return RunMode::Host;
     }
 
-    let rpc_host = args
-        .windows(2)
-        .find(|w| w[0] == "--rpc-host")
-        .map(|w| w[1].clone())
-        .unwrap_or_else(|| "127.0.0.1:19384".to_string());
+    let rpc_host = flag_value(args, "--rpc-host")
+        .unwrap_or("127.0.0.1:19384")
+        .to_string();
 
-    let task_id = args
-        .windows(2)
-        .find(|w| w[0] == "--task-id")
-        .map(|w| w[1].clone())
-        .unwrap_or_else(|| "unknown".to_string());
+    // `--app-session-dir` selects the native app-worker mode; `--task-id` then
+    // carries the App id (reusing the existing VM-child argument shape).
+    if let Some(app_session_dir) = flag_value(args, "--app-session-dir") {
+        let app_id = flag_value(args, "--task-id").unwrap_or("unknown").to_string();
+        return RunMode::AppWorker {
+            rpc_host,
+            app_id,
+            app_session_dir: std::path::PathBuf::from(app_session_dir),
+        };
+    }
+
+    let task_id = flag_value(args, "--task-id").unwrap_or("unknown").to_string();
 
     RunMode::Agent { rpc_host, task_id }
 }
@@ -69,6 +89,13 @@ async fn main() {
         }
         RunMode::Agent { rpc_host, task_id } => {
             child::run_child(rpc_host, task_id).await;
+        }
+        RunMode::AppWorker {
+            rpc_host,
+            app_id,
+            app_session_dir,
+        } => {
+            child::run_app_child(rpc_host, app_id, app_session_dir).await;
         }
     }
 }
@@ -114,6 +141,32 @@ mod tests {
                 assert_eq!(task_id, "t1");
             }
             _ => panic!("expected RunMode::Agent"),
+        }
+    }
+
+    #[test]
+    fn test_parse_mode_app_worker() {
+        let args: Vec<String> = vec![
+            "rubberduxd".into(),
+            "--agent".into(),
+            "--rpc-host".into(),
+            "1.2.3.4:19384".into(),
+            "--task-id".into(),
+            "2026-06-10-00-00-00-UTC".into(),
+            "--app-session-dir".into(),
+            "/tmp/apps/app-1".into(),
+        ];
+        match parse_mode(&args) {
+            RunMode::AppWorker {
+                rpc_host,
+                app_id,
+                app_session_dir,
+            } => {
+                assert_eq!(rpc_host, "1.2.3.4:19384");
+                assert_eq!(app_id, "2026-06-10-00-00-00-UTC");
+                assert_eq!(app_session_dir, std::path::PathBuf::from("/tmp/apps/app-1"));
+            }
+            _ => panic!("expected RunMode::AppWorker"),
         }
     }
 

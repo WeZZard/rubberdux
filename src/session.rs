@@ -35,6 +35,12 @@ pub struct AgentMetadata {
     pub parent_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_type: Option<String>,
+    /// Backref to the owning App cluster, when this session is a member of one
+    /// (see `crate::app` and `docs/app/whiteboard-backend.md`). Sessions created
+    /// outside the whiteboard have no App, so this is optional and omitted when
+    /// absent for backward compatibility with existing session metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
 }
 
 impl AgentMetadata {
@@ -45,6 +51,7 @@ impl AgentMetadata {
             subagent_name: None,
             parent_session_id: None,
             subagent_type: None,
+            app_id: None,
         }
     }
 
@@ -60,7 +67,15 @@ impl AgentMetadata {
             subagent_name: Some(subagent_name),
             parent_session_id: Some(parent_session_id),
             subagent_type: Some(subagent_type),
+            app_id: None,
         }
+    }
+
+    /// Attach this session to an App cluster, setting the [`Self::app_id`]
+    /// backref. Returns `self` for builder-style chaining.
+    pub fn with_app_id(mut self, app_id: String) -> Self {
+        self.app_id = Some(app_id);
+        self
     }
 }
 

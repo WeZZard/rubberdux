@@ -2,9 +2,30 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
-/// Messages sent from a VM agent to the host.
+/// Messages sent from a worker (VM agent or native app worker) to the host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentToHost {
+    /// The first frame a native app worker sends after connecting, identifying
+    /// which App this socket belongs to so the host can route it without relying
+    /// on accept order. See `docs/app/runtime/worker-lifecycle.md`.
+    Hello { app_id: String },
+    /// A history entry produced by a native app worker's `AgentLoop`, streamed to
+    /// the host as it is appended. Mirrors
+    /// [`crate::agent::runtime::port::EntryNotification`].
+    EntryNotification {
+        entry: crate::agent::entry::Entry,
+        is_final: bool,
+    },
+    /// A native app worker addresses another peer App. The host's peer broker
+    /// (defined later) routes the payload; here the frame is only declared.
+    /// See `docs/app/runtime/worker-lifecycle.md`.
+    PeerSend {
+        to: String,
+        payload: serde_json::Value,
+    },
+    /// A native app worker requests the set of peers it may address. The host
+    /// answers with [`HostToAgent::PeerListResult`].
+    PeerList,
     /// Agent response to a user message.
     Response {
         text: String,
@@ -24,9 +45,15 @@ pub enum AgentToHost {
         task_id: String,
         request: crate::agent::external::UIInteractionRequest,
     },
+    /// A native app worker raised a unified-vocabulary interaction for the user
+    /// to answer. The host replies with [`HostToAgent::InteractionResponse`].
+    /// See `docs/agent/interaction.md`.
+    Interaction {
+        interaction: crate::agent::interaction::AgentInteraction,
+    },
 }
 
-/// Messages sent from the host to a VM agent.
+/// Messages sent from the host to a worker (VM agent or native app worker).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HostToAgent {
     /// Forwarded user message from Telegram.
@@ -44,6 +71,21 @@ pub enum HostToAgent {
     InteractionResponse {
         request_id: String,
         response: crate::agent::external::UIInteractionResponse,
+    },
+    /// A peer App delivered a message to this native app worker. Counterpart of
+    /// [`AgentToHost::PeerSend`]; the broker that produces it is defined later.
+    /// See `docs/app/runtime/worker-lifecycle.md`.
+    PeerDeliver {
+        from: String,
+        payload: serde_json::Value,
+    },
+    /// The host's answer to [`AgentToHost::PeerList`]: the App ids this worker may
+    /// address.
+    PeerListResult { peers: Vec<String> },
+    /// The host's reply to an [`AgentToHost::Interaction`], using the unified
+    /// interaction vocabulary. See `docs/agent/interaction.md`.
+    InteractionAnswer {
+        response: crate::agent::interaction::InteractionResponse,
     },
 }
 
@@ -303,6 +345,134 @@ mod tests {
                 assert_eq!(agent_name, None);
             }
             _ => panic!("Expected SpawnVM"),
+        }
+    }
+
+    #[test]
+    fn test_hello_roundtrip() {
+        let msg = AgentToHost::Hello {
+            app_id: "2026-06-10-00-00-00-UTC".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("Hello"));
+        let back: AgentToHost = serde_json::from_str(&json).unwrap();
+        match back {
+            AgentToHost::Hello { app_id } => assert_eq!(app_id, "2026-06-10-00-00-00-UTC"),
+            _ => panic!("Expected Hello"),
+        }
+    }
+
+    #[test]
+    fn test_entry_notification_roundtrip() {
+        use crate::agent::entry::{Entry, EntryOrigin};
+        use crate::provider::moonshot::UserContent;
+
+        let msg = AgentToHost::EntryNotification {
+            entry: Entry {
+                id: 7,
+                parent_id: Some(3),
+                message: crate::provider::moonshot::Message::User {
+                    content: UserContent::Text("hi".into()),
+                },
+                origin: EntryOrigin::User { channel: "board".into() },
+                channel_metadata: None,
+            },
+            is_final: true,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: AgentToHost = serde_json::from_str(&json).unwrap();
+        match back {
+            AgentToHost::EntryNotification { entry, is_final } => {
+                assert_eq!(entry.id, 7);
+                assert_eq!(entry.message.content_text(), "hi");
+                assert!(is_final);
+            }
+            _ => panic!("Expected EntryNotification"),
+        }
+    }
+
+    #[test]
+    fn test_peer_send_and_list_roundtrip() {
+        let send = AgentToHost::PeerSend {
+            to: "app-2".into(),
+            payload: serde_json::json!({"text": "ping"}),
+        };
+        let back: AgentToHost = serde_json::from_str(&serde_json::to_string(&send).unwrap()).unwrap();
+        match back {
+            AgentToHost::PeerSend { to, payload } => {
+                assert_eq!(to, "app-2");
+                assert_eq!(payload["text"], "ping");
+            }
+            _ => panic!("Expected PeerSend"),
+        }
+
+        let list = AgentToHost::PeerList;
+        let back: AgentToHost = serde_json::from_str(&serde_json::to_string(&list).unwrap()).unwrap();
+        assert!(matches!(back, AgentToHost::PeerList));
+    }
+
+    #[test]
+    fn test_peer_deliver_and_list_result_roundtrip() {
+        let deliver = HostToAgent::PeerDeliver {
+            from: "app-1".into(),
+            payload: serde_json::json!({"text": "pong"}),
+        };
+        let back: HostToAgent =
+            serde_json::from_str(&serde_json::to_string(&deliver).unwrap()).unwrap();
+        match back {
+            HostToAgent::PeerDeliver { from, payload } => {
+                assert_eq!(from, "app-1");
+                assert_eq!(payload["text"], "pong");
+            }
+            _ => panic!("Expected PeerDeliver"),
+        }
+
+        let result = HostToAgent::PeerListResult {
+            peers: vec!["app-1".into(), "app-2".into()],
+        };
+        let back: HostToAgent =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        match back {
+            HostToAgent::PeerListResult { peers } => assert_eq!(peers.len(), 2),
+            _ => panic!("Expected PeerListResult"),
+        }
+    }
+
+    #[test]
+    fn test_interaction_frames_roundtrip() {
+        use crate::agent::interaction::{
+            AgentInteraction, ApprovalFlavor, InteractionResponse,
+        };
+
+        let msg = AgentToHost::Interaction {
+            interaction: AgentInteraction::Approval {
+                request_id: "r1".into(),
+                app_id: "app-1".into(),
+                flavor: ApprovalFlavor::Permission,
+                prompt: "delete?".into(),
+            },
+        };
+        let back: AgentToHost = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        match back {
+            AgentToHost::Interaction { interaction } => {
+                assert_eq!(interaction.request_id(), "r1");
+            }
+            _ => panic!("Expected Interaction"),
+        }
+
+        let answer = HostToAgent::InteractionAnswer {
+            response: InteractionResponse::Approved {
+                request_id: "r1".into(),
+                flavor: ApprovalFlavor::Permission,
+            },
+        };
+        let back: HostToAgent =
+            serde_json::from_str(&serde_json::to_string(&answer).unwrap()).unwrap();
+        match back {
+            HostToAgent::InteractionAnswer { response } => {
+                assert_eq!(response.request_id(), "r1");
+            }
+            _ => panic!("Expected InteractionAnswer"),
         }
     }
 

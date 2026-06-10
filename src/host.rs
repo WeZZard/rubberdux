@@ -12,6 +12,65 @@ use crate::vm::manager::VMManager;
 
 const DEFAULT_RPC_PORT: u16 = 19384;
 
+/// The read/write halves of an accepted worker socket, paired so a caller can
+/// keep streaming after the routing decision has been made.
+pub struct WorkerStream {
+    pub reader: tokio::net::tcp::OwnedReadHalf,
+    pub writer: tokio::net::tcp::OwnedWriteHalf,
+}
+
+/// The outcome of inspecting an accepted worker socket's first frame.
+///
+/// Incoming worker sockets are routed by their first frame rather than by
+/// accept order: a native app worker opens with
+/// [`AgentToHost::Hello`](crate::protocol::AgentToHost::Hello), while a VM child
+/// opens with a task frame ([`AgentToHost::Response`] /
+/// [`AgentToHost::ExternalInteraction`]). See
+/// `docs/app/runtime/worker-lifecycle.md`.
+pub enum AcceptedWorker {
+    /// A native app worker identified by its `Hello` frame.
+    App {
+        app_id: String,
+        stream: WorkerStream,
+    },
+    /// A VM child connection. `first_frame` is the frame already read off the
+    /// wire while classifying the socket, handed back so the VM path processes
+    /// it exactly as before.
+    VmChild {
+        first_frame: AgentToHost,
+        stream: WorkerStream,
+    },
+}
+
+/// Accept one worker connection and classify it by its first frame.
+///
+/// This replaces accept-by-order routing: the first frame decides whether the
+/// socket belongs to a native app worker (`Hello`) or a VM child (a task frame).
+/// The VM child's first frame is returned so no message is lost.
+pub async fn accept_worker(listener: &TcpListener) -> Result<AcceptedWorker, Error> {
+    let (stream, addr) = listener.accept().await?;
+    let (mut reader, writer) = stream.into_split();
+    match protocol::read_message::<AgentToHost>(&mut reader).await? {
+        Some(AgentToHost::Hello { app_id }) => {
+            log::info!("App worker {} connected from {}", app_id, addr);
+            Ok(AcceptedWorker::App {
+                app_id,
+                stream: WorkerStream { reader, writer },
+            })
+        }
+        Some(first_frame) => {
+            log::info!("VM child connected from {}", addr);
+            Ok(AcceptedWorker::VmChild {
+                first_frame,
+                stream: WorkerStream { reader, writer },
+            })
+        }
+        None => Err(Error::Rpc(format!(
+            "worker at {addr} disconnected before sending any frame"
+        ))),
+    }
+}
+
 /// Configuration for host mode.
 #[derive(Clone)]
 pub struct HostConfig {
@@ -386,18 +445,38 @@ pub async fn run_child_vm(
             .await;
         }
 
-        // Accept the child's RPC connection
-        // TODO: proper connection routing by task_id instead of accept order
-        let (stream, addr) = listener.accept().await?;
-        log::info!("Child VM {} connected from {}", task_id, addr);
-
-        let (mut reader, writer) = stream.into_split();
+        // Accept the child's RPC connection, routing by the first frame instead
+        // of by accept order. A native app worker would open with `Hello`; this
+        // VM path only consumes VM-child sockets and hands any stray app socket
+        // back to the listener for the supervisor (wired in a later task) by
+        // closing it — no app worker is expected on this path.
+        // See docs/app/runtime/worker-lifecycle.md.
+        let (mut reader, writer, first_frame) = loop {
+            match accept_worker(&listener).await? {
+                AcceptedWorker::VmChild { first_frame, stream } => {
+                    log::info!("Child VM {} matched a VM-child socket", task_id);
+                    break (stream.reader, stream.writer, first_frame);
+                }
+                AcceptedWorker::App { app_id, stream } => {
+                    log::warn!(
+                        "App worker {} connected on VM-child accept path; closing (no supervisor here)",
+                        app_id
+                    );
+                    drop(stream);
+                }
+            }
+        };
         let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
 
-        // Read messages until the child sends its final response
+        // Process the first frame that was already read while classifying the
+        // socket, then continue reading until the child's final response.
         let mut final_text = String::new();
+        let mut pending = Some(first_frame);
         loop {
-            let msg: Option<AgentToHost> = protocol::read_message(&mut reader).await?;
+            let msg: Option<AgentToHost> = match pending.take() {
+                Some(frame) => Some(frame),
+                None => protocol::read_message(&mut reader).await?,
+            };
             match msg {
                 Some(AgentToHost::Response { text, is_final, .. }) => {
                     final_text = text;
@@ -437,6 +516,16 @@ pub async fn run_child_vm(
                             }
                         }
                     });
+                }
+                Some(other) => {
+                    // App-worker frames (Hello/EntryNotification/peer/interaction)
+                    // never arrive on the VM-child path — sockets are classified
+                    // by their first frame in `accept_worker`. Log defensively.
+                    log::warn!(
+                        "Child VM {} sent unexpected frame on VM path: {:?}",
+                        task_id,
+                        other
+                    );
                 }
                 None => {
                     log::info!("Child VM {} disconnected", task_id);

@@ -13,6 +13,9 @@ pub enum LoopEvent {
     },
     /// Context update to inject into history without triggering LLM processing.
     ContextUpdate(Message),
+    /// An agent-initiated interaction raised into the loop for the user to
+    /// observe and answer. See `docs/agent/interaction.md`.
+    RaiseInteraction(crate::agent::interaction::AgentInteraction),
     /// Internal history/prompt mutation.
     Internal(InternalMutation),
 }
@@ -75,6 +78,15 @@ impl InputPort {
 
     pub async fn send_context_update(&self, message: Message) -> Result<(), crate::error::Error> {
         self.send(LoopEvent::ContextUpdate(message)).await
+    }
+
+    /// Raise an agent-initiated interaction into the loop. See
+    /// `docs/agent/interaction.md` for the interaction vocabulary.
+    pub async fn raise_interaction(
+        &self,
+        interaction: crate::agent::interaction::AgentInteraction,
+    ) -> Result<(), crate::error::Error> {
+        self.send(LoopEvent::RaiseInteraction(interaction)).await
     }
 }
 

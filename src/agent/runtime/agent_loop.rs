@@ -395,6 +395,16 @@ impl AgentLoop {
             LoopEvent::ContextUpdate(message) => {
                 self.record_context_update(message).await;
             }
+            LoopEvent::RaiseInteraction(interaction) => {
+                // Handling (presenting and awaiting a response) is implemented
+                // by a separate task; the loop only acknowledges the event for
+                // now. See docs/agent/interaction.md.
+                log::info!(
+                    "raise_interaction received (app {}, request {})",
+                    interaction.app_id(),
+                    interaction.request_id()
+                );
+            }
             LoopEvent::Internal(mutation) => {
                 self.handle_internal_mutation(mutation);
             }
@@ -836,6 +846,15 @@ impl AgentLoop {
                         .push((message, origin, channel_metadata));
                 }
                 Ok(LoopEvent::Internal(mutation)) => self.handle_internal_mutation(mutation),
+                Ok(LoopEvent::RaiseInteraction(interaction)) => {
+                    // See docs/agent/interaction.md; handling lands in a later
+                    // task. Acknowledge so draining stays exhaustive.
+                    log::info!(
+                        "raise_interaction received while draining (app {}, request {})",
+                        interaction.app_id(),
+                        interaction.request_id()
+                    );
+                }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
             }

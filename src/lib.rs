@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod app;
 #[cfg(feature = "host")]
 pub mod channel;
 pub mod child;

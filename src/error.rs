@@ -39,4 +39,7 @@ pub enum Error {
 
     #[error("mindset error: {0}")]
     Mindset(String),
+
+    #[error("app error: {0}")]
+    App(String),
 }
