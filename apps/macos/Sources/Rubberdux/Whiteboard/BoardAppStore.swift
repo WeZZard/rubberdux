@@ -98,14 +98,45 @@ final class BoardAppStore {
         return .upserted(placeholder)
     }
 
+    /// The marker prefixed onto every optimistic placeholder id so a client-local
+    /// id is never confused with a server id. The placeholder-detection logic
+    /// (`isPlaceholder(_:)`, `interactionSocketIDs(for:)`) derives from this single
+    /// constant, so the convention stays in one place.
+    static let placeholderIDPrefix = "optimistic-"
+
     /// Mint a temporary id for an optimistic placeholder. The prefix marks it as
     /// client-local so it is never confused with a server id.
     static func placeholderID() -> String {
-        "optimistic-\(UUID().uuidString)"
+        "\(placeholderIDPrefix)\(UUID().uuidString)"
+    }
+
+    /// Whether `id` is a client-minted optimistic placeholder rather than a server
+    /// id. Placeholder ids have no backing worker on the backend, so callers must
+    /// not address per-App backend resources (e.g. the interactions WebSocket) by
+    /// such an id.
+    static func isPlaceholderID(_ id: String) -> Bool {
+        id.hasPrefix(placeholderIDPrefix)
     }
 
     private func isPlaceholder(_ id: String) -> Bool {
-        id.hasPrefix("optimistic-")
+        Self.isPlaceholderID(id)
+    }
+
+    /// The App ids that should hold an open interactions WebSocket: the apps that
+    /// are `.active` AND backed by a real server id (not an optimistic
+    /// placeholder). A placeholder id has no backing worker on the backend, so
+    /// opening its interactions socket only yields a "no active worker" rejection;
+    /// excluding it here keeps the socket reconciliation addressed at real ids
+    /// only. Pure and free of view state so it is unit-testable.
+    ///
+    /// See `docs/apps/macos/whiteboard-client.md` for the whiteboard client design
+    /// record.
+    static func interactionSocketIDs(for apps: [App]) -> Set<String> {
+        Set(
+            apps
+                .filter { $0.status == .active && !isPlaceholderID($0.id) }
+                .map(\.id)
+        )
     }
 
     /// Collapse the optimistic placeholder identified by `placeholderID` into the

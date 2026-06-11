@@ -259,8 +259,10 @@ async fn handle_board(mut socket: WebSocket, state: Arc<GatewayState>) {
 }
 
 /// Translate a supervisor [`BoardEvent`] into its stable board wire message.
-/// `StatusChanged` and `Moved` both collapse to `updated`: the board reloads
-/// the affected App's view rather than diffing field-level changes.
+/// `StatusChanged`, `Moved`, and `IdentityChanged` all collapse to `updated`:
+/// the board reloads the affected App's view rather than diffing field-level
+/// changes, so a derived identity reaches subscribers through the same reload
+/// signal without changing the wire shape.
 fn project_board_event(event: BoardEvent) -> BoardWsMessage {
     match event {
         BoardEvent::Created(app) => BoardWsMessage::AppCreated {
@@ -268,6 +270,7 @@ fn project_board_event(event: BoardEvent) -> BoardWsMessage {
         },
         BoardEvent::StatusChanged { id, .. } => BoardWsMessage::Updated { id: id.0 },
         BoardEvent::Moved { id, .. } => BoardWsMessage::Updated { id: id.0 },
+        BoardEvent::IdentityChanged(app) => BoardWsMessage::Updated { id: app.id.0 },
         BoardEvent::Archived(id) => BoardWsMessage::Archived { id: id.0 },
     }
 }

@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		02CE32F3270E06E40C8E9CFB /* BoardAppStoreInteractionSocketSelectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0777B6E4CBBE761E3ED461D /* BoardAppStoreInteractionSocketSelectionTests.swift */; };
 		03C5C65C2942E0BA6EA4B6B0 /* EntryRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1727678AD41624C70F4EC0D /* EntryRowView.swift */; };
 		04F1731B74733524A3DFAA8F /* BoardAppStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4E337D74EC9D7D5CB0B7AE9 /* BoardAppStore.swift */; };
 		05957A8E6DA940547A3D4BD5 /* AppObservationViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39FBDC70C27EB40C34FD8667 /* AppObservationViewController.swift */; };
@@ -134,6 +135,7 @@
 		BE1EFD66A23F2CE2EC41A828 /* EventStreamViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EventStreamViewController.swift; sourceTree = "<group>"; };
 		BF5A56514C5DF9AC2DD7F714 /* AppearanceModeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppearanceModeTests.swift; sourceTree = "<group>"; };
 		BF69C9564DC2D7EEDE678EE4 /* AppSocket.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSocket.swift; sourceTree = "<group>"; };
+		C0777B6E4CBBE761E3ED461D /* BoardAppStoreInteractionSocketSelectionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoardAppStoreInteractionSocketSelectionTests.swift; sourceTree = "<group>"; };
 		C55EDAA078756C6C4C217448 /* AppPaletteTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppPaletteTests.swift; sourceTree = "<group>"; };
 		D8D6C4814B54EA20D8A1A47C /* AppearanceMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppearanceMode.swift; sourceTree = "<group>"; };
 		D8F035A757E471B50AB22A6A /* SettingsWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsWindowController.swift; sourceTree = "<group>"; };
@@ -261,6 +263,7 @@
 				144E051B1C0BCB1EDFFC0CF5 /* AppModelTests.swift */,
 				C55EDAA078756C6C4C217448 /* AppPaletteTests.swift */,
 				2037B6EDC360F841D1E25190 /* AppSocketRegistryTests.swift */,
+				C0777B6E4CBBE761E3ED461D /* BoardAppStoreInteractionSocketSelectionTests.swift */,
 				E69F9C6A957008B33A86C457 /* BoardAppStoreTests.swift */,
 				A355F86747A5E6CC01F794C7 /* BoardEventTests.swift */,
 				35B5469E130139DD9C8620A7 /* BoardGeometryTests.swift */,
@@ -523,6 +526,7 @@
 				10199606D81AD96901160080 /* AppPaletteTests.swift in Sources */,
 				D9E015F90509FFB6A690EE11 /* AppSocketRegistryTests.swift in Sources */,
 				0AADD896613E495FA7E6C28A /* AppearanceModeTests.swift in Sources */,
+				02CE32F3270E06E40C8E9CFB /* BoardAppStoreInteractionSocketSelectionTests.swift in Sources */,
 				CEB0F9E4A7A8D39BDAFCD07C /* BoardAppStoreTests.swift in Sources */,
 				A13D0052F047BA5D4E4936DF /* BoardEventTests.swift in Sources */,
 				FD3C2534C7FEAC64DAF80901 /* BoardGeometryTests.swift in Sources */,

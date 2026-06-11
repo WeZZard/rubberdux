@@ -22,10 +22,19 @@ D3 in `docs/app/whiteboard-backend.md`): they introduce network latency, cost,
 and visual inconsistency across the board. SF Symbol glyphs are instant, free,
 scalable, and visually coherent in both light and dark mode.
 
-The LLM is asked to return one symbol from the allowlist via a constrained JSON
-response (`response_format: { type: "json_object" }`). If the model returns a
-symbol that is not in the allowlist, only the symbol is repaired via the
-heuristic fallback; a valid title from the same response is preserved.
+The LLM is asked to return one symbol from the allowlist as part of a JSON
+object. The JSON shape is requested at the prompt level rather than through a
+`response_format` constraint: the model (`kimi-for-coding`) is a reasoning model
+that spends completion tokens on a visible chain-of-thought before emitting the
+answer, and an explicit `response_format: { type: "json_object" }` did not change
+that behavior in testing. The load-bearing constraint is instead the
+`max_completion_tokens` budget, which must leave room for both the reasoning and
+the answer — too small a budget truncates the response (`finish_reason:
+"length"`) with empty `content`, forcing the heuristic fallback on every call.
+The first balanced `{…}` object is extracted from the response content,
+tolerating markdown fences or surrounding prose. If the model returns a symbol
+that is not in the allowlist, only the symbol is repaired via the heuristic
+fallback; a valid title from the same response is preserved.
 
 ## Color Palette Rationale
 

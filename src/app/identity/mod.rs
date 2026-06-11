@@ -12,8 +12,7 @@ pub mod prompt;
 use serde::{Deserialize, Serialize};
 
 use crate::app::IconSpec;
-use crate::provider::moonshot::api::chat::ResponseFormat;
-use crate::provider::moonshot::MoonshotClient;
+use crate::provider::moonshot::{extract_json_object, MoonshotClient};
 
 use fallback::{fallback_color, fallback_symbol, fallback_title};
 
@@ -107,19 +106,19 @@ struct LlmIdentityResponse {
 pub async fn derive_identity(client: &MoonshotClient, task: &str) -> AppIdentity {
     let messages = vec![prompt::system_message(), prompt::user_message(task)];
 
-    // Request a JSON object response from the model.
-    let response_format = Some(ResponseFormat {
-        r#type: "json_object".to_owned(),
-    });
-
-    // Build the request manually to inject response_format.
+    // The model is a reasoning model: it spends completion tokens on a visible
+    // chain-of-thought before emitting the answer. The budget must leave room for
+    // both, or the response is truncated (`finish_reason: "length"`) with empty
+    // `content`. The JSON shape is requested at the prompt level (see
+    // `prompt::system_message`), which the model honors, so no `response_format`
+    // constraint is set. See `docs/app/identity.md`.
     let request = crate::provider::moonshot::api::chat::ChatRequest {
         model: client.model().to_owned(),
         messages,
         temperature: Some(0.3),
-        max_completion_tokens: Some(128),
+        max_completion_tokens: Some(2048),
         tools: None,
-        response_format,
+        response_format: None,
         thinking: None,
     };
 
@@ -166,13 +165,30 @@ async fn fetch_raw_json(
         response.json().await.ok()?;
 
     let text = chat.choices.into_iter().next()?.message;
-    Some(text.content_text().to_owned())
+    let content = text.content_text().trim();
+    // Empty/whitespace content (e.g. a truncated reasoning response) yields `None`
+    // so the deterministic fallback runs cleanly rather than hitting the
+    // parse-error path with an empty string.
+    if content.is_empty() {
+        return None;
+    }
+    Some(content.to_owned())
 }
 
 /// Parse the raw JSON from the LLM and repair any invalid fields, keeping
 /// valid ones. Falls back to `full_fallback` if parsing fails entirely.
 fn repair_from_json(json: &str, task: &str) -> AppIdentity {
-    let parsed: Result<LlmIdentityResponse, _> = serde_json::from_str(json);
+    // Extract the first balanced JSON object, tolerating markdown fences or
+    // surrounding prose the reasoning model may emit around the answer.
+    let object = match extract_json_object(json) {
+        Some(o) => o,
+        None => {
+            log::warn!("identity: no JSON object in LLM response, using full fallback");
+            return full_fallback(task);
+        }
+    };
+
+    let parsed: Result<LlmIdentityResponse, _> = serde_json::from_str(object);
 
     let llm = match parsed {
         Ok(r) => r,
@@ -456,6 +472,32 @@ mod tests {
         assert_eq!(id.title, "Check logs");
         assert_eq!(id.icon.symbol, "doc");
         assert_eq!(id.icon.color, "#3478F6");
+    }
+
+    /// A real-LLM identity derivation for the system suite. Ignored by default so
+    /// the unit gate stays green without live credentials; run with
+    /// `cargo test -- --ignored`. Asserts the model produces a real title and the
+    /// allowlisted `airplane` symbol for a flight task — proving the call no
+    /// longer truncates to empty content and hits the heuristic fallback.
+    #[tokio::test]
+    #[ignore = "makes real API call — run with `cargo test -- --ignored`"]
+    async fn real_llm_derives_identity_not_fallback() {
+        dotenvy::dotenv().ok();
+        let client = MoonshotClient::from_env();
+        let id = derive_identity(&client, "Book a flight to Tokyo").await;
+        assert!(!id.title.trim().is_empty(), "title must be non-empty");
+        assert!(
+            SYMBOL_ALLOWLIST.contains(&id.icon.symbol.as_str()),
+            "symbol '{}' must be allowlisted",
+            id.icon.symbol
+        );
+        // The heuristic fallback for a travel task does not yield "airplane";
+        // a real model response does, so this distinguishes the two paths.
+        assert_eq!(
+            id.icon.symbol, "airplane",
+            "expected the model's real 'airplane' symbol for a flight task, got '{}'",
+            id.icon.symbol
+        );
     }
 
     /// repair_from_json with fully missing fields falls back to heuristics.

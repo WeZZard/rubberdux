@@ -396,20 +396,40 @@ async fn create_app(
         .await
         .map_err(supervisor_error)?;
 
-    // Derive the real identity off the request path. The board observes the
-    // result via the App's streams once the identity-update path lands; failing
-    // to derive is non-fatal because `derive_identity` itself never errors.
+    // Derive the real identity off the request path, then persist it over the
+    // heuristic placeholder and announce an `updated` board event so live
+    // subscribers refresh. Running off the request path honors the convention
+    // that the create handler never blocks on LLM work; failing to derive is
+    // non-fatal because `derive_identity` itself never errors.
     if let Some(client) = state.identity_client.clone() {
         let task = body.task.clone();
-        let app_id = app.id.clone();
+        let mut app = app.clone();
+        let board_tx = state.board_tx.clone();
         tokio::spawn(async move {
             let identity = derive_identity(&client, &task).await;
             log::info!(
                 "derived identity for App `{}`: title={:?} symbol={:?}",
-                app_id,
+                app.id,
                 identity.title,
                 identity.icon.symbol
             );
+
+            // The derivation task resolves `RUBBERDUX_HOME` the same way the
+            // supervisor's store does, so it writes the same on-disk App that
+            // `GET /apps` reads back. The summary stays the originating task.
+            let store = FilesystemAppStore::new();
+            if let Err(e) = store.set_identity(&app.id, &identity.title, &identity.icon, &task) {
+                log::warn!("failed to persist derived identity for App `{}`: {e}", app.id);
+                return;
+            }
+
+            // Reflect the persisted identity in the App carried on the board
+            // event so the `updated` reload signal references the current tile.
+            app.title = identity.title;
+            app.icon = identity.icon;
+            app.summary = task;
+            // No active board subscribers right now is not a failure.
+            let _ = board_tx.send(crate::app::supervisor::BoardEvent::IdentityChanged(app));
         });
     }
 

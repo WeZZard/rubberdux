@@ -35,12 +35,15 @@ unit-test.
 
 ### A — LLM classifier (chosen)
 
-A constrained-JSON Moonshot call at **temperature 0** classifies the new summary
-against the candidate summaries, returning `{"decision":"join","index":N}` or
+A Moonshot call at **temperature 0** classifies the new summary against the
+candidate summaries, returning `{"decision":"join","index":N}` or
 `{"decision":"new"}`. Temperature 0 makes the decision as deterministic as the
 provider allows, which matters because the same conversation must cluster the
-same way on retry. `response_format: { type: "json_object" }` constrains the
-output shape, mirroring `docs/app/identity.md`.
+same way on retry. The JSON shape is requested at the prompt level rather than
+through a `response_format` constraint, and the `max_completion_tokens` budget is
+sized to leave room for the model's chain-of-thought before the answer —
+mirroring `docs/app/identity.md`. The first balanced `{…}` object is extracted
+from the response content, tolerating markdown fences or surrounding prose.
 
 Chosen because it captures *semantic* relatedness — two summaries can share a
 topic without sharing words ("book a flight" vs. "plan the Tokyo trip"), which a

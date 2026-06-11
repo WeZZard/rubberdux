@@ -255,7 +255,13 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
             syncObservationPanel()
             reconcileInteractionSockets()
         case .unchanged:
-            break
+            // Even when the store reports no observable App change, the id-to-id
+            // mapping may have moved (e.g. `reconcileCreate` swapped an optimistic
+            // placeholder for a server id whose App was already inserted by a
+            // board event, yielding `.unchanged`). Reconcile sockets so the
+            // server-id interactions socket opens; the reconciliation is
+            // idempotent for already-subscribed ids.
+            reconcileInteractionSockets()
         }
     }
 
@@ -443,7 +449,13 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
     /// without requiring the App to be selected. Idempotent: an App that is
     /// already subscribed is left untouched.
     private func reconcileInteractionSockets() {
-        let liveIDs = Set(store.apps.filter { $0.status == .active }.map(\.id))
+        // An optimistic placeholder id has no backing worker on the backend, so
+        // its interactions socket would only draw a "no active worker" rejection;
+        // `interactionSocketIDs(for:)` excludes placeholders, leaving real server
+        // ids only. Once `reconcileCreate` swaps optimistic→server, the next
+        // reconciliation (run after every board change) opens the server-id
+        // socket. See `docs/apps/macos/whiteboard-client.md`.
+        let liveIDs = BoardAppStore.interactionSocketIDs(for: store.apps)
         let currentIDs = Set(interactionSockets.keys)
 
         for id in currentIDs.subtracting(liveIDs) {

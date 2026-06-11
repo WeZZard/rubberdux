@@ -186,9 +186,101 @@ impl MoonshotClient {
     }
 }
 
+/// Extract the first balanced JSON object (`{…}`) from a model's response
+/// content, returning `None` for empty/whitespace-only content or when no
+/// balanced object is present.
+///
+/// The model is instructed to return bare JSON, but a reasoning model may wrap
+/// it in ```` ```json ```` fences or surround it with prose. This tolerates both
+/// by scanning for the first `{` and matching it to its closing `}`, ignoring
+/// braces inside JSON string literals (and their escapes). Shared by the App
+/// identity and conversation-clustering call sites so the lenient parsing lives
+/// in one place. See `docs/app/identity.md` and `docs/app/merge/clustering.md`.
+pub fn extract_json_object(content: &str) -> Option<&str> {
+    if content.trim().is_empty() {
+        return None;
+    }
+
+    let bytes = content.as_bytes();
+    let start = content.find('{')?;
+
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for i in start..bytes.len() {
+        let c = bytes[i] as char;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&content[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_json_object_bare() {
+        assert_eq!(
+            extract_json_object(r#"{"a":1}"#),
+            Some(r#"{"a":1}"#)
+        );
+    }
+
+    #[test]
+    fn extract_json_object_strips_fences() {
+        let s = "```json\n{\"a\":1,\"b\":\"x\"}\n```";
+        assert_eq!(extract_json_object(s), Some(r#"{"a":1,"b":"x"}"#));
+    }
+
+    #[test]
+    fn extract_json_object_strips_surrounding_prose() {
+        let s = "Here is the result: {\"decision\":\"new\"} done.";
+        assert_eq!(extract_json_object(s), Some(r#"{"decision":"new"}"#));
+    }
+
+    #[test]
+    fn extract_json_object_handles_nested_and_string_braces() {
+        let s = r#"{"title":"a } b","nested":{"k":1}}"#;
+        assert_eq!(extract_json_object(s), Some(s));
+    }
+
+    #[test]
+    fn extract_json_object_empty_is_none() {
+        assert_eq!(extract_json_object(""), None);
+        assert_eq!(extract_json_object("   \n\t "), None);
+    }
+
+    #[test]
+    fn extract_json_object_no_object_is_none() {
+        assert_eq!(extract_json_object("just text, no json"), None);
+    }
+
+    #[test]
+    fn extract_json_object_unbalanced_is_none() {
+        assert_eq!(extract_json_object(r#"{"a":1"#), None);
+    }
 
     #[test]
     fn test_message_serialization() {

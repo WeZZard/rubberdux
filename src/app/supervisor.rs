@@ -54,6 +54,11 @@ pub enum BoardEvent {
     StatusChanged { id: AppId, status: AppStatus },
     /// An App's board position changed.
     Moved { id: AppId, position: BoardPosition },
+    /// An App's derived identity (title + icon + summary) replaced the
+    /// placeholder it was created with. Carries the updated App so board
+    /// subscribers refresh; the board projects it to the same `updated` reload
+    /// signal as a status or position change. See `docs/gateway/apps_stream.md`.
+    IdentityChanged(App),
     /// An App was archived and removed from the default board listing.
     Archived(AppId),
 }

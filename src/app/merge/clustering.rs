@@ -13,9 +13,8 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::provider::moonshot::MoonshotClient;
-use crate::provider::moonshot::api::chat::{ChatRequest, ResponseFormat};
-use crate::provider::moonshot::{Message, UserContent};
+use crate::provider::moonshot::api::chat::ChatRequest;
+use crate::provider::moonshot::{extract_json_object, Message, MoonshotClient, UserContent};
 
 use super::{ClusterCandidate, ClusterDecision, Clusterer};
 
@@ -92,11 +91,16 @@ impl LlmClusterer {
             // Temperature 0: the decision must be as deterministic as the
             // provider allows so the same conversation clusters the same way.
             temperature: Some(0.0),
-            max_completion_tokens: Some(64),
+            // The model is a reasoning model that spends completion tokens on a
+            // visible chain-of-thought before emitting the answer. Too small a
+            // budget truncates the response (`finish_reason: "length"`) with empty
+            // `content`, so the budget must cover the reasoning and the decision.
+            // The JSON shape is requested at the prompt level (see
+            // `system_message`), which the model honors, so no `response_format`
+            // constraint is set. See `docs/app/merge/clustering.md`.
+            max_completion_tokens: Some(2048),
             tools: None,
-            response_format: Some(ResponseFormat {
-                r#type: "json_object".to_owned(),
-            }),
+            response_format: None,
             thinking: None,
         };
 
@@ -269,14 +273,31 @@ async fn fetch_raw_json(client: &MoonshotClient, request: ChatRequest) -> Option
 
     let chat: crate::provider::moonshot::api::chat::ChatResponse = response.json().await.ok()?;
     let message = chat.choices.into_iter().next()?.message;
-    Some(message.content_text().to_owned())
+    let content = message.content_text().trim();
+    // Empty/whitespace content (e.g. a truncated reasoning response) yields `None`
+    // so the lexical fallback runs cleanly rather than hitting the parse-error
+    // path with an empty string.
+    if content.is_empty() {
+        return None;
+    }
+    Some(content.to_owned())
 }
 
 /// Parse the model's JSON response into a [`ClusterDecision`], validating the
 /// index against the shortlist. A malformed response, an out-of-range index, or
 /// a missing index on a "join" decision all conservatively become `New`.
 fn parse_decision(json: &str, shortlist: &[ClusterCandidate]) -> ClusterDecision {
-    let parsed: Result<LlmClassifyResponse, _> = serde_json::from_str(json);
+    // Extract the first balanced JSON object, tolerating markdown fences or
+    // surrounding prose the reasoning model may emit around the answer.
+    let object = match extract_json_object(json) {
+        Some(o) => o,
+        None => {
+            log::warn!("clustering: no JSON object in LLM response, defaulting to new");
+            return ClusterDecision::New;
+        }
+    };
+
+    let parsed: Result<LlmClassifyResponse, _> = serde_json::from_str(object);
     let response = match parsed {
         Ok(r) => r,
         Err(e) => {

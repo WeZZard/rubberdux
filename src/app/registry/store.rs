@@ -108,6 +108,21 @@ pub trait AppStore: Send + Sync {
     /// absent or unreadable. See `docs/app/merge/clustering.md`.
     fn touch_last_active(&self, id: &AppId) -> Result<(), Error>;
 
+    /// Overwrite an App's derived identity — `title`, `icon`, and `summary` — and
+    /// persist the manifest. Called after background identity derivation replaces
+    /// the placeholder identity an App is created with, so `GET /apps` serves the
+    /// derived identity rather than the heuristic seed. The overwrite is
+    /// idempotent: writing the same identity again leaves the manifest unchanged.
+    /// Errors if the App's manifest is absent or unreadable. See
+    /// `docs/app/whiteboard-backend.md`.
+    fn set_identity(
+        &self,
+        id: &AppId,
+        title: &str,
+        icon: &crate::app::IconSpec,
+        summary: &str,
+    ) -> Result<(), Error>;
+
     /// Append a membership change to the App's `members.jsonl` log.
     fn record_member(&self, id: &AppId, record: &MemberRecord) -> Result<(), Error>;
 
@@ -331,6 +346,35 @@ impl AppStore for FilesystemAppStore {
         // override `read_manifest` applies) so only `last_active` changes.
         let mut app: App = serde_json::from_str(&raw).map_err(Error::Json)?;
         app.last_active = chrono::Utc::now().to_rfc3339();
+        Self::write_manifest(&dir, &app)
+    }
+
+    fn set_identity(
+        &self,
+        id: &AppId,
+        title: &str,
+        icon: &crate::app::IconSpec,
+        summary: &str,
+    ) -> Result<(), Error> {
+        // Locate the App's manifest in the live directory, falling back to the
+        // archive so a derived identity is written wherever the App currently
+        // lives. Mirrors `touch_last_active`'s read-modify-write.
+        let dir = {
+            let live = self.app_dir(id);
+            if live.is_dir() {
+                live
+            } else {
+                self.archive_dir(id)
+            }
+        };
+        let path = dir.join(METADATA_FILE);
+        let raw = fs::read_to_string(&path).map_err(Error::Io)?;
+        // Read the manifest as persisted (without the startup Tombstoned
+        // override `read_manifest` applies) so only the identity fields change.
+        let mut app: App = serde_json::from_str(&raw).map_err(Error::Json)?;
+        app.title = title.to_owned();
+        app.icon = icon.clone();
+        app.summary = summary.to_owned();
         Self::write_manifest(&dir, &app)
     }
 
