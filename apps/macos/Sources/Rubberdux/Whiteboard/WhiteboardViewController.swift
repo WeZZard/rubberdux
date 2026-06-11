@@ -35,18 +35,14 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
     /// panel so its panes open/close per-app sockets without leaking.
     private lazy var socketRegistry = AppSocketRegistry(baseURL: apiClient.baseURL)
 
-    /// The trailing observation panel. It streams the selected apps' conversation
-    /// and trajectory; it is hidden (collapsing the split) when the selection is
-    /// empty and shown (shrinking the board) when one or more apps are selected.
+    /// The floating observation panel. It streams the selected apps' conversation
+    /// and trajectory as a translucent card pinned to the board's right edge; it
+    /// is hidden (board reclaims full width) when the selection is empty and shown
+    /// (board reserves its width) when one or more apps are selected.
     private lazy var observationPanel = ObservationPanelViewController(
         apiClient: apiClient,
         registry: socketRegistry
     )
-
-    /// The split that places the board on the leading side and the observation
-    /// panel on the trailing side. Collapsing the trailing item gives the board
-    /// the full width.
-    private let splitView = NSSplitView()
 
     // MARK: - Selection
 
@@ -115,44 +111,40 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
         boardView.delegate = self
         boardView.translatesAutoresizingMaskIntoConstraints = false
 
-        // The board lives inside its own container so the split view manages only
-        // the two top-level panes (board container, observation panel).
-        let boardContainer = NSView()
-        boardContainer.addSubview(boardView)
-        NSLayoutConstraint.activate([
-            boardView.topAnchor.constraint(equalTo: boardContainer.topAnchor),
-            boardView.bottomAnchor.constraint(equalTo: boardContainer.bottomAnchor),
-            boardView.leadingAnchor.constraint(equalTo: boardContainer.leadingAnchor),
-            boardView.trailingAnchor.constraint(equalTo: boardContainer.trailingAnchor),
-        ])
-
         let recognizer = NSPanGestureRecognizer(target: self, action: #selector(handleDrag(_:)))
         boardView.addGestureRecognizer(recognizer)
         dragRecognizer = recognizer
 
-        // Wrap the board and the observation panel in a horizontal split. The
-        // panel is the trailing, collapsible pane; collapsing it (empty
-        // selection) lets the board occupy the full width.
-        addChild(observationPanel)
-        splitView.isVertical = true
-        splitView.dividerStyle = .thin
-        splitView.translatesAutoresizingMaskIntoConstraints = false
-        splitView.addArrangedSubview(boardContainer)
-        splitView.addArrangedSubview(observationPanel.view)
-        splitView.setHoldingPriority(.defaultLow, forSubviewAt: 0)
-        splitView.setHoldingPriority(.defaultHigh, forSubviewAt: 1)
-
+        // The board fills the window; the observation panel floats over it, pinned
+        // to the top, bottom, and trailing edges. The board reserves a usable-area
+        // inset equal to the panel's width (set in `applyObservationVisibility`) so
+        // its content reflows to the panel's left rather than hiding under it.
         let container = NSView()
-        container.addSubview(splitView)
+        container.addSubview(boardView)
+        addChild(observationPanel)
+        observationPanel.view.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(observationPanel.view)
+
         NSLayoutConstraint.activate([
-            splitView.topAnchor.constraint(equalTo: container.topAnchor),
-            splitView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            splitView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            splitView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            boardView.topAnchor.constraint(equalTo: container.topAnchor),
+            boardView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            boardView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            boardView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+
+            observationPanel.view.topAnchor.constraint(equalTo: container.topAnchor, constant: 12),
+            observationPanel.view.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
+            observationPanel.view.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
         ])
 
+        // Mirror the panel's width into the board's reserved inset whenever the
+        // user drags the panel's resize handle.
+        observationPanel.onWidthChange = { [weak self] _ in
+            self?.applyReservedInset()
+        }
+
         view = container
-        // Start collapsed: nothing is selected on load.
+        // Start hidden: nothing is selected on load, so the board owns the full
+        // width with no reserved inset.
         applyObservationVisibility()
     }
 
@@ -297,15 +289,30 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
         applyObservationVisibility()
     }
 
-    /// Show the observation pane when the selection is non-empty and collapse it
-    /// otherwise, giving the board the full width when nothing is observed.
+    /// Show the floating observation panel when the selection is non-empty and
+    /// hide it otherwise, then reconcile the board's reserved inset so the board
+    /// reflows to the panel's left when shown and reclaims the full width when
+    /// hidden.
     private func applyObservationVisibility() {
-        let panelView = observationPanel.view
-        let shouldShow = !selectedAppIDs.isEmpty
-        let isCollapsed = splitView.isSubviewCollapsed(panelView)
-        guard shouldShow == isCollapsed else { return }
-        panelView.isHidden = !shouldShow
-        splitView.adjustSubviews()
+        observationPanel.view.isHidden = selectedAppIDs.isEmpty
+        applyReservedInset()
+    }
+
+    /// Set the board's right inset to the panel's current width while it is shown,
+    /// or `0` while it is hidden, then animate the board's reflow. The board's
+    /// lattice, tiles, and create hit-testing all honor this inset so nothing
+    /// lives under the floating panel.
+    private func applyReservedInset() {
+        let shown = !selectedAppIDs.isEmpty
+        // The reserved strip spans the panel width plus its trailing/leading gap
+        // to the window edge, so board content clears the whole floating card.
+        let inset = shown ? observationPanel.panelWidth + 24 : 0
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.2
+            context.allowsImplicitAnimation = true
+            boardView.rightInset = inset
+            boardView.layoutSubtreeIfNeeded()
+        }
     }
 
     // MARK: - BoardViewDelegate

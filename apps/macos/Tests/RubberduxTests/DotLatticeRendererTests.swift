@@ -94,4 +94,58 @@ final class DotLatticeRendererTests: XCTestCase {
             accuracy: 1e-6
         )
     }
+
+    // MARK: - Usable-area gate
+
+    func testPointInsideUsableAreaIsAllowed() {
+        // A point inside the usable rect may receive a magnified dot / the plus.
+        let usable = CGRect(x: 0, y: 0, width: 140, height: 100)
+        XCTAssertTrue(
+            DotLatticeRenderer.isWithinUsableArea(CGPoint(x: 80, y: 30), usableBounds: usable)
+        )
+    }
+
+    func testPointInReservedStripIsRejected() {
+        // A point in the reserved strip [140, 200) must be gated out so neither a
+        // magnified dot nor the plus glyph is drawn under the floating panel.
+        let usable = CGRect(x: 0, y: 0, width: 140, height: 100)
+        XCTAssertFalse(
+            DotLatticeRenderer.isWithinUsableArea(CGPoint(x: 160, y: 30), usableBounds: usable)
+        )
+    }
+
+    func testPointOnTrailingEdgeIsRejected() {
+        // The usable rect is half-open at its trailing edge under `contains`, so a
+        // point exactly at the inset boundary is treated as reserved.
+        let usable = CGRect(x: 0, y: 0, width: 140, height: 100)
+        XCTAssertFalse(
+            DotLatticeRenderer.isWithinUsableArea(CGPoint(x: 140, y: 30), usableBounds: usable)
+        )
+    }
+
+    func testInfiniteUsableAreaAllowsEverything() {
+        // Before layout the usable area is `.infinite`, so an un-laid-out renderer
+        // magnifies everywhere rather than suppressing all dots.
+        XCTAssertTrue(
+            DotLatticeRenderer.isWithinUsableArea(CGPoint(x: 9_999, y: 9_999), usableBounds: .infinite)
+        )
+    }
+
+    // MARK: - Container clip
+
+    func testContainerClipsToUsableAreaAfterLayout() {
+        // The renderer clips its container to the laid-out usable rect so every
+        // sublayer (lattice, magnified pool, plus glyph, icon tiles) is confined
+        // to it; re-laying-out to a wider rect reflows the clip.
+        let renderer = DotLatticeRenderer(geometry: BoardGeometry(pitch: 10, origin: .zero))
+        XCTAssertTrue(renderer.containerLayer.masksToBounds)
+
+        let usable = CGRect(x: 0, y: 0, width: 140, height: 100)
+        renderer.layout(in: usable)
+        XCTAssertEqual(renderer.containerLayer.frame, usable)
+
+        let full = CGRect(x: 0, y: 0, width: 200, height: 100)
+        renderer.layout(in: full)
+        XCTAssertEqual(renderer.containerLayer.frame, full)
+    }
 }

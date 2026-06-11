@@ -12,6 +12,10 @@ enum BoardHit: Equatable {
     /// No icon under the point; the nearest empty cell is reported so the caller
     /// can offer a create affordance there.
     case emptyCell(GridCell)
+    /// The point falls in the board's reserved region (the strip under the
+    /// floating observation panel), so it maps to no cell and offers no create
+    /// affordance.
+    case reserved
 }
 
 // MARK: - BoardViewDelegate
@@ -50,6 +54,31 @@ final class BoardView: NSView {
     /// The currently selected app id, if any.
     private(set) var selectedAppID: String?
 
+    /// The width, in points, reserved on the board's trailing (right) edge for
+    /// the floating observation panel. The lattice, icon tiles, and click→create
+    /// hit-testing all operate within `usableBounds` (`bounds` minus this inset),
+    /// so nothing is drawn or created under the panel. `0` reclaims the full
+    /// width when the panel is hidden.
+    var rightInset: CGFloat = 0 {
+        didSet {
+            guard rightInset != oldValue else { return }
+            needsLayout = true
+        }
+    }
+
+    /// The board's usable area: `bounds` minus the trailing `rightInset`. All
+    /// lattice rendering, tile placement, and create hit-testing are confined to
+    /// this rect so the floating panel never overlaps live board content.
+    var usableBounds: CGRect {
+        let clamped = max(0, min(rightInset, bounds.width))
+        return CGRect(
+            x: bounds.minX,
+            y: bounds.minY,
+            width: bounds.width - clamped,
+            height: bounds.height
+        )
+    }
+
     private var trackingArea: NSTrackingArea?
 
     // MARK: - Init
@@ -80,7 +109,9 @@ final class BoardView: NSView {
 
     override func layout() {
         super.layout()
-        renderer.layout(in: bounds)
+        // Confine the dot lattice to the usable area so no dots are drawn under
+        // the floating observation panel's reserved strip.
+        renderer.layout(in: usableBounds)
         for icon in iconLayers.values {
             icon.place(in: geometry)
         }
@@ -141,14 +172,19 @@ final class BoardView: NSView {
 
     // MARK: - Hit testing
 
-    /// Classify `point` (view coordinates) as an icon hit or an empty cell.
-    /// An icon is hit when the point falls within its tile frame; otherwise the
-    /// nearest cell is reported as empty.
+    /// Classify `point` (view coordinates) as an icon hit, an empty cell, or a
+    /// point in the reserved (panel) region. An icon is hit when the point falls
+    /// within its tile frame; otherwise, if the point lies in the usable area the
+    /// nearest cell is reported as empty, and if it lies in the reserved strip
+    /// under the floating panel it is `.reserved` so no create affordance shows.
     func hit(at point: CGPoint) -> BoardHit {
         for (id, layer) in iconLayers where layer.frame.contains(point) {
             return .icon(appID: id)
         }
-        return .emptyCell(geometry.cell(at: point))
+        guard let cell = geometry.cell(at: point, in: usableBounds) else {
+            return .reserved
+        }
+        return .emptyCell(cell)
     }
 
     /// Whether `cell` currently has no app icon, used to gate the plus-glyph.
@@ -192,6 +228,9 @@ final class BoardView: NSView {
             delegate?.boardView(self, didSelectAppID: appID)
         case let .emptyCell(cell):
             delegate?.boardView(self, didActivateEmptyCell: cell)
+        case .reserved:
+            // A click in the reserved strip under the panel creates nothing.
+            break
         }
     }
 

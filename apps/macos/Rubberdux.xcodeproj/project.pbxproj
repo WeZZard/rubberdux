@@ -64,6 +64,7 @@
 		DB484900F7A96BF65D670FA6 /* ToolCall.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C3233B15B96791DA42AD9A3 /* ToolCall.swift */; };
 		E120EE1E7DDF1679B64E7FFB /* TrajectoryEvent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30B93FA4F18EECFBC3BEC906 /* TrajectoryEvent.swift */; };
 		E29B279CF113A8F889CC0FC6 /* SymbolImage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 774AFD94DA74CE22193D92D6 /* SymbolImage.swift */; };
+		E572C5C4C71719DE2BBAD63A /* BoardGeometryInsetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 467324B14697724D7FA728C5 /* BoardGeometryInsetTests.swift */; };
 		E57B06C4A16A28CB2F84F088 /* ConversationViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 579740676D6B89448772B570 /* ConversationViewController.swift */; };
 		E7B9021D91870CA6EF217FAB /* InteractionPopoverController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16468416F3EA49C533AC3B87 /* InteractionPopoverController.swift */; };
 		E8B0BA13C6DCFBB96DFE14AB /* InteractionContentViewControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F489850DD7DCA861F1BEA3CE /* InteractionContentViewControllerTests.swift */; };
@@ -103,6 +104,7 @@
 		3A839E45D21DA90B245C64D6 /* InteractionContentViewControllers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InteractionContentViewControllers.swift; sourceTree = "<group>"; };
 		3C3233B15B96791DA42AD9A3 /* ToolCall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolCall.swift; sourceTree = "<group>"; };
 		41AFBD085D2644CD7B45FA00 /* InteractionSocket.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InteractionSocket.swift; sourceTree = "<group>"; };
+		467324B14697724D7FA728C5 /* BoardGeometryInsetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoardGeometryInsetTests.swift; sourceTree = "<group>"; };
 		48EAB1A18749A1C2DB9A1076 /* InteractionResponse.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InteractionResponse.swift; sourceTree = "<group>"; };
 		4931535F707FE2DB729B0C83 /* .gitkeep */ = {isa = PBXFileReference; path = .gitkeep; sourceTree = "<group>"; };
 		4A6342E67911EA0D896E5163 /* AppSocketRegistry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSocketRegistry.swift; sourceTree = "<group>"; };
@@ -268,6 +270,7 @@
 				C0777B6E4CBBE761E3ED461D /* BoardAppStoreInteractionSocketSelectionTests.swift */,
 				E69F9C6A957008B33A86C457 /* BoardAppStoreTests.swift */,
 				A355F86747A5E6CC01F794C7 /* BoardEventTests.swift */,
+				467324B14697724D7FA728C5 /* BoardGeometryInsetTests.swift */,
 				35B5469E130139DD9C8620A7 /* BoardGeometryTests.swift */,
 				A08D36EECACAB5D58224AB84 /* BuildTypeTests.swift */,
 				FE31711DEC2839FD6E802097 /* DotLatticeRendererTests.swift */,
@@ -532,6 +535,7 @@
 				02CE32F3270E06E40C8E9CFB /* BoardAppStoreInteractionSocketSelectionTests.swift in Sources */,
 				CEB0F9E4A7A8D39BDAFCD07C /* BoardAppStoreTests.swift in Sources */,
 				A13D0052F047BA5D4E4936DF /* BoardEventTests.swift in Sources */,
+				E572C5C4C71719DE2BBAD63A /* BoardGeometryInsetTests.swift in Sources */,
 				FD3C2534C7FEAC64DAF80901 /* BoardGeometryTests.swift in Sources */,
 				B7F2244B8F673DE71808B6B7 /* BuildTypeTests.swift in Sources */,
 				6399833FB0A1FB880A80BCE5 /* DotLatticeRendererTests.swift in Sources */,

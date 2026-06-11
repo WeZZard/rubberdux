@@ -84,6 +84,19 @@ final class DotLatticeRenderer {
         return restOpacity + (maxOpacity - restOpacity) * f
     }
 
+    // MARK: - Usable-area gate
+
+    /// Whether `point` lies within the board's `usableBounds` and may therefore
+    /// receive a magnified dot or the plus glyph. Points in the reserved strip
+    /// under the floating observation panel return `false` so no magnified dot or
+    /// plus is drawn there.
+    ///
+    /// Pure and static so the gate is unit-testable independently of any layer
+    /// state, mirroring the `falloff`/`scale`/`opacity` curves above.
+    static func isWithinUsableArea(_ point: CGPoint, usableBounds: CGRect) -> Bool {
+        usableBounds.contains(point)
+    }
+
     // MARK: - Layers
 
     /// The host layer the renderer attaches its sublayers to.
@@ -105,6 +118,15 @@ final class DotLatticeRenderer {
     // MARK: - State
 
     private var geometry: BoardGeometry
+
+    /// The board's usable area in container coordinates: the magnification and
+    /// plus-glyph paths are confined to this rect so neither a magnified dot nor
+    /// the plus glyph is drawn within the strip reserved for the floating
+    /// observation panel. `layout(in:)` keeps it in sync with the laid-out
+    /// viewport; it starts as `.infinite` so an un-laid-out renderer magnifies
+    /// everywhere.
+    private var usableBounds: CGRect = .infinite
+
     private let magnification: Magnification
     private let dotDiameter: CGFloat
     private let dotColor: CGColor
@@ -143,6 +165,12 @@ final class DotLatticeRenderer {
     }
 
     private func configureReplicators() {
+        // Clip every sublayer (the at-rest field, the magnified pool, the plus
+        // glyph, and the app-icon tiles the view adds as children) to the
+        // container's frame. `layout(in:)` sets that frame to the usable area, so
+        // nothing renders within the strip reserved for the floating panel even
+        // when an icon's cell or a magnified dot would otherwise fall there.
+        containerLayer.masksToBounds = true
         columnReplicator.addSublayer(prototypeDot)
         rowReplicator.addSublayer(columnReplicator)
         containerLayer.addSublayer(rowReplicator)
@@ -186,6 +214,9 @@ final class DotLatticeRenderer {
     /// counts cover every visible column and row; only the prototype and the two
     /// replicator transforms change, so this stays `O(1)` in stored layers.
     func layout(in bounds: CGRect) {
+        // Record the usable area so the magnification and plus-glyph paths can
+        // exclude the reserved strip, matching the lattice they animate over.
+        usableBounds = bounds
         let cells = geometry.visibleCells(in: bounds)
         guard let first = cells.first, let last = cells.last else { return }
 
@@ -237,6 +268,9 @@ final class DotLatticeRenderer {
             let center = geometry.point(for: cell)
             let distance = hypot(center.x - cursor.x, center.y - cursor.y)
             if distance > radiusPoints { continue }
+            // Skip any dot whose center falls in the reserved strip so the
+            // magnified field never spills under the floating panel.
+            if !Self.isWithinUsableArea(center, usableBounds: usableBounds) { continue }
 
             let dot = pool[poolIndex]
             poolIndex += 1
@@ -279,8 +313,11 @@ final class DotLatticeRenderer {
 
     private func updatePlusGlyph(at cursor: CGPoint, isCellEmpty: (GridCell) -> Bool) {
         let cell = geometry.cell(at: cursor)
-        if isCellEmpty(cell) {
-            plusGlyphLayer.position = geometry.point(for: cell)
+        let center = geometry.point(for: cell)
+        // Suppress the plus glyph when its cell center lies in the reserved strip
+        // so no create affordance is drawn under the floating panel.
+        if isCellEmpty(cell), Self.isWithinUsableArea(center, usableBounds: usableBounds) {
+            plusGlyphLayer.position = center
             plusGlyphLayer.opacity = 1
         } else {
             plusGlyphLayer.opacity = 0

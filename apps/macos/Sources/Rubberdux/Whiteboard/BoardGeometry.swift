@@ -62,6 +62,21 @@ struct BoardGeometry: Equatable {
         )
     }
 
+    /// The lattice cell whose center is nearest to `point`, restricted to the
+    /// board's usable area. A point whose location falls outside `usableBounds`
+    /// — for example within the region reserved on the right for the floating
+    /// observation panel — maps to no cell, so the caller offers no create
+    /// affordance under the panel.
+    ///
+    /// Membership is tested against `usableBounds` directly (not against the
+    /// nearest cell's center) so the entire reserved strip is excluded, even the
+    /// half-cell of width nearest the inset edge whose center already lies in the
+    /// usable region.
+    func cell(at point: CGPoint, in usableBounds: CGRect) -> GridCell? {
+        guard usableBounds.contains(point) else { return nil }
+        return cell(at: point)
+    }
+
     /// Round a fractional lattice coordinate to its nearest integer index with a
     /// deterministic rule at the `.5` boundary: half-values always round up
     /// (toward `+∞`), independent of sign. This avoids the away-from-zero
