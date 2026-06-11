@@ -69,7 +69,8 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
     // MARK: - Interaction surfaces
 
     /// The pending interactions every shown App is awaiting. Drives both the icon
-    /// badge counts and the pop-out pending list.
+    /// badge counts and each selected App's inline pending list in its
+    /// observation column.
     private var pendingInteractions = PendingInteractionsStore()
 
     /// One open interaction socket per shown App, keyed by app id. Opened when an
@@ -83,9 +84,6 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
     /// The popover shown when an interaction is raised while the board window is
     /// front. Reused across raises.
     private let interactionPopover = InteractionPopoverController()
-
-    /// The pop-out pending list, presented when the user clicks a badged icon.
-    private var pendingListController: PendingInteractionsController?
 
     /// Whether the board window is the front, key surface. When `true` a raised
     /// interaction is presented as a popover; when `false` it only updates the
@@ -160,6 +158,12 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        // Route answers to inline column interactions back through the same
+        // delivery path as the popover, so a response from a column behaves
+        // exactly like one from the raised-interaction popover.
+        observationPanel.onRespond = { [weak self] appID, response in
+            self?.respond(response, appID: appID)
+        }
         subscribeToBoard()
         observeFrontSurface()
         loadApps()
@@ -285,6 +289,11 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
             selection: selectedAppIDs,
             order: store.apps.map(\.id)
         )
+        // Seed each shown column's inline pending list from the current model so
+        // selecting a badged App immediately shows its awaited interactions.
+        for appID in selectedAppIDs {
+            refreshColumnInteractions(forAppID: appID)
+        }
         applyObservationVisibility()
     }
 
@@ -302,12 +311,9 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
     // MARK: - BoardViewDelegate
 
     func boardView(_ boardView: BoardView, didSelectAppID appID: String) {
-        // A click on a badged icon opens its pending-interactions pop-out (the
-        // badge surface), rather than only selecting the icon. Selection still
-        // proceeds so the observation panel tracks it.
-        if pendingInteractions.hasPending(forAppID: appID) {
-            presentPendingList(forAppID: appID)
-        }
+        // A click on a badged icon selects the App, surfacing its observation
+        // column, whose inline pending list shows the awaited interactions; the
+        // badge no longer opens a separate pop-out.
         let extending = NSEvent.modifierFlags.contains(.command) || NSEvent.modifierFlags.contains(.shift)
         if extending {
             if selectedAppIDs.contains(appID) {
@@ -484,7 +490,7 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
         case let .raised(interaction):
             pendingInteractions.raise(interaction)
             boardView.setBadge(pendingInteractions.badgeCount(forAppID: appID), forAppID: appID)
-            refreshPendingList(forAppID: appID)
+            refreshColumnInteractions(forAppID: appID)
             if isBoardFront {
                 presentInteractionPopover(interaction, appID: appID)
             }
@@ -492,7 +498,7 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
             pendingInteractions.resolve(appID: appID, requestId: requestId)
             boardView.setBadge(pendingInteractions.badgeCount(forAppID: appID), forAppID: appID)
             interactionPopover.dismiss(ifShowing: requestId)
-            refreshPendingList(forAppID: appID)
+            refreshColumnInteractions(forAppID: appID)
         }
     }
 
@@ -507,22 +513,14 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
         }
     }
 
-    /// Open the pop-out pending list anchored to `appID`'s badged icon.
-    private func presentPendingList(forAppID appID: String) {
-        guard let rect = boardView.iconRect(forAppID: appID) else { return }
-        let controller = PendingInteractionsController()
-        controller.onRespond = { [weak self] response in
-            self?.respond(response, appID: appID)
-        }
-        controller.setInteractions(pendingInteractions.interactions(forAppID: appID))
-        pendingListController = controller
-        controller.present(relativeTo: rect, of: boardView)
-    }
-
-    /// Push the latest pending interactions into the open pop-out list, if it is
-    /// showing.
-    private func refreshPendingList(forAppID appID: String) {
-        pendingListController?.setInteractions(pendingInteractions.interactions(forAppID: appID))
+    /// Push the latest pending interactions for `appID` into its observation
+    /// column's inline list. A no-op when the App is not currently selected, so
+    /// the panel only renders interactions for shown columns.
+    private func refreshColumnInteractions(forAppID appID: String) {
+        observationPanel.updateInteractions(
+            pendingInteractions.interactions(forAppID: appID),
+            forAppID: appID
+        )
     }
 
     /// Deliver `response` to the backend over the App's interaction socket when
@@ -547,7 +545,7 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
         }
         pendingInteractions.resolve(appID: appID, requestId: response.requestId)
         boardView.setBadge(pendingInteractions.badgeCount(forAppID: appID), forAppID: appID)
-        refreshPendingList(forAppID: appID)
+        refreshColumnInteractions(forAppID: appID)
     }
 
     /// Reapply badge counts from the pending model after a board resync, so a

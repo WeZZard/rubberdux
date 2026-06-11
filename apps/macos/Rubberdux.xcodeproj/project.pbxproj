@@ -31,6 +31,7 @@
 		51436E9D76496AC391670BE8 /* ObservationPanelViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC43A6C19F726FC1BB937499 /* ObservationPanelViewController.swift */; };
 		52DEC3A6C61BF99EDC1EE005 /* SettingsViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E475850BD6C0C8D03E54CF33 /* SettingsViewController.swift */; };
 		55D7EA907C5D0D0EEDE02C34 /* AppModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 144E051B1C0BCB1EDFFC0CF5 /* AppModelTests.swift */; };
+		59D9BA22258E50FA35CA9E78 /* ObservationColumnLayoutTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98E82904594EC0B941DEE091 /* ObservationColumnLayoutTests.swift */; };
 		6399833FB0A1FB880A80BCE5 /* DotLatticeRendererTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE31711DEC2839FD6E802097 /* DotLatticeRendererTests.swift */; };
 		66E1A2F50EF4196207DC19F8 /* AgentInteractionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32C71190A24F036127BECA55 /* AgentInteractionTests.swift */; };
 		670361E4BF0DD2EF81FB760B /* PromptKind.swift in Sources */ = {isa = PBXBuildFile; fileRef = 584AAE08EE25628268737CB5 /* PromptKind.swift */; };
@@ -121,6 +122,7 @@
 		92681524D62669D469FF35B6 /* SidebarViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarViewController.swift; sourceTree = "<group>"; };
 		9366D0EF35C286AACB6CCF04 /* SymbolImageTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SymbolImageTests.swift; sourceTree = "<group>"; };
 		93CE9A83EE55E136A4412B88 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		98E82904594EC0B941DEE091 /* ObservationColumnLayoutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObservationColumnLayoutTests.swift; sourceTree = "<group>"; };
 		A08D36EECACAB5D58224AB84 /* BuildTypeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BuildTypeTests.swift; sourceTree = "<group>"; };
 		A1501B69109F7144E391AD9C /* Debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Debug.xcconfig; sourceTree = "<group>"; };
 		A355F86747A5E6CC01F794C7 /* BoardEventTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoardEventTests.swift; sourceTree = "<group>"; };
@@ -270,6 +272,7 @@
 				A08D36EECACAB5D58224AB84 /* BuildTypeTests.swift */,
 				FE31711DEC2839FD6E802097 /* DotLatticeRendererTests.swift */,
 				F489850DD7DCA861F1BEA3CE /* InteractionContentViewControllerTests.swift */,
+				98E82904594EC0B941DEE091 /* ObservationColumnLayoutTests.swift */,
 				EC414423444BD7652FF38182 /* ObservationSelectionPlanTests.swift */,
 				8A2C3DE4FCC5175FDF63B126 /* PendingInteractionsStoreTests.swift */,
 				9366D0EF35C286AACB6CCF04 /* SymbolImageTests.swift */,
@@ -533,6 +536,7 @@
 				B7F2244B8F673DE71808B6B7 /* BuildTypeTests.swift in Sources */,
 				6399833FB0A1FB880A80BCE5 /* DotLatticeRendererTests.swift in Sources */,
 				E8B0BA13C6DCFBB96DFE14AB /* InteractionContentViewControllerTests.swift in Sources */,
+				59D9BA22258E50FA35CA9E78 /* ObservationColumnLayoutTests.swift in Sources */,
 				37B6655E2F2FC7FC8E90E71F /* ObservationSelectionPlanTests.swift in Sources */,
 				376516D7A90C4F6C566BE33C /* PendingInteractionsStoreTests.swift in Sources */,
 				A1E788B84BDB05B511813843 /* SymbolImageTests.swift in Sources */,

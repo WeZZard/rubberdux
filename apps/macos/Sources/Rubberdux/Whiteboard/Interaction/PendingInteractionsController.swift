@@ -2,12 +2,12 @@ import AppKit
 
 // MARK: - PendingInteractionsController
 
-/// The pop-out list of an App's pending interactions, presented from its icon
-/// badge when the board window is not front. Each pending interaction is shown
-/// stacked vertically in its own content view controller (the same per-primitive
-/// vocabulary the popover uses), so the human can answer any of them in place.
-/// Answering forwards the response through `onRespond`; the owner delivers it to
-/// the backend and refreshes the list.
+/// The inline list of an App's pending interactions, embedded in the App's
+/// observation column. Each pending interaction is shown stacked vertically in
+/// its own content view controller (the same per-primitive vocabulary the
+/// single-interaction popover uses), so the human can answer any of them in
+/// place. Answering forwards the response through `onRespond`; the owner
+/// delivers it to the backend and refreshes the list.
 ///
 /// See `docs/apps/macos/whiteboard-interaction.md` for the interaction-surface
 /// design record.
@@ -23,7 +23,6 @@ final class PendingInteractionsController: NSViewController {
 
     private var interactions: [AgentInteraction] = []
     private let stack = NSStackView()
-    private let popover = NSPopover()
     private var childControllers: [NSViewController] = []
 
     // MARK: - Lifecycle
@@ -69,25 +68,12 @@ final class PendingInteractionsController: NSViewController {
     // MARK: - Content
 
     /// Replace the listed interactions and rebuild the stacked content. Empty
-    /// input shows a placeholder so the pop-out is never blank.
+    /// input shows a placeholder so the list is never blank.
     func setInteractions(_ interactions: [AgentInteraction]) {
         self.interactions = interactions
         if isViewLoaded {
             rebuild()
         }
-    }
-
-    /// Present the pending list anchored to `rect` within `boardView`, on the
-    /// trailing edge of the badged icon.
-    func present(relativeTo rect: NSRect, of boardView: NSView) {
-        popover.behavior = .transient
-        popover.contentViewController = self
-        popover.show(relativeTo: rect, of: boardView, preferredEdge: .maxX)
-    }
-
-    /// Dismiss the pop-out.
-    func dismiss() {
-        popover.performClose(nil)
     }
 
     // MARK: - Private
