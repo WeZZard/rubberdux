@@ -142,10 +142,20 @@ impl MoonshotClient {
             None
         };
 
+        // The coding model fixes the only accepted temperature to its thinking
+        // state: 1 when thinking is active, 0.6 when thinking is disabled. Any
+        // other value yields a 400 "invalid temperature: only <x> is allowed for
+        // this model".
+        let thinking_disabled = thinking
+            .as_ref()
+            .map(|t| t.r#type == "disabled")
+            .unwrap_or(false);
+        let temperature = if thinking_disabled { 0.6 } else { 1.0 };
+
         let request = ChatRequest {
             model: self.model().to_owned(),
             messages,
-            temperature: Some(0.6),
+            temperature: Some(temperature),
             max_completion_tokens: None,
             tools,
             response_format: None,
