@@ -16,6 +16,11 @@ pub mod runtime;
 pub mod supervisor;
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Process-local counter to disambiguate AppIds created in the same microsecond.
+/// This is thread-safe and wait-free.
+static APP_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Stable identifier for an [`App`], formatted like a session id
 /// (`YYYY-MM-DD-hh-mm-ss-UTC`) so an App's on-disk directory name is sortable by
@@ -24,13 +29,17 @@ use serde::{Deserialize, Serialize};
 pub struct AppId(pub String);
 
 impl AppId {
-    /// Mint a fresh id from the current UTC instant.
+    /// Mint a fresh id from the current UTC instant plus a process-local counter.
+    ///
+    /// The format includes a per-process monotonic counter suffix to ensure
+    /// collision resistance even when multiple Apps are created within the same
+    /// microsecond. The counter appends as `-NNNNNN` after the timestamp, keeping
+    /// ids lexically sortable and allowing existing second-granularity ids on disk
+    /// to remain valid (they have no counter suffix).
     pub fn now() -> Self {
-        Self(
-            chrono::Utc::now()
-                .format("%Y-%m-%d-%H-%M-%S-UTC")
-                .to_string(),
-        )
+        let timestamp = chrono::Utc::now().format("%Y-%m-%d-%H-%M-%S-%6f").to_string();
+        let counter = APP_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self(format!("{}-{:06}-UTC", timestamp, counter % 1_000_000))
     }
 
     pub fn as_str(&self) -> &str {
@@ -114,7 +123,7 @@ impl App {
             icon,
             position,
             status: AppStatus::Tombstoned,
-            member_session_ids: Vec::new(),
+            member_session_ids: vec![],
             summary: String::new(),
             user_locked: false,
             last_active: chrono::Utc::now().to_rfc3339(),
@@ -128,7 +137,7 @@ mod tests {
 
     fn sample_app() -> App {
         App::new(
-            AppId("2026-06-10-00-00-00-UTC".into()),
+            AppId("2026-06-10-00-00-00-000000-000000-UTC".into()),
             "Plan the trip".into(),
             IconSpec {
                 symbol: "airplane".into(),
@@ -163,6 +172,24 @@ mod tests {
     fn app_id_now_is_sortable_format() {
         let id = AppId::now();
         assert!(id.as_str().ends_with("-UTC"));
-        assert_eq!(id.as_str().len(), 23);
+        // Format: YYYY-MM-DD-HH-MM-SS-MMMMMM-CCCCCC-UTC (37 chars)
+        assert_eq!(id.as_str().len(), 37);
+    }
+
+    #[test]
+    fn app_id_concurrent_creates_are_distinct() {
+        // Mint multiple IDs as fast as possible in sequence.
+        let mut ids = vec![];
+        for _ in 0..100 {
+            ids.push(AppId::now());
+        }
+        
+        // All should be distinct.
+        let unique_count = ids.iter().collect::<std::collections::HashSet<_>>().len();
+        assert_eq!(
+            unique_count, 100,
+            "all 100 ids should be distinct; got {} unique",
+            unique_count
+        );
     }
 }

@@ -243,3 +243,94 @@ async fn unknown_app_id_is_not_found_across_routes() {
         );
     }
 }
+
+/// Test that sequential App creation (with monotonic counter AppIds) produces
+/// distinct IDs and all apps persist.
+#[tokio::test(flavor = "multi_thread")]
+async fn sequential_creates_all_persist_with_distinct_ids() {
+    let app = board_router();
+
+    // Create N apps sequentially.
+    let n = 5;
+    let mut ids = vec![];
+
+    for i in 0..n {
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/apps",
+            Some(serde_json::json!({
+                "task": format!("App {}", i),
+                "position": { "row": 0, "column": i }
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "create #{} must return 201, got {} with body: {}",
+            i,
+            status,
+            serde_json::to_string(&body).unwrap_or_else(|_| "??".into())
+        );
+        ids.push(body["id"].as_str().unwrap().to_string());
+    }
+
+    // All N ids must be distinct.
+    let unique_ids: std::collections::HashSet<_> = ids.iter().cloned().collect();
+    assert_eq!(
+        unique_ids.len(),
+        n,
+        "all {} ids must be distinct; got: {:?}",
+        n,
+        ids
+    );
+
+    // All N apps must be listed as active.
+    let (status, list) = send(&app, "GET", "/api/v1/apps", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed_ids: Vec<&str> = list["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        listed_ids.len(),
+        n,
+        "all {} apps must be listed; only {} were persisted",
+        n,
+        listed_ids.len()
+    );
+}
+
+/// Test that concurrent AppId::now() calls produce distinct IDs when used
+/// across multiple threads.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_app_ids_are_distinct() {
+    let n = 10;
+    let mut tasks = vec![];
+
+    // Spawn tasks that create AppIds concurrently.
+    for _ in 0..n {
+        let task = tokio::spawn(async move {
+            rubberdux::app::AppId::now()
+        });
+        tasks.push(task);
+    }
+
+    let mut ids = vec![];
+    for task in tasks {
+        ids.push(task.await.unwrap());
+    }
+
+    // All IDs must be distinct.
+    let unique_ids: std::collections::HashSet<_> = ids.iter().cloned().collect();
+    assert_eq!(
+        unique_ids.len(),
+        n,
+        "all {} AppIds must be distinct; got: {:?}",
+        n,
+        ids.iter().map(|id| id.as_str()).collect::<Vec<_>>()
+    );
+}
