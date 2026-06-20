@@ -356,7 +356,12 @@ final class DotLatticeRenderer {
         // Suppress the plus glyph when its cell center lies in the reserved strip
         // so no create affordance is drawn under the floating panel.
         if isCellEmpty(cell), Self.isWithinUsableArea(center, usableBounds: usableBounds) {
+            // Position must snap: moving to a new cell would otherwise animate a
+            // visible slide across the board, breaking the magnify invariant.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
             plusGlyphLayer.position = center
+            CATransaction.commit()
             plusGlyphLayer.opacity = 1
         } else {
             plusGlyphLayer.opacity = 0
