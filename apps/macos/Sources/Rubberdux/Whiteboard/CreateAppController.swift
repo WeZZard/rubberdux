@@ -12,6 +12,11 @@ import AppKit
 /// record.
 final class CreateAppController: NSViewController, NSTextFieldDelegate {
 
+    private enum Outcome {
+        case submitted(String)
+        case cancelled
+    }
+
     // MARK: - Callbacks
 
     /// Called with the trimmed task text when the user commits (Return or the
@@ -26,45 +31,50 @@ final class CreateAppController: NSViewController, NSTextFieldDelegate {
     private let textField = NSTextField()
     private let createButton = NSButton()
     private let popover = NSPopover()
+    private var outcome: Outcome?
 
     // MARK: - Lifecycle
 
     override func loadView() {
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 76))
-
         let label = NSTextField(labelWithString: "New task")
         label.font = .boldSystemFont(ofSize: NSFont.smallSystemFontSize)
         label.textColor = .secondaryLabelColor
-        label.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(label)
 
         textField.placeholderString = "What should this app do?"
         textField.delegate = self
-        textField.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(textField)
 
         createButton.title = "Create"
         createButton.bezelStyle = .rounded
         createButton.keyEquivalent = "\r"
         createButton.target = self
         createButton.action = #selector(commit)
-        createButton.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(createButton)
+
+        // Wrap the button in a trailing-aligned stack so NSStackView fills the
+        // button to its intrinsic size rather than stretching it full-width.
+        let buttonRow = NSStackView(views: [NSView(), createButton])
+        buttonRow.orientation = .horizontal
+        buttonRow.distribution = .gravityAreas
+        buttonRow.setHuggingPriority(.defaultLow, for: .horizontal)
+
+        let stack = NSStackView(views: [label, textField, buttonRow])
+        stack.orientation = .vertical
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView()
+        container.addSubview(stack)
 
         NSLayoutConstraint.activate([
-            label.topAnchor.constraint(equalTo: container.topAnchor, constant: 12),
-            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
-
-            textField.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 6),
-            textField.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
-            textField.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
-
-            createButton.topAnchor.constraint(equalTo: textField.bottomAnchor, constant: 8),
-            createButton.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
-            createButton.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
+            container.widthAnchor.constraint(equalToConstant: 310),
+            stack.topAnchor.constraint(equalTo: container.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
         ])
 
         view = container
+        preferredContentSize = container.fittingSize
     }
 
     // MARK: - Presentation
@@ -79,26 +89,46 @@ final class CreateAppController: NSViewController, NSTextFieldDelegate {
         view.window?.makeFirstResponder(textField)
     }
 
-    /// Close the popover without firing `onCancel` (used after a commit).
+    /// Close the popover. The close notification resolves cancellation unless
+    /// an outcome was already recorded.
     func close() {
         popover.performClose(nil)
     }
 
     // MARK: - Actions
 
-    @objc private func commit() {
+    @objc func commit() {
         let task = textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !task.isEmpty else { return }
-        onSubmit?(task)
+        resolve(as: .submitted(task))
         close()
+    }
+
+    private func resolve(as outcome: Outcome) {
+        guard self.outcome == nil else { return }
+        self.outcome = outcome
+
+        switch outcome {
+        case let .submitted(task):
+            onSubmit?(task)
+        case .cancelled:
+            onCancel?()
+        }
+
+        onSubmit = nil
+        onCancel = nil
     }
 
     // MARK: - NSTextFieldDelegate
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        if selector == #selector(insertNewline(_:)) {
+            commit()
+            return true
+        }
         if selector == #selector(NSResponder.cancelOperation(_:)) {
+            resolve(as: .cancelled)
             close()
-            onCancel?()
             return true
         }
         return false
@@ -109,12 +139,14 @@ final class CreateAppController: NSViewController, NSTextFieldDelegate {
 
 extension CreateAppController: NSPopoverDelegate {
     func popoverDidClose(_ notification: Notification) {
-        // A transient popover dismissed by click-out reports cancellation so the
-        // view controller can clear any pending-create state. A commit closes via
-        // `close()` after `onSubmit`, so this path is the cancel path only.
+        // NSPopover reports both click-out and programmatic closes here. Treat
+        // every non-detach close as cancellation unless another exit already
+        // resolved first.
         if let reason = notification.userInfo?[NSPopover.closeReasonUserInfoKey] as? NSPopover.CloseReason,
            reason == .detachToWindow {
             return
         }
+        resolve(as: .cancelled)
+        popover.contentViewController = nil
     }
 }

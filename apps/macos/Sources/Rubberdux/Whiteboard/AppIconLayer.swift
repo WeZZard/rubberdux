@@ -166,12 +166,13 @@ final class AppIconLayer: CALayer {
     }
 
     private func applyHover() {
+        let targetTransform = isHovered ? CATransform3DMakeScale(1.08, 1.08, 1) : CATransform3DIdentity
+        let targetShadowOpacity: Float = isHovered ? 0.30 : 0.18
         CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        transform = isHovered
-            ? CATransform3DMakeScale(1.08, 1.08, 1)
-            : CATransform3DIdentity
-        shadowOpacity = isHovered ? 0.30 : 0.18
+        CATransaction.setAnimationDuration(0.18)
+        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+        transform = targetTransform
+        shadowOpacity = targetShadowOpacity
         CATransaction.commit()
     }
 

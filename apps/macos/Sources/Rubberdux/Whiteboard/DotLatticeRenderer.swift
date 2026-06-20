@@ -22,6 +22,22 @@ final class DotLatticeRenderer {
 
     // MARK: - Tuning
 
+    /// The underdamped spring that drives every `transform`/`opacity` write on the
+    /// pooled dots and the plus glyph. Its slight overshoot and settle give the
+    /// magnification a lively, physical feel rather than a passive ease, and its
+    /// `settlingDuration` becomes the animation duration so the motion is never
+    /// truncated. Installed as each layer's implicit-animation action; the at-rest
+    /// replicated field is never animated by it.
+    private static func springAnimation(keyPath: String) -> CASpringAnimation {
+        let spring = CASpringAnimation(keyPath: keyPath)
+        spring.mass = 1
+        spring.stiffness = 170
+        spring.damping = 14
+        spring.initialVelocity = 0
+        spring.duration = spring.settlingDuration
+        return spring
+    }
+
     /// Geometry of magnification, kept in one value so the falloff math and the
     /// pool sizing stay in agreement.
     struct Magnification: Equatable {
@@ -41,8 +57,8 @@ final class DotLatticeRenderer {
         let restOpacity: Float
 
         static let `default` = Magnification(
-            radius: 3,
-            maxScale: 2.4,
+            radius: 6,
+            maxScale: 3.6,
             maxOpacity: 1.0,
             restOpacity: 0.35
         )
@@ -193,9 +209,26 @@ final class DotLatticeRenderer {
             dot.cornerRadius = dotDiameter / 2
             dot.backgroundColor = dotColor
             dot.opacity = 0
+            // Spring the magnification: a `transform`/`opacity` write within an
+            // enabled-actions transaction overshoots and settles instead of
+            // snapping. `position` is excluded — it is always written with actions
+            // disabled so a reassigned slot never streaks across the board.
+            installSpringActions(on: dot)
             containerLayer.addSublayer(dot)
             return dot
         }
+    }
+
+    /// Install the spring as the implicit-animation action for `transform` and
+    /// `opacity` so writes to either property on `layer` animate with the
+    /// overshoot-and-settle response. Core Animation fills the spring's
+    /// `fromValue`/`toValue` from the layer's presentation/model values, so each
+    /// write re-targets the in-flight spring.
+    private func installSpringActions(on layer: CALayer) {
+        layer.actions = [
+            "transform": Self.springAnimation(keyPath: "transform"),
+            "opacity": Self.springAnimation(keyPath: "opacity"),
+        ]
     }
 
     private func configurePlusGlyph() {
@@ -205,6 +238,8 @@ final class DotLatticeRenderer {
         plusGlyphLayer.opacity = 0
         plusGlyphLayer.contents = plusImage(side: size).cgImageForLayer()
         plusGlyphLayer.contentsGravity = .resizeAspect
+        // The plus glyph springs in and out with the same response as the dots.
+        installSpringActions(on: plusGlyphLayer)
         _ = glyph
     }
 
@@ -247,9 +282,12 @@ final class DotLatticeRenderer {
     /// plus-glyph.
     ///
     /// Only the dots within the influence radius are touched; the work is bounded
-    /// by the pool size. The whole update runs inside a `CATransaction` with
-    /// implicit actions disabled so the field follows the cursor without
-    /// animating each move.
+    /// by the pool size. `position` is written with implicit actions disabled —
+    /// animating it would smear a pooled dot across the board whenever a slot is
+    /// reassigned to a different cell. `transform` (scale) and `opacity` are
+    /// written within the enabled-actions transaction, so each write re-targets the
+    /// installed spring: the disc springs toward its target with a slight overshoot
+    /// and settles when the cursor stops.
     func magnify(at cursor: CGPoint, isCellEmpty: (GridCell) -> Bool) {
         let radiusPoints = magnification.radius * geometry.pitch
         let influence = CGRect(
@@ -259,9 +297,6 @@ final class DotLatticeRenderer {
             height: radiusPoints * 2
         )
         let cells = geometry.visibleCells(in: influence)
-
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
 
         var poolIndex = 0
         for cell in cells where poolIndex < pool.count {
@@ -275,12 +310,19 @@ final class DotLatticeRenderer {
             let dot = pool[poolIndex]
             poolIndex += 1
 
+            // Position must snap: a reassigned slot at a new cell would otherwise
+            // animate a visible streak across the board.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
             dot.position = center
-            dot.transform = CATransform3DMakeScale(
-                Self.scale(distance: distance, radius: radiusPoints, maxScale: magnification.maxScale),
-                Self.scale(distance: distance, radius: radiusPoints, maxScale: magnification.maxScale),
-                1
+            CATransaction.commit()
+
+            let scale = Self.scale(
+                distance: distance,
+                radius: radiusPoints,
+                maxScale: magnification.maxScale
             )
+            dot.transform = CATransform3DMakeScale(scale, scale, 1)
             dot.opacity = Self.opacity(
                 distance: distance,
                 radius: radiusPoints,
@@ -289,26 +331,23 @@ final class DotLatticeRenderer {
             )
         }
 
-        // Park the unused pool dots offscreen-invisible so stale positions never
-        // linger after the cursor moves to a sparser region.
+        // Spring the unused pool dots to invisible so stale positions fade out
+        // rather than linger after the cursor moves to a sparser region.
         for index in poolIndex..<pool.count {
             pool[index].opacity = 0
         }
 
         updatePlusGlyph(at: cursor, isCellEmpty: isCellEmpty)
-
-        CATransaction.commit()
     }
 
-    /// Fade the magnified field out — used when the cursor leaves the view.
+    /// Fade the magnified field out — used when the cursor leaves the view. Each
+    /// `opacity = 0` write rides the installed opacity spring, so the disc and the
+    /// plus glyph settle to invisible rather than snapping.
     func clearMagnification() {
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
         for dot in pool {
             dot.opacity = 0
         }
         plusGlyphLayer.opacity = 0
-        CATransaction.commit()
     }
 
     private func updatePlusGlyph(at cursor: CGPoint, isCellEmpty: (GridCell) -> Bool) {

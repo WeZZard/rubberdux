@@ -352,13 +352,10 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
         }
         createController = controller
 
-        let anchor = NSRect(
-            x: boardView.bounds.midX,
-            y: boardView.bounds.midY,
-            width: 1,
-            height: 1
-        )
-        controller.present(relativeTo: anchor, of: boardView)
+        // Anchor the popover at the clicked cell so it points at where the new app
+        // will land, and so the optimistic placeholder appears under the popover
+        // rather than at the board center.
+        controller.present(relativeTo: boardView.cellRect(for: cell), of: boardView)
     }
 
     private func createApp(task: String, at cell: GridCell) {

@@ -159,6 +159,14 @@ final class BoardView: NSView {
         return clamped.isNull ? layer.frame : clamped
     }
 
+    /// The view-space rect of `cell`'s center, a small zero-area-adjacent box used
+    /// to anchor the create popover on the cell the user clicked rather than at the
+    /// board center. The popover points its arrow at this point via `point(for:)`.
+    func cellRect(for cell: GridCell) -> NSRect {
+        let center = geometry.point(for: cell)
+        return NSRect(x: center.x, y: center.y, width: 1, height: 1)
+    }
+
     /// Select an app icon (or clear selection with `nil`), updating rings.
     func selectApp(_ appID: String?) {
         if let current = selectedAppID, let layer = iconLayers[current] {

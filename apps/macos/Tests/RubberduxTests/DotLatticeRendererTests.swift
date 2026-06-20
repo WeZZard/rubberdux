@@ -148,4 +148,33 @@ final class DotLatticeRendererTests: XCTestCase {
         renderer.layout(in: full)
         XCTAssertEqual(renderer.containerLayer.frame, full)
     }
+
+    // MARK: - Magnification.default
+
+    func testMagnificationDefaultHasCorrectConstants() {
+        let mag = DotLatticeRenderer.Magnification.default
+        XCTAssertEqual(mag.radius, 6, accuracy: accuracy)
+        XCTAssertEqual(mag.maxScale, 3.6, accuracy: accuracy)
+        XCTAssertEqual(mag.restOpacity, 0.35, accuracy: 1e-6)
+        XCTAssertEqual(mag.maxOpacity, 1.0, accuracy: 1e-6)
+    }
+
+    func testScaleWithDefaultMagnificationAt36MaxScale() {
+        // scale should equal maxScale (3.6) at distance 0 and decrease to 1.0 at/after radius (6).
+        XCTAssertEqual(
+            DotLatticeRenderer.scale(distance: 0, radius: 6, maxScale: 3.6),
+            3.6,
+            accuracy: accuracy
+        )
+        XCTAssertEqual(
+            DotLatticeRenderer.scale(distance: 6, radius: 6, maxScale: 3.6),
+            1,
+            accuracy: accuracy
+        )
+        XCTAssertEqual(
+            DotLatticeRenderer.scale(distance: 10, radius: 6, maxScale: 3.6),
+            1,
+            accuracy: accuracy
+        )
+    }
 }
