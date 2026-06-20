@@ -334,3 +334,57 @@ async fn concurrent_app_ids_are_distinct() {
         ids.iter().map(|id| id.as_str()).collect::<Vec<_>>()
     );
 }
+
+/// Two Apps created at the SAME board cell both persist with distinct ids. The
+/// gateway does not enforce board-position uniqueness, so a cell may hold more
+/// than one App; clients render the overlap stacked. This pins the same-cell
+/// placement behavior documented in `docs/gateway/apps.md`.
+#[tokio::test(flavor = "multi_thread")]
+async fn same_cell_creates_both_persist() {
+    let app = board_router();
+
+    let mut ids = vec![];
+    for label in ["First", "Second"] {
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/apps",
+            Some(serde_json::json!({
+                "task": format!("{label} at the shared cell"),
+                "position": { "row": 2, "column": 2 }
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "same-cell create must return 201, got {} with body: {}",
+            status,
+            serde_json::to_string(&body).unwrap_or_else(|_| "??".into())
+        );
+        ids.push(body["id"].as_str().unwrap().to_string());
+    }
+
+    // The shared cell does not collapse the two Apps onto one id.
+    assert_ne!(ids[0], ids[1], "same-cell creates still mint distinct ids");
+
+    // Both Apps persist on the board, each still reporting the shared cell.
+    let (status, list) = send(&app, "GET", "/api/v1/apps", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let at_cell: Vec<&serde_json::Value> = list["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| ids.iter().any(|id| id == a["id"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        at_cell.len(),
+        2,
+        "both same-cell Apps persist on the board; got {}",
+        at_cell.len()
+    );
+    for a in at_cell {
+        assert_eq!(a["position"]["row"], 2, "same-cell App keeps its row");
+        assert_eq!(a["position"]["column"], 2, "same-cell App keeps its column");
+    }
+}

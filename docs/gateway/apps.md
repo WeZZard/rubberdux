@@ -75,6 +75,31 @@ The entries and trajectory reads are one-shot snapshots: they subscribe to the
 App's broadcast stream and drain whatever is currently buffered. A live feed is
 the WebSocket surface's concern, designed in the next task.
 
+## Identity and Placement
+
+**Collision-resistant ids.** `AppId::now` (`src/app/mod.rs`) mints an id from the
+UTC instant at microsecond precision plus a process-local monotonic counter
+(`YYYY-MM-DD-HH-MM-SS-ffffff-NNNNNN-UTC`). Two `POST /apps` calls within the same
+second therefore receive distinct ids, so concurrent creates never collide on the
+filesystem store's `app_dir`. The counter alone guarantees distinctness within a
+process even when two mints share a microsecond.
+
+**Sortability tradeoff.** Among ids minted by this code, lexical order matches
+creation order (microseconds then counter both increase). Pre-existing
+second-granularity ids on disk (`YYYY-MM-DD-HH-MM-SS-UTC`, no suffix) remain
+valid directory names and still load. The one edge is the upgrade boundary: a
+post-upgrade id that shares a whole second with a pre-upgrade id sorts *before*
+it (the `-` of `-UTC` precedes the digits of the suffix). This is accepted as
+cosmetic — no correctness path orders Apps by id; board layout is driven by each
+App's `{row, column}`, and the id ordering is only a convenience for listings.
+
+**Same-cell placement.** The board does not enforce position uniqueness. Two Apps
+may be created at the same `{row, column}`; both persist with distinct ids and
+both keep the shared cell. Clients render the overlap stacked. Spreading or
+auto-clustering co-located Apps is a client/merge concern, out of scope for the
+REST surface. (Pinned by `same_cell_creates_both_persist` in
+`tests/integration/gateway/multi_app_board.rs`.)
+
 ## Gateway-State Additions
 
 `GatewayState` gains two optional fields behind a new `with_apps` constructor:
