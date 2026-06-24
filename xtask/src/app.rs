@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn project_root() -> Result<PathBuf, String> {
@@ -48,6 +48,7 @@ fn generate_xcode_project(app_dir: &PathBuf) -> Result<(), String> {
 
 fn build_xcode_project(app_dir: &PathBuf, release: bool) -> Result<PathBuf, String> {
     let config = xcode_configuration(release);
+    let derived_data = derived_data_dir(app_dir);
     println!("Building macOS app ({})...", config);
     let status = Command::new("xcodebuild")
         .current_dir(app_dir)
@@ -58,46 +59,50 @@ fn build_xcode_project(app_dir: &PathBuf, release: bool) -> Result<PathBuf, Stri
             "Rubberdux",
             "-configuration",
             config,
-            "build",
         ])
+        .arg("-derivedDataPath")
+        .arg(&derived_data)
+        .arg("build")
         .status()
         .map_err(|e| format!("xcodebuild failed: {}", e))?;
     if !status.success() {
         return Err(format!("xcodebuild ({}) failed", config));
     }
 
-    let derived_data = find_derived_data_product(config)?;
-    Ok(derived_data)
+    let product = product_path(&derived_data, config);
+    if !product.exists() {
+        return Err(format!(
+            "xcodebuild ({}) reported success but the product is missing at {}",
+            config,
+            product.display()
+        ));
+    }
+    Ok(product)
 }
 
-fn find_derived_data_product(config: &str) -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    let derived = home.join("Library/Developer/Xcode/DerivedData");
-    let entries = std::fs::read_dir(&derived)
-        .map_err(|e| format!("Cannot read DerivedData: {}", e))?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if name_str.starts_with("Rubberdux-") {
-            let product_name = if config == "Debug" {
-                "Rubberdux (Debug).app"
-            } else {
-                "Rubberdux.app"
-            };
-            let app_path = entry
-                .path()
-                .join("Build/Products")
-                .join(config)
-                .join(product_name);
-            if app_path.exists() {
-                return Ok(app_path);
-            }
-        }
-    }
-    Err(format!(
-        "Cannot find Rubberdux.app in DerivedData for configuration {}",
-        config
-    ))
+/// The repo-local DerivedData directory, mirroring `apps/macos/scripts/build.sh`.
+///
+/// Pinning it makes the launched product the one this build just produced. The
+/// previous global `~/Library/Developer/Xcode/DerivedData` scan returned the
+/// first `Rubberdux-<hash>` directory that happened to hold a product, which
+/// could be a stale app from a different checkout: Xcode keys that hash on the
+/// project's absolute path, so moving or renaming the repo leaves orphan
+/// products behind whose baked-in `RubberduxWorkspaceRoot` points at the old,
+/// now-missing checkout.
+fn derived_data_dir(app_dir: &Path) -> PathBuf {
+    app_dir.join(".build").join("DerivedData")
+}
+
+/// The built `.app` path for a configuration. The bundle name follows
+/// `PRODUCT_NAME` in `apps/macos/Config/<config>.xcconfig`, which is
+/// `Rubberdux (<config>)` for the Debug and Release configurations the xtask
+/// builds.
+fn product_path(derived_data: &Path, config: &str) -> PathBuf {
+    derived_data
+        .join("Build")
+        .join("Products")
+        .join(config)
+        .join(format!("Rubberdux ({}).app", config))
 }
 
 fn which(cmd: &str) -> Result<String, String> {
@@ -172,8 +177,10 @@ fn test_xcode_project(app_dir: &PathBuf) -> Result<(), String> {
             "Debug",
             "-destination",
             "platform=macOS",
-            "test",
         ])
+        .arg("-derivedDataPath")
+        .arg(derived_data_dir(app_dir))
+        .arg("test")
         .status()
         .map_err(|e| format!("xcodebuild test failed: {}", e))?;
     if !status.success() {
