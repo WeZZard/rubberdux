@@ -39,7 +39,9 @@ use crate::agent::runtime::port::EntryNotification;
 use crate::error::Error;
 use crate::app::peer::PeerId;
 use crate::app::peer::mailbox::Mailbox;
-use crate::host::{AcceptedWorker, PeerBroker, PeerRouteOutcome, WorkerStream, accept_worker};
+use crate::host::{
+    AcceptedWorker, PeerBroker, PeerRouteOutcome, SurfaceRouter, WorkerStream, accept_worker,
+};
 use crate::protocol::{self, AgentToHost, HostToAgent};
 use crate::trajectory::TrajectoryEvent;
 
@@ -51,6 +53,12 @@ const CHANNEL_CAPACITY: usize = 256;
 /// promptly by the supervision task, so a small buffer absorbs bursts without
 /// unbounded growth.
 const OUTBOUND_CAPACITY: usize = 64;
+
+/// Bound on the per-App surface-relay inbound queue: macOS client observations the
+/// [`SurfaceRouter`] routes to this worker before the pump writes them to the
+/// worker socket. Surface events arrive at human interaction speed, so a small
+/// buffer absorbs bursts without back-pressuring the router.
+const SURFACE_RELAY_CAPACITY: usize = 64;
 
 /// Initial restart backoff after a worker crash. Doubles on each consecutive
 /// crash up to [`MAX_BACKOFF`], resetting once a worker stays up past
@@ -129,6 +137,13 @@ pub struct LocalSupervisor {
     /// fails (no live `Arc<Self>`) skips the wake and the message drains on the
     /// target's next restore. See `docs/app/peer/decentralized-messaging.md`.
     me: Weak<LocalSupervisor>,
+    /// The host's surface router, shared so each App's RPC pump can register the
+    /// worker's inbound surface seam (`register_worker`) and route the worker's
+    /// outbound `AgentToHost::SurfaceDrive` frames to the registered macOS client
+    /// (`route_drive`), keyed by App id. `None` for a supervisor built with `bind`
+    /// (tests with no live surface client); `Some` for the host's `bind_shared`.
+    /// See `docs/agent/world/ecs-runtime.md` (Theme 2a/2b; VC-P.1).
+    surface_router: Option<Arc<SurfaceRouter>>,
 }
 
 /// The async-bound parts of a [`LocalSupervisor`], produced by `assemble` before
@@ -144,9 +159,15 @@ struct SupervisorParts {
 }
 
 impl SupervisorParts {
-    /// Finish the assembled parts into a supervisor with the given self-reference.
-    /// `me` is empty for `bind` and the live `Weak` for `bind_shared`.
-    fn into_supervisor(self, me: Weak<LocalSupervisor>) -> LocalSupervisor {
+    /// Finish the assembled parts into a supervisor with the given self-reference
+    /// and surface router. `me` is empty for `bind` and the live `Weak` for
+    /// `bind_shared`; `surface_router` is `None` for `bind` and the host's shared
+    /// router for `bind_shared`.
+    fn into_supervisor(
+        self,
+        me: Weak<LocalSupervisor>,
+        surface_router: Option<Arc<SurfaceRouter>>,
+    ) -> LocalSupervisor {
         LocalSupervisor {
             store: self.store,
             rpc_addr: self.rpc_addr,
@@ -156,6 +177,7 @@ impl SupervisorParts {
             board_tx: self.board_tx,
             peer_broker: self.peer_broker,
             me,
+            surface_router,
         }
     }
 }
@@ -170,7 +192,7 @@ impl LocalSupervisor {
         // message drains on the target's next restore). The host uses
         // `bind_shared` to get the active wake.
         let parts = Self::assemble(store).await?;
-        let supervisor = parts.into_supervisor(Weak::new());
+        let supervisor = parts.into_supervisor(Weak::new(), None);
         supervisor.spawn_idle_sweeper();
         Ok(supervisor)
     }
@@ -179,13 +201,20 @@ impl LocalSupervisor {
     /// holding a live `Weak<Self>` so a `PeerSend` queued to an offline target
     /// wakes that target through `ensure_active`. The host uses this so the
     /// peer-send wake is active; `bind` is the by-value variant for callers that
-    /// do not need the wake. See `docs/app/peer/decentralized-messaging.md`.
-    pub async fn bind_shared(store: Arc<dyn AppStore>) -> Result<Arc<Self>, Error> {
+    /// do not need the wake. The `surface_router` is shared so each App's RPC pump
+    /// relays surface frames to/from the registered macOS client (Theme 2a/2b).
+    /// See `docs/app/peer/decentralized-messaging.md` and
+    /// `docs/agent/world/ecs-runtime.md`.
+    pub async fn bind_shared(
+        store: Arc<dyn AppStore>,
+        surface_router: Arc<SurfaceRouter>,
+    ) -> Result<Arc<Self>, Error> {
         // `assemble` does the async listener/router setup; the `Arc` is then
         // built cyclically so every pump captures the supervisor's own `Weak` and
         // can call back into `ensure_active`.
         let parts = Self::assemble(store).await?;
-        let shared = Arc::new_cyclic(|me| parts.into_supervisor(me.clone()));
+        let shared =
+            Arc::new_cyclic(|me| parts.into_supervisor(me.clone(), Some(surface_router)));
         shared.spawn_idle_sweeper();
         Ok(shared)
     }
@@ -321,6 +350,7 @@ impl LocalSupervisor {
                 lifecycles: self.lifecycles.clone(),
                 peer_broker: self.peer_broker.clone(),
                 supervisor: self.me.clone(),
+                surface_router: self.surface_router.clone(),
             };
             tokio::spawn(task.run(conn_rx, outbound_rx, Some(ready_tx)));
 
@@ -624,6 +654,11 @@ struct SupervisionTask {
     /// supervisor was built by value (`bind`), in which case the wake is skipped
     /// and the message drains on the target's next restore.
     supervisor: Weak<LocalSupervisor>,
+    /// The host's surface router, so the pump can register this worker's inbound
+    /// surface seam and route its outbound `SurfaceDrive` frames to the registered
+    /// macOS client, keyed by App id. `None` when no live surface relay is wired
+    /// (the `bind` path used by tests). See `docs/agent/world/ecs-runtime.md`.
+    surface_router: Option<Arc<SurfaceRouter>>,
 }
 
 impl SupervisionTask {
@@ -810,6 +845,24 @@ impl SupervisionTask {
         } = stream;
         log::info!("[app-worker:{}] connected, pumping RPC", self.app_id);
 
+        // Register this worker's inbound surface seam so the host's SurfaceRouter
+        // relays a macOS client's observations to it, keyed by App id. The seam
+        // carries `AgentToHost::SurfaceObservation`/`SurfaceMutated`; the select
+        // arm below converts each to the host→worker `HostToAgent` form and writes
+        // it to the worker socket. Re-registration on a crash-restart simply
+        // overwrites the stale entry. See `docs/agent/world/ecs-runtime.md`
+        // (Theme 2b; VC-P.1).
+        let (surface_inbound_tx, mut surface_inbound_rx) =
+            mpsc::channel::<AgentToHost>(SURFACE_RELAY_CAPACITY);
+        if let Some(router) = self.surface_router.as_ref() {
+            router
+                .register_worker(self.app_id.to_string(), surface_inbound_tx.clone())
+                .await;
+        }
+        // Hold the original sender so `surface_inbound_rx` stays open for the
+        // pump's lifetime even with no router attached (the `bind` test path).
+        let _surface_inbound_tx = surface_inbound_tx;
+
         loop {
             tokio::select! {
                 biased;
@@ -920,6 +973,24 @@ impl SupervisionTask {
                             let result = HostToAgent::PeerListResult { peers };
                             protocol::write_message(&mut writer, &result).await?;
                         }
+                        Some(AgentToHost::SurfaceDrive { ops, cmd, key }) => {
+                            // The worker's World driver ran a `set_value` surface
+                            // tool. Repackage the relay frame as the host→client
+                            // `HostToAgent::SurfaceDrive` and route it to this App's
+                            // registered macOS client (the host is a switch, keyed
+                            // by App id). A missing client/router drops it.
+                            // See docs/agent/world/ecs-runtime.md (Theme 2a).
+                            let drive = HostToAgent::SurfaceDrive { ops, cmd, key };
+                            match self.surface_router.as_ref() {
+                                Some(router) => {
+                                    router.route_drive(self.app_id.as_str(), drive).await;
+                                }
+                                None => log::debug!(
+                                    "[app-worker:{}] SurfaceDrive with no surface router; dropping",
+                                    self.app_id
+                                ),
+                            }
+                        }
                         Some(other) => {
                             log::debug!(
                                 "[app-worker:{}] unhandled worker frame: {other:?}",
@@ -940,6 +1011,32 @@ impl SupervisionTask {
                         // The handle was dropped: nothing more to send, but keep
                         // reading until cancel/disconnect drives the exit.
                         None => return Ok(()),
+                    }
+                }
+
+                // Surface relay (host → worker): a macOS client observation the
+                // router routed to this App. Convert the inbound `AgentToHost`
+                // surface frame to its host→worker `HostToAgent` counterpart and
+                // write it to the worker; its bridge folds it into the World input
+                // queue. See docs/agent/world/ecs-runtime.md (Theme 2b; Inv 18).
+                inbound = surface_inbound_rx.recv() => {
+                    match inbound {
+                        Some(AgentToHost::SurfaceObservation { observed }) => {
+                            let frame = HostToAgent::SurfaceObservation { observed };
+                            protocol::write_message(&mut writer, &frame).await?;
+                        }
+                        Some(AgentToHost::SurfaceMutated { op, cause }) => {
+                            let frame = HostToAgent::SurfaceMutated { op, cause };
+                            protocol::write_message(&mut writer, &frame).await?;
+                        }
+                        // Non-surface frames never reach this seam (the router only
+                        // routes observations here); ignore defensively. `None` is
+                        // unreachable while the pump holds `_surface_inbound_tx`.
+                        Some(other) => log::debug!(
+                            "[app-worker:{}] unexpected frame on surface seam: {other:?}",
+                            self.app_id
+                        ),
+                        None => {}
                     }
                 }
 

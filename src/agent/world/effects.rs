@@ -1,0 +1,2149 @@
+//! effects — see docs/agent/world/ecs-runtime.md
+//!
+//! The P0 `Command` subset plus the imperative-shell DRIVERS that turn a tick's
+//! emitted Commands into result Inputs. There are TWO drivers, separate code
+//! paths rather than a flag inside a System (Inv 6):
+//!
+//! - the **live driver** performs the effect, APPENDS the result `Event` to the
+//!   log BEFORE feeding it back (log-before-apply, Inv 4), and
+//! - the **replay driver** DISCARDS the emitted Commands and stands in the
+//!   already-logged result, reusing it ONLY while the re-emitted request
+//!   re-hashes to the recorded `Fingerprint` (content-addressed replay, Inv 7).
+//!
+//! A System cannot tell which driver it runs under: replay re-calls nothing
+//! because the replay driver suppresses every Command — not because any System
+//! behaves differently. P0 implements ONLY the `CallModel` effect.
+
+use std::collections::BTreeSet;
+use std::future::Future;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value as Json;
+use sha2::{Digest, Sha256};
+
+use super::autonomy::{AgentInteraction, HumanAction, Notify};
+use super::event_log::EventLog;
+use super::history::{Block, History, MessageBuilder, ToolSchema};
+use super::inputs::{CancelReason, Event, Fingerprint, LogicalInput, ModelError, ModelMeta, Origin};
+use super::lifecycle::{ActorCtx, AppId, EffectId, EffectKind, IdempotencyKey, LifecycleEvent};
+use super::model_client::MessagesClient;
+use super::surface::{
+    SurfaceOp, SurfaceView, fingerprint_ui_request, perceived_for_ops, set_value_tool_schema,
+    surface_tool_result,
+};
+use super::world::{CmdId, EdgeId, EntityId, ModelConfig, ReqId, Tick, Timestamp};
+use crate::error::Error;
+
+/// A tool name, matching the `name` field of a `Block::ToolUse` block.
+/// Aliased so Command fields read as domain concepts (the tool being run)
+/// rather than the underlying `String` type.
+pub type ToolName = String;
+
+// ---------------------------------------------------------------------------
+// Command (World → shell) — P0 subset
+// ---------------------------------------------------------------------------
+
+/// Commands a tick emits for the imperative shell to dispatch (P0 + P1a).
+///
+/// A Command is an INTENT to perform an effect. The LIVE driver dispatches it and
+/// feeds the result back as a recorded Input; the REPLAY driver discards it and
+/// stands in the already-logged result (the two-driver model). Each effectful
+/// Command has a terminating Input dual (see docs/agent/world/ecs-runtime.md —
+/// Command↔Input duals). Cancel/abort Commands need no `key`; aborting an already-
+/// aborted effect is inherently idempotent. `RaiseInteraction` is deduped by its
+/// stable `request_id` and also needs no key.
+/// See docs/agent/world/ecs-runtime.md (Commands).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Command {
+    /// Dispatch one inference: assemble the `/v1/messages` body from
+    /// `messages`/`params`, call the provider, and record the result as
+    /// `ModelResponded` (or `ModelFailed`) correlated by `cmd`. `key` exists so a
+    /// crash-resume re-dispatch can be deduped downstream (the full
+    /// `IdempotencyKey` is the WAL milestone, P2). Dual: `ModelResponded` /
+    /// `ModelFailed` / `InferenceCancelled`.
+    CallModel {
+        cmd: CmdId,
+        entity: EntityId,
+        messages: History,
+        tools: ToolSet,
+        params: ModelConfig,
+        key: CommandKey,
+    },
+
+    /// Request cancellation of an in-flight `CallModel`. No `key` — aborting an
+    /// already-cancelled inference is inherently idempotent.
+    /// Dual: `InferenceCancelled`.
+    CancelInference { cmd: CmdId },
+
+    /// Dispatch one tool call. `key` enables crash-resume dedup.
+    /// Dual: `ToolReturned`.
+    RunTool {
+        cmd: CmdId,
+        entity: EntityId,
+        tool: ToolName,
+        args: Json,
+        key: CommandKey,
+    },
+
+    /// Request cancellation of an in-flight `RunTool`. No `key` — idempotent.
+    /// Dual: `ToolAborted`.
+    CancelTool { cmd: CmdId },
+
+    /// Ask a human to perform an action (e.g. provide text input). `notify`
+    /// controls how the shell surfaces the request. `key` enables crash-resume
+    /// dedup. Dual: `HumanActionDone`.
+    RequestHumanAction {
+        cmd: CmdId,
+        entity: EntityId,
+        ask: HumanAction,
+        notify: Notify,
+        key: CommandKey,
+    },
+
+    /// Abort a pending `RequestHumanAction`. No `key` — idempotent.
+    /// Dual: `HumanActionAborted`.
+    AbortHumanAction { cmd: CmdId },
+
+    /// Raise an agent-facing interaction (e.g. an approval dialog). Deduped by
+    /// the stable `request_id` so no separate `key` is needed.
+    /// Dual: `InteractionAnswer`.
+    RaiseInteraction {
+        request_id: ReqId,
+        entity: EntityId,
+        interaction: AgentInteraction,
+    },
+
+    /// Summarize the oldest `upto` History messages into one compact message so
+    /// the next request's context window shrinks (Boundedness). A model call;
+    /// `key` enables crash-resume dedup. `messages` is the history slice to
+    /// summarize (the oldest `upto` Msgs); `params` is the model config for the
+    /// summarization call. The fingerprint is content-addressed over `(messages,
+    /// params)` like `CallModel` (Inv 7). Dual: `Compacted` / `ModelFailed`.
+    Compact {
+        cmd: CmdId,
+        entity: EntityId,
+        upto: u32,
+        /// The oldest `upto` History messages to summarize.
+        messages: History,
+        /// Model config for the summarization call.
+        params: ModelConfig,
+        key: CommandKey,
+    },
+
+    /// Carry a stratum-2 [`LifecycleEvent`] OBSERVABILITY record out of a pure
+    /// System to the driver, which is the sole appender of lifecycle records. It
+    /// is NOT an effect: it dispatches nothing, consumes no idempotency
+    /// key/`effect_id`, and has no Input dual. The LIVE driver appends it via
+    /// `append_lifecycle`; the REPLAY driver DISCARDS it (it is stratum-2 and
+    /// neutral on replay — any World change it reports already lives in the
+    /// stratum-1 fold, so replay stays byte-identical). Today this carries the
+    /// Inbox-overflow `MessageDropped` notice SteeringSystem would otherwise have
+    /// no channel to surface. See docs/agent/world/ecs-runtime.md (Stratum 2;
+    /// Bounded queues — Inbox DropOldest).
+    EmitLifecycle(LifecycleEvent),
+}
+
+/// The tools offered to a model call. P0 has no tools (the tool effect is a later
+/// milestone), so this is an ordered list of tool names — empty in P0 — carried
+/// so the request `Fingerprint` covers tool availability. The full structured
+/// tool set arrives with the tool milestone. See docs/agent/world/ecs-runtime.md.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSet(pub Vec<String>);
+
+/// P0 placeholder for an effectful Command's idempotency key. The full
+/// `IdempotencyKey { app_id, tick, effect_id }` — which dedups a crash-resume
+/// re-dispatch — arrives with the WAL milestone (P2). P0 carries this opaque
+/// placeholder so the `Command` shape is stable without pulling WAL concerns in.
+/// See docs/agent/world/ecs-runtime.md.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandKey;
+
+// ---------------------------------------------------------------------------
+// Fingerprint — canonical hash of a CallModel request payload
+// ---------------------------------------------------------------------------
+
+/// Compute the canonical request `Fingerprint` for a `CallModel`: a SHA-256 over
+/// the deterministically-serialized `(messages, tools, params)` payload. Field
+/// order is fixed and the payload carries no map-by-iteration or float
+/// nondeterminism, so an identical request hashes identically across processes
+/// and runs — the basis of content-addressed replay (Inv 7). Recorded on the
+/// result and re-checked on re-emit. See docs/agent/world/ecs-runtime.md
+/// (Content-addressed replay — the fingerprint).
+pub fn fingerprint_call(
+    messages: &History,
+    tools: &ToolSet,
+    params: &ModelConfig,
+) -> Result<Fingerprint, Error> {
+    /// The exact, fixed-order payload that is hashed. A dedicated struct so the
+    /// field order is explicit rather than positional.
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        messages: &'a History,
+        tools: &'a ToolSet,
+        params: &'a ModelConfig,
+    }
+
+    let bytes = serde_json::to_vec(&Payload {
+        messages,
+        tools,
+        params,
+    })?;
+    let digest = Sha256::digest(&bytes);
+    Ok(Fingerprint(hex::encode(digest)))
+}
+
+/// Compute the canonical request `Fingerprint` for a `Compact`: a SHA-256 over
+/// the deterministically-serialized `(messages, params)` payload of the compaction
+/// call — the history slice being summarized and the model config used. The same
+/// content-addressed discipline as `fingerprint_call` ensures an identical
+/// compaction request hashes identically across processes and runs (Inv 7).
+/// See docs/agent/world/ecs-runtime.md (Content-addressed replay; Compact↔Compacted).
+pub fn fingerprint_compact(
+    messages: &History,
+    params: &ModelConfig,
+) -> Result<Fingerprint, Error> {
+    /// The exact, fixed-order payload that is hashed.
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        messages: &'a History,
+        params: &'a ModelConfig,
+    }
+
+    let bytes = serde_json::to_vec(&Payload { messages, params })?;
+    let digest = Sha256::digest(&bytes);
+    Ok(Fingerprint(hex::encode(digest)))
+}
+
+// ---------------------------------------------------------------------------
+// Tool resolution — a CallModel's ToolSet names → their Anthropic declarations
+// ---------------------------------------------------------------------------
+
+/// Resolve the tool NAMES a `CallModel` carries (`ToolSet`) to their Anthropic
+/// `ToolSchema` declarations, so the assembled request body tells the model which
+/// tools EXIST and how to shape each `tool_use.input`. YAGNI — a small static
+/// name→schema table, not a registry: the only surface tool declared today is
+/// `set_value`, whose `input_schema` matches the live `set_value` executor's
+/// `args` shape. An unknown name resolves to nothing (it was carried for the
+/// fingerprint only). See docs/agent/world/ecs-runtime.md.
+fn resolve_tools(tools: &ToolSet) -> Vec<ToolSchema> {
+    tools
+        .0
+        .iter()
+        .filter_map(|name| match name.as_str() {
+            "set_value" => Some(set_value_tool_schema()),
+            _ => None,
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// ModelCaller — the model-call capability the LIVE driver needs
+// ---------------------------------------------------------------------------
+
+/// The model-call capability the LIVE driver depends on, abstracted behind a
+/// trait so a test can inject a stand-in without a network. `MessagesClient` is
+/// the production implementation. The REPLAY driver takes NO `ModelCaller` — it
+/// cannot make a call by construction (Inv 6). See docs/agent/world/ecs-runtime.md.
+pub trait ModelCaller {
+    /// POST the assembled `/v1/messages` body and return the assistant blocks and
+    /// call metadata, mirroring `MessagesClient::call`.
+    fn call(
+        &self,
+        request_body: Json,
+    ) -> impl Future<Output = Result<(Vec<Block>, ModelMeta), Error>> + Send;
+}
+
+impl ModelCaller for MessagesClient {
+    async fn call(&self, request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+        // Inherent `MessagesClient::call` (resolves ahead of this trait method).
+        MessagesClient::call(self, request_body).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SurfaceDriver — the surface-drive sink the LIVE driver needs (stratum-2/live)
+// ---------------------------------------------------------------------------
+
+/// The surface-drive capability the LIVE driver depends on, abstracted behind a
+/// trait so a test can inject a capturing stand-in without the macOS app, exactly
+/// as `ModelCaller` abstracts the model call. When the live driver executes a
+/// `set_value` surface `RunTool` it hands the Command to `drive`, whose production
+/// impl converts it to a `HostToAgent::SurfaceDrive` frame (the worker's
+/// `surface_drive_frame`) and forwards it to the macOS app so the screen actually
+/// changes. The send is a stratum-2/LIVE-only effect — the REPLAY driver takes NO
+/// `SurfaceDriver` and never re-sends it (the recorded `ToolReturned` already
+/// carries the projection the fold reproduces). See docs/agent/world/ecs-runtime.md
+/// (Theme 2a; SurfaceDrive; the agent UI-write echo is one fact).
+pub trait SurfaceDriver {
+    /// Forward a `set_value` surface `RunTool` out to the macOS app as a surface
+    /// drive. Mirrors `ModelCaller::call`: the live driver awaits it as the real
+    /// effect; a genuine forwarding failure propagates so the driver can record it.
+    fn drive(&self, command: &Command) -> impl Future<Output = Result<(), Error>> + Send;
+}
+
+// ---------------------------------------------------------------------------
+// ResultStamp — the envelope facts the Command does not carry
+// ---------------------------------------------------------------------------
+
+/// The log-envelope facts a driver stamps onto a result `Event` that the
+/// `Command` itself does not carry: the counterpart `edge` a CONVERSATION result
+/// (the model call) routes to, the distinct `app_edge` an agent SURFACE-WRITE
+/// result routes to, the logical `at` tick it is recorded at, and the `wall`-time
+/// the shell observed when it appended. The tick driver (the caller) owns these;
+/// the effects driver only needs them to wrap the `LogicalInput` it produces.
+///
+/// `edge` and `app_edge` are DISTINCT so the per-edge mode projection (Inv 19)
+/// folds the human conversation and the agent's surface drive INDEPENDENTLY: an
+/// agent `set_value` write recorded on `app_edge` makes `mode(app_edge)` fold
+/// `Driven` (agent-only) even while the human conversation edge stays `Assisted`
+/// (Human + Agent) — concurrent per-edge modes. See docs/agent/world/ecs-runtime.md
+/// (Event envelope; Mode-as-projection).
+#[derive(Debug, Clone, Copy)]
+pub struct ResultStamp {
+    /// The edge a CONVERSATION result (model call / compaction) routes to.
+    pub edge: EdgeId,
+    /// The DISTINCT edge an agent SURFACE-WRITE result (the `set_value`
+    /// `ToolReturned`) routes to, so `mode(app_edge)` folds `Driven` while the
+    /// human conversation edge is unaffected.
+    pub app_edge: EdgeId,
+    pub at: Tick,
+    pub wall: Option<Timestamp>,
+}
+
+// ---------------------------------------------------------------------------
+// LIVE driver — dispatch the effect, log-before-apply, feed the result back
+// ---------------------------------------------------------------------------
+
+/// The LIVE driver: dispatch each emitted `CallModel`, performing the real model
+/// call, and feed its recorded result back as the next Input.
+///
+/// For each `CallModel` it first WRITE-AHEADS a stratum-2
+/// `CommandDispatched` dispatch-intent (intent before commitment, Inv 5) BEFORE
+/// performing the effect, carrying the `ActorCtx` (the durable `cmd → ctx` index,
+/// Theme 1b/Inv 17), the `IdempotencyKey = (app_id, tick, effect_id)`, and the
+/// request `Fingerprint`. It then assembles the `/v1/messages` body via
+/// `MessageBuilder`, calls the `ModelCaller`, and builds the result
+/// `LogicalInput` — `ModelResponded` on success, `ModelFailed` on a call error
+/// (a failed call is a RECORDED Input that drives the failure edge, not a driver
+/// error) — whose `entity`/`origin`/`edge` INHERIT from the dispatch-intent's
+/// `ctx`. It APPENDS the wrapping `Event` to the stratum-1 log BEFORE returning
+/// it (log-before-apply, Inv 4), so the result is durable before any System folds
+/// it. Genuine infrastructure failures (body assembly, log append) propagate via
+/// `?`.
+///
+/// `effect_id` is the intra-tick ORDINAL of an effectful Command within this
+/// emitted list. The dispatch tick is `stamp.at`; the supervisor-owned `app_id`
+/// is threaded by the resume path (a later milestone), so P2-wal records the
+/// key shape with a default `AppId` placeholder.
+///
+/// P0 has no system-prompt assembly (a later concern), so the request is built
+/// with an empty `system`.
+///
+/// A `set_value` surface `RunTool` executes here too: the live driver forwards a
+/// surface drive out the injected `surface_driver` sink (the LIVE-only effect) and
+/// appends a `ToolReturned` carrying the `{"surface_ops":[...]}` projection
+/// envelope and a UI-request `Fingerprint` that folds the perceived surface state
+/// (Inv 18). `surfaces` is the World's perceived `SurfaceView` (`Resources.surfaces`)
+/// the fingerprint reads so a re-emit diverges exactly when the manipulated surface
+/// changed (Theme 2b). The agent UI write's SOLE record is that one `ToolReturned`;
+/// the drive is never re-sent on replay (the REPLAY driver takes no `surface_driver`).
+pub async fn drive_live<C, S, L>(
+    commands: &[Command],
+    stamp: ResultStamp,
+    surfaces: &SurfaceView,
+    client: &C,
+    surface_driver: &S,
+    log: &mut L,
+) -> Result<Vec<Event>, Error>
+where
+    C: ModelCaller,
+    S: SurfaceDriver,
+    L: EventLog,
+{
+    let mut results = Vec::with_capacity(commands.len());
+    // The intra-tick effect ordinal: the n-th EFFECTFUL Command this tick. Reset
+    // per `drive_live` call (one call drives one tick's Commands).
+    let mut effect_id: EffectId = 0;
+    for command in commands {
+        match command {
+            Command::CallModel {
+                cmd,
+                entity,
+                messages,
+                tools,
+                params,
+                ..
+            } => {
+                let fingerprint = fingerprint_call(messages, tools, params)?;
+                // The durable cmd → ctx index: a model call serves the agent's turn
+                // (`origin = Agent`) on the relationship the turn serves (`edge`).
+                let ctx = ActorCtx {
+                    entity: *entity,
+                    origin: Origin::Agent,
+                    edge: stamp.edge,
+                };
+                let key = IdempotencyKey {
+                    app_id: AppId::default(),
+                    tick: stamp.at,
+                    effect_id,
+                };
+                // Write-ahead the dispatch-intent BEFORE acting (Inv 5). Neutral on
+                // replay; read only by resume.
+                let dispatched = LifecycleEvent::CommandDispatched {
+                    at: stamp.at,
+                    cmd: *cmd,
+                    kind: EffectKind::CallModel,
+                    ctx,
+                    key,
+                    fingerprint: fingerprint.clone(),
+                };
+                log.append_lifecycle(&dispatched)?;
+                effect_id += 1;
+
+                // Resolve the command's tool NAMES to their declarations so the
+                // request tells the model which tools exist (an empty ToolSet
+                // resolves to none → the body omits `tools`, byte-identical to a
+                // tool-less call).
+                let tool_schemas = resolve_tools(tools);
+                let body = MessageBuilder::new("", params, messages)
+                    .with_tools(&tool_schemas)
+                    .build()?;
+                // The result INHERITS its `entity` from the dispatch-intent's `ctx`
+                // (Inv 17), not from a positional scan.
+                let input = match client.call(body).await {
+                    Ok((blocks, meta)) => LogicalInput::ModelResponded {
+                        cmd: *cmd,
+                        entity: ctx.entity,
+                        fingerprint,
+                        blocks,
+                        meta,
+                    },
+                    Err(error) => LogicalInput::ModelFailed {
+                        cmd: *cmd,
+                        entity: ctx.entity,
+                        fingerprint,
+                        error: classify(&error),
+                    },
+                };
+                // The wrapping Event inherits `origin`/`edge` from the same `ctx`.
+                let event = Event {
+                    origin: ctx.origin,
+                    edge: ctx.edge,
+                    at: stamp.at,
+                    wall: stamp.wall,
+                    input,
+                };
+                // Log-before-apply (Inv 4): durable BEFORE it is fed back.
+                log.append(&event)?;
+                results.push(event);
+            }
+            // A `set_value` surface `RunTool` is the one tool with a LIVE executor in
+            // this milestone: it (1) forwards a surface drive out the injected sink so
+            // the imperative shell applies it to the macOS app, and (2) records the
+            // agent UI write as its SOLE fact — a `ToolReturned` carrying the
+            // `{"surface_ops":[...]}` projection envelope and a UI-request
+            // `Fingerprint` that folds the perceived surface state (Inv 18). Other
+            // tools' live drivers arrive with their own milestones; they still consume
+            // an `effect_id` ordinal so a later effectful Command keeps a stable
+            // intra-tick ordinal once their drivers land. See
+            // docs/agent/world/ecs-runtime.md (The agent UI-write echo is one fact).
+            Command::RunTool {
+                cmd,
+                entity,
+                tool,
+                args,
+                ..
+            } if tool == "set_value" => {
+                // The canonical `set_value` encoding carries its ops in
+                // `args["surface_ops"]` (matching the SurfaceDrive frame converter);
+                // a missing/malformed field decodes to no ops (a no-op drive).
+                let ops: Vec<SurfaceOp> = args
+                    .get("surface_ops")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                // The UI-request Fingerprint folds the perceived state of the surface
+                // the ops target (Inv 18 / Theme 2b): a re-emit diverges exactly when
+                // that surface changed.
+                let perceived = perceived_for_ops(surfaces, &ops);
+                let fingerprint = fingerprint_ui_request(tool, args, &perceived)?;
+                // The durable cmd → ctx index: a surface write serves the agent's turn
+                // (`origin = Agent`) on the DISTINCT APP edge (`stamp.app_edge`), NOT
+                // the human conversation `edge`, so `mode(app_edge)` folds `Driven`
+                // (agent-only) while the conversation edge stays unaffected (GAP B /
+                // Inv 19). See docs/agent/world/ecs-runtime.md (Mode-as-projection).
+                let ctx = ActorCtx {
+                    entity: *entity,
+                    origin: Origin::Agent,
+                    edge: stamp.app_edge,
+                };
+                let key = IdempotencyKey {
+                    app_id: AppId::default(),
+                    tick: stamp.at,
+                    effect_id,
+                };
+                // Write-ahead the dispatch-intent BEFORE acting (Inv 5). Neutral on
+                // replay; read only by resume.
+                let dispatched = LifecycleEvent::CommandDispatched {
+                    at: stamp.at,
+                    cmd: *cmd,
+                    kind: EffectKind::RunTool,
+                    ctx,
+                    key,
+                    fingerprint: fingerprint.clone(),
+                };
+                log.append_lifecycle(&dispatched)?;
+                effect_id += 1;
+
+                // The LIVE effect (stratum-2/live-only): forward the drive so the
+                // shell applies it to the macOS app. Replay NEVER re-sends it — the
+                // recorded `ToolReturned` already carries the projection the fold
+                // reproduces.
+                surface_driver.drive(command).await?;
+
+                // The agent UI write's SOLE record: a `ToolReturned` carrying the
+                // projection envelope SurfaceSystem folds ONCE into a version bump —
+                // or an `is_error` result when an op was rejected by the optimistic-
+                // concurrency precondition. `tool_use_id` is empty here; the owning
+                // ToolSystem re-stamps it to the slot's id when it settles.
+                let result = vec![surface_tool_result("", surfaces, &ops)?];
+                let input = LogicalInput::ToolReturned {
+                    cmd: *cmd,
+                    entity: ctx.entity,
+                    fingerprint,
+                    result,
+                };
+                // The wrapping Event inherits `origin`/`edge` from the same `ctx`.
+                let event = Event {
+                    origin: ctx.origin,
+                    edge: ctx.edge,
+                    at: stamp.at,
+                    wall: stamp.wall,
+                    input,
+                };
+                // Log-before-apply (Inv 4): durable BEFORE it is fed back.
+                log.append(&event)?;
+                results.push(event);
+            }
+            // Other EFFECTFUL Commands (live dispatch arrives in later milestones)
+            // still CONSUME an `effect_id` ordinal, so a `CallModel` emitted after
+            // them keeps a stable intra-tick ordinal once their drivers land.
+            Command::RunTool { .. } | Command::RequestHumanAction { .. } => {
+                effect_id += 1;
+            }
+            // `Compact` is a model call that summarizes the oldest `upto` History
+            // messages; it uses the same write-ahead / log-before-apply / fingerprint
+            // discipline as `CallModel`. On success it produces `Compacted`; on
+            // failure `ModelFailed` (best-effort — compaction failure is not a sink).
+            // See docs/agent/world/ecs-runtime.md (Context-window compaction; Compact↔Compacted).
+            Command::Compact {
+                cmd,
+                entity,
+                messages,
+                params,
+                ..
+            } => {
+                let fingerprint = fingerprint_compact(messages, params)?;
+                let ctx = ActorCtx {
+                    entity: *entity,
+                    origin: Origin::Agent,
+                    edge: stamp.edge,
+                };
+                let key = IdempotencyKey {
+                    app_id: AppId::default(),
+                    tick: stamp.at,
+                    effect_id,
+                };
+                // Write-ahead the dispatch-intent BEFORE acting (Inv 5).
+                let dispatched = LifecycleEvent::CommandDispatched {
+                    at: stamp.at,
+                    cmd: *cmd,
+                    kind: EffectKind::Compact,
+                    ctx,
+                    key,
+                    fingerprint: fingerprint.clone(),
+                };
+                log.append_lifecycle(&dispatched)?;
+                effect_id += 1;
+
+                // Build the summarization request: system prompt + the history
+                // slice to condense. The model returns the summary blocks.
+                let body = MessageBuilder::new(
+                    "Summarize the following conversation into a single concise \
+                     message that preserves all key information and context \
+                     needed to continue the conversation coherently.",
+                    params,
+                    messages,
+                )
+                .build()?;
+                let input = match client.call(body).await {
+                    Ok((blocks, _meta)) => LogicalInput::Compacted {
+                        cmd: *cmd,
+                        entity: ctx.entity,
+                        fingerprint,
+                        summary: blocks,
+                        replaced: messages.0.len() as u32,
+                    },
+                    Err(error) => LogicalInput::ModelFailed {
+                        cmd: *cmd,
+                        entity: ctx.entity,
+                        fingerprint,
+                        error: classify(&error),
+                    },
+                };
+                let event = Event {
+                    origin: ctx.origin,
+                    edge: ctx.edge,
+                    at: stamp.at,
+                    wall: stamp.wall,
+                    input,
+                };
+                // Log-before-apply (Inv 4): durable BEFORE it is fed back.
+                log.append(&event)?;
+                results.push(event);
+            }
+            // A stratum-2 observability record: APPEND it via `append_lifecycle`
+            // (the driver is the sole lifecycle appender) and produce no stratum-1
+            // result. It is not an effect, so it consumes no `effect_id` ordinal.
+            // This is how a pure System's notice (e.g. the Inbox-overflow
+            // `MessageDropped`) reaches the live log without folding into the World.
+            Command::EmitLifecycle(event) => {
+                log.append_lifecycle(event)?;
+            }
+            // Non-effectful Commands (the cancel/abort duals and `RaiseInteraction`)
+            // carry no idempotency key and consume no ordinal.
+            Command::CancelInference { .. }
+            | Command::CancelTool { .. }
+            | Command::AbortHumanAction { .. }
+            | Command::RaiseInteraction { .. } => {}
+        }
+    }
+    Ok(results)
+}
+
+/// Classify a model-call `Error` into the recorded `ModelError` that drives the
+/// failure edge. The `TurnSystem` later refines transient-vs-terminal retry
+/// policy from this value; the driver only records the failure shape.
+fn classify(error: &Error) -> ModelError {
+    match error {
+        Error::ProviderApi { status, .. } => ModelError::Http(*status),
+        Error::ProviderHttp(e) if e.is_timeout() => ModelError::Timeout,
+        Error::ProviderHttp(e) => ModelError::Transport(e.to_string()),
+        other => ModelError::Transport(other.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REPLAY driver — discard the Command, stand in the logged result
+// ---------------------------------------------------------------------------
+
+/// The outcome of standing in a single emitted `CallModel` during replay.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Replayed {
+    /// The re-emitted request re-hashed to the recorded result's `Fingerprint` →
+    /// reuse the recorded `Event` (the Command is suppressed). The default replay
+    /// path on an unchanged run (Inv 7).
+    Reused(Event),
+    /// The re-emitted request DIVERGES from the recorded result (fingerprint
+    /// mismatch), or the recorded results are exhausted → the fork/edit boundary.
+    /// The caller MUST hand this Command (and every later one on the branch) to
+    /// the LIVE driver. The replay driver NEVER goes live itself (it has no
+    /// client). The transition is one-way: replay → live, exactly once. See
+    /// docs/agent/world/ecs-runtime.md (One-way replay → live handoff).
+    Diverged,
+}
+
+/// A read cursor over the DERIVED result `Event`s recorded in the log, advanced
+/// as the replay driver reuses each one. EXOGENOUS inputs (session header, user
+/// messages) are NOT here — the replay driver only stands in for effect results.
+pub struct ReplayCursor {
+    /// The recorded `ModelResponded`/`ModelFailed` Events, in log order.
+    results: Vec<Event>,
+    /// The next unreused result.
+    pos: usize,
+}
+
+impl ReplayCursor {
+    /// Build a cursor over the DERIVED result Events in `events` (the loaded log),
+    /// preserving log order and skipping EXOGENOUS inputs.
+    pub fn new(events: &[Event]) -> Self {
+        let results = events
+            .iter()
+            .filter(|e| is_derived_result(&e.input))
+            .cloned()
+            .collect();
+        ReplayCursor { results, pos: 0 }
+    }
+
+    /// Take the next recorded result, advancing the cursor.
+    fn next_result(&mut self) -> Option<Event> {
+        let event = self.results.get(self.pos).cloned();
+        if event.is_some() {
+            self.pos += 1;
+        }
+        event
+    }
+}
+
+/// The REPLAY driver: DISCARD the emitted Commands and stand in the already-logged
+/// result for each, reusing it ONLY while the re-emitted request re-hashes to the
+/// recorded `Fingerprint`.
+///
+/// For each `CallModel` it recomputes the request `Fingerprint` and compares it to
+/// the next recorded result's: a MATCH reuses that recorded `Event` (`Reused`); a
+/// MISMATCH — or an exhausted log — is the fork/edit boundary (`Diverged`), at
+/// which the run flips one-way to live and the caller takes over from this
+/// Command onward. The driver makes NO model call (it takes no `ModelCaller`), so
+/// replay reconstructs the World with zero model calls (Inv 6/7).
+pub fn drive_replay(commands: &[Command], cursor: &mut ReplayCursor) -> Result<Vec<Replayed>, Error> {
+    let mut out = Vec::with_capacity(commands.len());
+    for command in commands {
+        match command {
+            Command::CallModel {
+                messages,
+                tools,
+                params,
+                ..
+            } => {
+                let emitted = fingerprint_call(messages, tools, params)?;
+                match cursor.next_result() {
+                    Some(event)
+                        if recorded_fingerprint(&event.input) == Some(&emitted) =>
+                    {
+                        out.push(Replayed::Reused(event));
+                    }
+                    // Mismatch (stale recorded result) or exhausted log → boundary;
+                    // the run goes live from here. One-way, so stop replaying.
+                    _ => {
+                        out.push(Replayed::Diverged);
+                        break;
+                    }
+                }
+            }
+            // `Compact` is fingerprinted like `CallModel`: the replay driver
+            // reuses the logged `Compacted` / `ModelFailed` only while the
+            // re-emitted compaction request hashes identically to the recorded
+            // result's fingerprint (content-addressed replay, Inv 7).
+            Command::Compact { messages, params, .. } => {
+                let emitted = fingerprint_compact(messages, params)?;
+                match cursor.next_result() {
+                    Some(event)
+                        if recorded_fingerprint(&event.input) == Some(&emitted) =>
+                    {
+                        out.push(Replayed::Reused(event));
+                    }
+                    _ => {
+                        out.push(Replayed::Diverged);
+                        break;
+                    }
+                }
+            }
+            // `EmitLifecycle` is a stratum-2 observability record, neutral on
+            // replay: DISCARD it so the replay fold stays byte-identical (the
+            // World change it reports is already reproduced by the stratum-1 fold).
+            Command::EmitLifecycle(_) => {}
+            // P1a Commands: replay drivers for these Commands arrive with their
+            // respective milestones. The replay driver skips them here so it
+            // remains compilable while Systems are added incrementally.
+            Command::CancelInference { .. }
+            | Command::RunTool { .. }
+            | Command::CancelTool { .. }
+            | Command::RequestHumanAction { .. }
+            | Command::AbortHumanAction { .. }
+            | Command::RaiseInteraction { .. } => {}
+        }
+    }
+    Ok(out)
+}
+
+/// Whether a `LogicalInput` is a DERIVED effect result the replay driver stands
+/// in for. Only fingerprinted DERIVED variants qualify — the named non-
+/// fingerprinted exceptions (`ChildReturned`, `ToolAborted`, `HumanActionAborted`)
+/// are in-World identity-correlated results, not shell-dispatched effect results.
+fn is_derived_result(input: &LogicalInput) -> bool {
+    matches!(
+        input,
+        LogicalInput::ModelResponded { .. }
+            | LogicalInput::ModelFailed { .. }
+            | LogicalInput::InferenceCancelled { .. }
+            | LogicalInput::ToolReturned { .. }
+            | LogicalInput::HumanActionDone { .. }
+            | LogicalInput::Compacted { .. }
+    )
+}
+
+/// The recorded request `Fingerprint` a fingerprinted DERIVED result carries,
+/// used to gate reuse against the freshly re-emitted request. Returns `None`
+/// for EXOGENOUS inputs and the named non-fingerprinted DERIVED exceptions
+/// (`ChildReturned`, `ToolAborted`, `HumanActionAborted`).
+fn recorded_fingerprint(input: &LogicalInput) -> Option<&Fingerprint> {
+    match input {
+        LogicalInput::ModelResponded { fingerprint, .. }
+        | LogicalInput::ModelFailed { fingerprint, .. }
+        | LogicalInput::InferenceCancelled { fingerprint, .. }
+        | LogicalInput::ToolReturned { fingerprint, .. }
+        | LogicalInput::HumanActionDone { fingerprint, .. }
+        | LogicalInput::Compacted { fingerprint, .. } => Some(fingerprint),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RESUME (crash recovery) — reconcile outstanding dispatch-intents on the
+// replay → resume edge
+// ---------------------------------------------------------------------------
+
+/// The reconciliation of ONE outstanding `CommandDispatched` on resume — a
+/// dispatch-intent whose effect was in flight when the App crashed (written, but
+/// its result Input never logged). See docs/agent/world/ecs-runtime.md
+/// (Reconciliation = the replay→resume edge; Inv 5).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reconciliation {
+    /// A synthesised stratum-1 result was LOGGED (and is returned here): a
+    /// `Thinking` crash's `InferenceCancelled { reason: Crash }`, or a
+    /// non-idempotent effectful tool's `is_error` `ToolReturned`
+    /// (surfaced-as-failed). The crash is a REAL logical Input — not a silent
+    /// rewind — so the entity settles deterministically when the reducer folds
+    /// it (Thinking → Idle), and replay reproduces it. After settling,
+    /// Autonomy/budget decides a FRESH, accounted retry (new `cmd`, new `key`);
+    /// that retry is named here, not performed.
+    Settled(Event),
+
+    /// An idempotent / key-deduped effect is safe to re-present: the SAME
+    /// idempotency `key` is re-dispatched so the downstream dedupes the second
+    /// attempt (effectively-once = at-least-once + idempotency). resume NAMES the
+    /// re-dispatch by surfacing the outstanding dispatch's `cmd`/`kind`/`key`; the
+    /// live driver reconstructs the request payload from the rebuilt World's tail
+    /// Activity and re-emits under this key. See docs/agent/world/ecs-runtime.md
+    /// (Reconciliation table — "re-dispatch (same key)").
+    Redispatch {
+        cmd: CmdId,
+        kind: EffectKind,
+        key: IdempotencyKey,
+    },
+}
+
+/// The RESUME (live-recovery) phase of crash recovery, the second half of the
+/// asymmetric replay → resume edge: after replay has rebuilt the World by folding
+/// stratum-1 Inputs (suppressing every emitted Command), resume scans the
+/// stratum-2 dispatch-intents for any `CommandDispatched` whose `cmd` has NO
+/// matching terminal result in the stratum-1 tail — an effect that was in flight
+/// at the crash (intent written before commitment, Inv 5) — and reconciles each
+/// per its `EffectKind`:
+///
+/// - `CallModel` (a `Thinking` tail) → synthesise AND LOG a stratum-1
+///   `InferenceCancelled { cmd, entity, fingerprint, partial: None, reason: Crash }`
+///   so the entity settles. The crash's behavioral effect becomes a real logical
+///   Input (not a neutral lifecycle trace), so budget/Autonomy see it and replay
+///   reproduces it.
+/// - `RunTool` (a non-idempotent effectful tool) → synthesise AND LOG a stratum-1
+///   `ToolReturned` carrying an `is_error` `ToolResult` ("effect interrupted by
+///   crash; not safely retryable"). Absent a recorded `ToolEffect` proving the
+///   tool is Observational or Effectful·idempotent (that classification is a later
+///   milestone), surfacing-as-failed is the only SAFE reconciliation — the design
+///   rule is "re-run ONLY if idempotent, otherwise surface-as-failed".
+/// - `RequestHumanAction` / `SendPeer` / `ScheduleTimer` / `Compact` → re-dispatch
+///   with the SAME `key` (`Redispatch`); the downstream dedupes by key so the
+///   effect commits effectively-once.
+///
+/// Each synthesised result fills `cmd`/`entity`/`fingerprint` from the outstanding
+/// `CommandDispatched` and inherits its Event envelope `origin`/`edge` from the
+/// recorded `ctx` (Inv 17), so it correlates by IDENTITY exactly like a real
+/// result. Synthesised results are appended to the stratum-1 tail BEFORE being
+/// returned (log-before-apply, Inv 4), each at its own fresh tick after the loaded
+/// log (one Input per tick). `events`/`lifecycle` are the loaded stratum-1 /
+/// stratum-2 streams; `log` is the same log they were loaded from.
+pub fn resume<L>(
+    events: &[Event],
+    lifecycle: &[LifecycleEvent],
+    log: &mut L,
+) -> Result<Vec<Reconciliation>, Error>
+where
+    L: EventLog,
+{
+    // The `cmd`s that ALREADY have a terminal result in the stratum-1 tail. A
+    // dispatch-intent whose `cmd` is absent here is an outstanding effect. A
+    // deterministic `BTreeSet` (never a `HashMap`) keeps membership lookup free of
+    // a hidden ordering input (Inv 8).
+    let resolved: BTreeSet<CmdId> = events.iter().filter_map(|e| result_cmd(&e.input)).collect();
+
+    // The resume phase appends synthesised results to the tail; each settles at its
+    // own fresh tick after the loaded log (one Input per tick, Inv 12).
+    let mut next_at: Tick = events.iter().map(|e| e.at).max().map_or(0, |m| m + 1);
+
+    let mut out = Vec::new();
+    for record in lifecycle {
+        let LifecycleEvent::CommandDispatched {
+            cmd,
+            kind,
+            ctx,
+            key,
+            fingerprint,
+            ..
+        } = record
+        else {
+            // The other stratum-2 records are behaviorally neutral trace; only a
+            // dispatch-intent is load-bearing for recovery.
+            continue;
+        };
+        // A dispatch whose result is already logged committed before the crash —
+        // nothing to reconcile.
+        if resolved.contains(cmd) {
+            continue;
+        }
+
+        let outcome = reconcile(*cmd, *kind, *ctx, key.clone(), fingerprint.clone(), next_at);
+        if let Reconciliation::Settled(event) = &outcome {
+            // Log-before-apply (Inv 4): the synthesised Input is durable BEFORE any
+            // System folds it.
+            log.append(event)?;
+            next_at += 1;
+        }
+        out.push(outcome);
+    }
+    Ok(out)
+}
+
+/// The per-`EffectKind` reconciliation policy for one outstanding dispatch — a
+/// PURE function of the recorded dispatch facts and the resume tick `at`. The
+/// caller logs a `Settled` event; this only constructs it. See
+/// docs/agent/world/ecs-runtime.md (Reconciliation table).
+fn reconcile(
+    cmd: CmdId,
+    kind: EffectKind,
+    ctx: ActorCtx,
+    key: IdempotencyKey,
+    fingerprint: Fingerprint,
+    at: Tick,
+) -> Reconciliation {
+    /// Wrap a synthesised `LogicalInput` in its Event envelope, inheriting
+    /// `origin`/`edge` from the dispatch's `ctx` (Inv 17). `wall` is `None` — the
+    /// crash moment was never observed, and a `None` wall leaves `Resources.wall`
+    /// untouched when folded.
+    fn settle(ctx: ActorCtx, at: Tick, input: LogicalInput) -> Reconciliation {
+        Reconciliation::Settled(Event {
+            origin: ctx.origin,
+            edge: ctx.edge,
+            at,
+            wall: None,
+            input,
+        })
+    }
+
+    match kind {
+        // A `Thinking` crash: the synthesised cancellation settles the entity.
+        EffectKind::CallModel => settle(
+            ctx,
+            at,
+            LogicalInput::InferenceCancelled {
+                cmd,
+                entity: ctx.entity,
+                fingerprint,
+                partial: None,
+                reason: CancelReason::Crash,
+            },
+        ),
+        // A non-idempotent effectful tool: surface-as-failed (the safe default —
+        // idempotency is unprovable without a recorded `ToolEffect`). The slot's
+        // owning System re-stamps the result's `tool_use_id`; the `is_error` flag
+        // is what crosses, so the model sees a well-formed failed `tool_result`.
+        EffectKind::RunTool => settle(
+            ctx,
+            at,
+            LogicalInput::ToolReturned {
+                cmd,
+                entity: ctx.entity,
+                fingerprint,
+                result: vec![Block::ToolResult {
+                    tool_use_id: String::new(),
+                    content: vec![Block::Text {
+                        text: "effect interrupted by crash; not safely retryable".into(),
+                    }],
+                    is_error: true,
+                }],
+            },
+        ),
+        // Key-deduped effects: re-present the SAME key; the downstream dedupes.
+        EffectKind::RequestHumanAction
+        | EffectKind::SendPeer
+        | EffectKind::ScheduleTimer
+        | EffectKind::Compact => Reconciliation::Redispatch { cmd, kind, key },
+    }
+}
+
+/// The `cmd` a terminal DERIVED result settles, used to detect an outstanding
+/// dispatch (a `CommandDispatched` whose `cmd` has no such result in the tail).
+/// Covers every `cmd`-correlated result, including the non-fingerprinted abort
+/// acks. `ChildReturned` is identity-correlated (no `cmd`) and the EXOGENOUS
+/// inputs carry none — both yield `None`.
+fn result_cmd(input: &LogicalInput) -> Option<CmdId> {
+    match input {
+        LogicalInput::ModelResponded { cmd, .. }
+        | LogicalInput::ModelFailed { cmd, .. }
+        | LogicalInput::InferenceCancelled { cmd, .. }
+        | LogicalInput::ToolReturned { cmd, .. }
+        | LogicalInput::ToolAborted { cmd, .. }
+        | LogicalInput::HumanActionDone { cmd, .. }
+        | LogicalInput::HumanActionAborted { cmd, .. }
+        | LogicalInput::Compacted { cmd, .. } => Some(*cmd),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::world::event_log::{EventLog, MemoryEventLog};
+    use crate::agent::world::history::{Block, History, Msg, Role};
+    use crate::agent::world::inputs::{
+        Capabilities, Event, LogicalInput, ModelMeta, Origin, ReasoningPolicy, StopReason, Usage,
+    };
+    use crate::agent::world::world::{Effort, ModelConfig};
+
+    /// A model client that fails loudly if invoked. The replay driver takes NO
+    /// client (it cannot make a call by construction, Inv 6); this stand-in makes
+    /// that guarantee explicit — were any replay path to call a client, the test
+    /// would panic here.
+    struct ExplodingClient;
+
+    impl ModelCaller for ExplodingClient {
+        async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+            panic!("the replay driver must never invoke the model client");
+        }
+    }
+
+    fn sample_params() -> ModelConfig {
+        ModelConfig {
+            model: "claude-x".into(),
+            max_tokens: 1024,
+            effort: Effort::Medium,
+        }
+    }
+
+    fn sample_call(cmd: CmdId, text: &str) -> Command {
+        Command::CallModel {
+            cmd,
+            entity: 0,
+            messages: History(vec![Msg {
+                role: Role::User,
+                content: vec![Block::Text { text: text.into() }],
+            }]),
+            tools: ToolSet::default(),
+            params: sample_params(),
+            key: CommandKey,
+        }
+    }
+
+    /// Build the `ModelResponded` Event the live driver WOULD have recorded for
+    /// `command`, carrying that request's fingerprint — the recorded result the
+    /// replay driver stands in.
+    fn recorded_response_for(command: &Command, at: Tick) -> Event {
+        let Command::CallModel {
+            cmd,
+            entity,
+            messages,
+            tools,
+            params,
+            ..
+        } = command
+        else {
+            panic!("expected CallModel");
+        };
+        let fingerprint = fingerprint_call(messages, tools, params).expect("fingerprint");
+        Event {
+            origin: Origin::Agent,
+            edge: 0,
+            at,
+            wall: Some(1_700_000_000),
+            input: LogicalInput::ModelResponded {
+                cmd: *cmd,
+                entity: *entity,
+                fingerprint,
+                blocks: vec![Block::Text {
+                    text: "recorded answer".into(),
+                }],
+                meta: ModelMeta {
+                    usage: Usage {
+                        input_tokens: 5,
+                        output_tokens: 3,
+                    },
+                    model_id: "claude-x-2026".into(),
+                    stop_reason: StopReason::EndTurn,
+                    capabilities: Capabilities(serde_json::json!({})),
+                    reasoning: ReasoningPolicy::Drop,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn replay_reuses_recorded_result_and_never_calls_the_client() {
+        let command = sample_call(0, "hello");
+        let recorded = recorded_response_for(&command, 2);
+
+        // Pre-load a MemoryEventLog with an EXOGENOUS header (which the cursor must
+        // skip) and the recorded result.
+        let mut log = MemoryEventLog::new();
+        log.append(&Event {
+            origin: Origin::System,
+            edge: 0,
+            at: 0,
+            wall: None,
+            input: LogicalInput::SessionStarted {
+                seed: 7,
+                surface_tools: Vec::new(),
+            },
+        })
+        .expect("append header");
+        log.append(&recorded).expect("append recorded result");
+
+        let events = log.load().expect("load");
+        let mut cursor = ReplayCursor::new(&events);
+
+        // The exploding client is constructed to make the guarantee explicit, but
+        // `drive_replay`'s signature takes NO client — it CANNOT be passed, so it
+        // cannot be invoked. (If the replay path ever called a client, the panic
+        // in `ExplodingClient::call` would fail this test.)
+        let _exploding = ExplodingClient;
+
+        let replayed = drive_replay(&[command], &mut cursor).expect("replay");
+
+        assert_eq!(replayed.len(), 1);
+        match &replayed[0] {
+            Replayed::Reused(event) => {
+                assert_eq!(event, &recorded, "replay must feed back the logged Event verbatim");
+            }
+            other => panic!("expected Reused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_diverges_when_the_re_emitted_request_changes() {
+        // Record the result for the ORIGINAL prompt.
+        let original = sample_call(0, "hello");
+        let recorded = recorded_response_for(&original, 2);
+
+        let mut log = MemoryEventLog::new();
+        log.append(&recorded).expect("append recorded result");
+        let events = log.load().expect("load");
+        let mut cursor = ReplayCursor::new(&events);
+
+        // The shell re-emits an EDITED prompt → fingerprint mismatch → the
+        // recorded result is stale → fork boundary, NOT a silent stale reuse.
+        let edited = sample_call(0, "hello, edited");
+        let replayed = drive_replay(&[edited], &mut cursor).expect("replay");
+
+        assert_eq!(replayed, vec![Replayed::Diverged]);
+    }
+
+    #[test]
+    fn fingerprint_is_deterministic_for_the_same_request() {
+        let messages = History(vec![Msg {
+            role: Role::User,
+            content: vec![Block::Text {
+                text: "same request".into(),
+            }],
+        }]);
+        let tools = ToolSet::default();
+        let params = sample_params();
+
+        // Two independent computations of the SAME request hash identically.
+        let a = fingerprint_call(&messages, &tools, &params).expect("fp a");
+        let b = fingerprint_call(&messages, &tools, &params).expect("fp b");
+        assert_eq!(a, b, "the same request must yield the same Fingerprint");
+
+        // A changed request hashes differently (content-addressed).
+        let other = History(vec![Msg {
+            role: Role::User,
+            content: vec![Block::Text {
+                text: "a different request".into(),
+            }],
+        }]);
+        let c = fingerprint_call(&other, &tools, &params).expect("fp c");
+        assert_ne!(a, c, "a different request must yield a different Fingerprint");
+    }
+
+    // --- P2-wal: write-ahead dispatch-intent + ctx inheritance --------------
+
+    /// A model client that returns a fixed successful response, so the live
+    /// driver produces a `ModelResponded` without a network.
+    struct StubClient;
+
+    impl ModelCaller for StubClient {
+        async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+            Ok((
+                vec![Block::Text { text: "ok".into() }],
+                ModelMeta {
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                    model_id: "claude-x-2026".into(),
+                    stop_reason: StopReason::EndTurn,
+                    capabilities: Capabilities(serde_json::json!({})),
+                    reasoning: ReasoningPolicy::Drop,
+                },
+            ))
+        }
+    }
+
+    /// A `SurfaceDriver` that RECORDS each forwarded drive Command, so a test can
+    /// assert exactly one surface drive was emitted for a `set_value` `RunTool`
+    /// without the macOS app. It is the live-only sink the REPLAY driver never
+    /// receives. A `CallModel`-only drive never reaches it, so it doubles as the
+    /// no-op sink for the model-path tests.
+    #[derive(Default)]
+    struct CapturingSurfaceDriver {
+        drives: std::sync::Mutex<Vec<Command>>,
+    }
+
+    impl SurfaceDriver for CapturingSurfaceDriver {
+        async fn drive(&self, command: &Command) -> Result<(), Error> {
+            self.drives.lock().expect("lock drives").push(command.clone());
+            Ok(())
+        }
+    }
+
+    /// One append against the log, tagged by stratum, preserving INTERLEAVED
+    /// order so a test can assert the write-ahead dispatch-intent (stratum 2)
+    /// lands BEFORE the result Event (stratum 1).
+    #[derive(Clone)]
+    enum Appended {
+        Stratum1(Event),
+        Stratum2(LifecycleEvent),
+    }
+
+    /// An `EventLog` that records the interleaved append order across BOTH
+    /// strata, so ordering between a stratum-2 dispatch-intent and a stratum-1
+    /// result is observable (the parallel-stream logs cannot show interleaving).
+    #[derive(Default)]
+    struct OrderedLog {
+        appended: Vec<Appended>,
+    }
+
+    impl EventLog for OrderedLog {
+        fn append(&mut self, event: &Event) -> Result<(), Error> {
+            self.appended.push(Appended::Stratum1(event.clone()));
+            Ok(())
+        }
+        fn load(&self) -> Result<Vec<Event>, Error> {
+            Ok(self
+                .appended
+                .iter()
+                .filter_map(|a| match a {
+                    Appended::Stratum1(e) => Some(e.clone()),
+                    Appended::Stratum2(_) => None,
+                })
+                .collect())
+        }
+        fn append_lifecycle(&mut self, event: &LifecycleEvent) -> Result<(), Error> {
+            self.appended.push(Appended::Stratum2(event.clone()));
+            Ok(())
+        }
+        fn load_lifecycle(&self) -> Result<Vec<LifecycleEvent>, Error> {
+            Ok(self
+                .appended
+                .iter()
+                .filter_map(|a| match a {
+                    Appended::Stratum2(e) => Some(e.clone()),
+                    Appended::Stratum1(_) => None,
+                })
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn live_driver_write_aheads_dispatch_intent_before_the_result_event() {
+        let command = sample_call(3, "hi");
+        let stamp = ResultStamp {
+            edge: 9,
+            app_edge: 1,
+            at: 5,
+            wall: Some(1_700_000_000),
+        };
+        let mut log = OrderedLog::default();
+
+        let results = drive_live(
+            &[command],
+            stamp,
+            &SurfaceView::new(),
+            &StubClient,
+            &CapturingSurfaceDriver::default(),
+            &mut log,
+        )
+        .await
+        .expect("drive");
+
+        // Ordering (Inv 5): the stratum-2 CommandDispatched is appended BEFORE the
+        // stratum-1 result Event — intent before commitment.
+        assert_eq!(log.appended.len(), 2);
+        assert!(
+            matches!(
+                log.appended[0],
+                Appended::Stratum2(LifecycleEvent::CommandDispatched { .. })
+            ),
+            "the dispatch-intent must be written first"
+        );
+        assert!(
+            matches!(log.appended[1], Appended::Stratum1(_)),
+            "the result Event must be written after the dispatch-intent"
+        );
+
+        // The dispatch-intent carries ctx, key = (app_id, tick, effect_id), and the
+        // request fingerprint.
+        let dispatched = log.load_lifecycle().expect("load lifecycle");
+        let LifecycleEvent::CommandDispatched {
+            cmd,
+            at,
+            kind,
+            ctx,
+            key,
+            fingerprint,
+        } = &dispatched[0]
+        else {
+            panic!("expected CommandDispatched");
+        };
+        assert_eq!(*cmd, 3);
+        assert_eq!(*at, 5);
+        assert_eq!(*kind, EffectKind::CallModel);
+        assert_eq!(ctx.entity, 0);
+        assert_eq!(ctx.origin, Origin::Agent);
+        assert_eq!(ctx.edge, 9);
+        assert_eq!(key.tick, 5);
+        assert_eq!(key.effect_id, 0);
+
+        // The result Event INHERITS entity/origin/edge from the dispatch-intent's
+        // ctx (Inv 17) — not from a positional scan.
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        assert_eq!(result.origin, ctx.origin, "result origin inherited from ctx");
+        assert_eq!(result.edge, ctx.edge, "result edge inherited from ctx");
+        match &result.input {
+            LogicalInput::ModelResponded {
+                entity,
+                cmd: rcmd,
+                fingerprint: rfp,
+                ..
+            } => {
+                assert_eq!(*entity, ctx.entity, "result entity inherited from ctx");
+                assert_eq!(*rcmd, 3);
+                assert_eq!(rfp, fingerprint, "result fingerprint binds back to the intent");
+            }
+            other => panic!("expected ModelResponded, got {other:?}"),
+        }
+    }
+
+    /// W2-tool-exec: driving a `[RunTool set_value]` through the LIVE driver (1)
+    /// emits EXACTLY ONE surface drive on the injected sink (the macOS-app forward),
+    /// and (2) appends a `ToolReturned` carrying the `{"surface_ops":[...]}`
+    /// projection envelope and a UI-request `Fingerprint`. That recorded result
+    /// folds via `SurfaceSystem` to a surface-version bump — the agent UI write's
+    /// SOLE fact (Inv 18). The model client is NEVER reached (an `ExplodingClient`
+    /// proves it), and the `RunTool` dispatch-intent is write-ahead'd in stratum-2.
+    #[tokio::test]
+    async fn live_driver_executes_set_value_run_tool_emits_drive_and_records_tool_returned() {
+        use crate::agent::world::surface::SurfaceSystem;
+        use crate::agent::world::systems::System;
+        use crate::agent::world::world::{Resources, World};
+
+        // A `set_value` RunTool carrying one surface op in the canonical
+        // `args["surface_ops"]` encoding.
+        let command = Command::RunTool {
+            cmd: 8,
+            entity: 0,
+            tool: "set_value".into(),
+            args: serde_json::json!({
+                "surface_ops": [
+                    { "op": "set_value", "surface": 9, "element": 2, "value": "typed", "base_version": null }
+                ]
+            }),
+            key: CommandKey,
+        };
+        let stamp = ResultStamp {
+            // A surface-write routes to `app_edge` (3), NOT the conversation `edge` (7).
+            edge: 7,
+            app_edge: 3,
+            at: 4,
+            wall: Some(1_700_000_000),
+        };
+        let mut log = MemoryEventLog::new();
+        let sink = CapturingSurfaceDriver::default();
+
+        // The model client must never be invoked for a tool execution: the
+        // ExplodingClient panics if reached.
+        let results = drive_live(
+            &[command],
+            stamp,
+            &SurfaceView::new(),
+            &ExplodingClient,
+            &sink,
+            &mut log,
+        )
+        .await
+        .expect("drive_live executes the set_value RunTool");
+
+        // (1) EXACTLY ONE surface drive was forwarded out the sink — the set_value
+        // RunTool itself (the production sink converts it to a SurfaceDrive frame).
+        {
+            let drives = sink.drives.lock().expect("lock drives");
+            assert_eq!(drives.len(), 1, "exactly one surface drive emitted for set_value");
+            assert!(
+                matches!(&drives[0], Command::RunTool { tool, .. } if tool == "set_value"),
+                "the forwarded drive is the set_value RunTool"
+            );
+        }
+
+        // (2) One ToolReturned result Event, inheriting origin/edge from ctx, carrying
+        // the projection envelope and the UI-request fingerprint.
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        assert_eq!(result.origin, Origin::Agent, "origin inherited from ctx");
+        assert_eq!(
+            result.edge, 3,
+            "a surface-write ToolReturned routes to the DISTINCT app edge (stamp.app_edge), \
+             not the human conversation edge (GAP B)"
+        );
+        match &result.input {
+            LogicalInput::ToolReturned { cmd, entity, .. } => {
+                assert_eq!(*cmd, 8, "result correlates back to the dispatched cmd");
+                assert_eq!(*entity, 0, "entity inherited from ctx");
+            }
+            other => panic!("expected ToolReturned, got {other:?}"),
+        }
+
+        // The recorded ToolReturned folds via SurfaceSystem to a surface-version bump
+        // (0 → 1): the agent write's SOLE record projects the op exactly once (Inv 18),
+        // authoring no separate SurfaceMutated and emitting no Commands.
+        let model = ModelConfig {
+            model: "claude-x".into(),
+            max_tokens: 1024,
+            effort: Effort::Medium,
+        };
+        let world = World::new(0, Resources::new(7, model));
+        let (next, cmds) = SurfaceSystem.step(&world, &result.input);
+        assert!(cmds.is_empty(), "a surface projection emits no Commands");
+        assert_eq!(
+            next.resources.surfaces.get(&9).map(|s| s.version),
+            Some(1),
+            "the recorded ToolReturned folds via SurfaceSystem to a version bump 0→1"
+        );
+
+        // Log-before-apply (Inv 4): the result is durable in stratum-1, and the
+        // RunTool dispatch-intent is write-ahead'd in stratum-2 (Inv 5).
+        assert_eq!(log.load().expect("load").len(), 1, "one ToolReturned appended");
+        assert!(
+            matches!(
+                log.load_lifecycle().expect("load lifecycle").as_slice(),
+                [LifecycleEvent::CommandDispatched {
+                    kind: EffectKind::RunTool,
+                    ..
+                }]
+            ),
+            "the RunTool dispatch-intent is write-ahead'd in stratum-2"
+        );
+    }
+
+    /// [W3-tool-decl] The full tool-declaration round-trip: a model `tool_use`
+    /// named `set_value` (the declared tool) folds through `turn`/`tool` to a
+    /// `Command::RunTool { tool: "set_value", args }` carrying the `tool_use.input`
+    /// VERBATIM, and that `args` is accepted by the W2 live executor — driving the
+    /// RunTool through `drive_live` forwards EXACTLY ONE SurfaceDrive on the
+    /// capturing sink and records ONE `ToolReturned`. This closes the loop W3 opens:
+    /// declaring the tool lets a real model request it, and what it requests
+    /// executes unchanged. The model client is NEVER reached (ExplodingClient).
+    #[tokio::test]
+    async fn set_value_tool_use_round_trips_through_turn_tool_and_executes() {
+        use crate::agent::world::budget::Budget;
+        use crate::agent::world::gates::EntityGate;
+        use crate::agent::world::systems::tick;
+        use crate::agent::world::world::{
+            Activity, Components, Identity, Inbox, Lineage, Resources, World,
+        };
+
+        // The tool_use.input the model would produce for the declared set_value
+        // schema: the EXACT `{ "surface_ops": [...] }` shape the W2 executor parses.
+        let tool_input = serde_json::json!({
+            "surface_ops": [
+                { "op": "set_value", "surface": 9, "element": 2, "value": "typed", "base_version": null }
+            ]
+        });
+
+        // An Idle primary entity ready to take a turn.
+        let model = ModelConfig {
+            model: "claude-x".into(),
+            max_tokens: 1024,
+            effort: Effort::Medium,
+        };
+        let mut world = World::new(0, Resources::new(7, model));
+        world.entities.insert(
+            0,
+            Components {
+                identity: Identity::Primary,
+                lineage: Lineage { parent: None, depth: 0 },
+                history: History::default(),
+                activity: Activity::Idle,
+                gate: EntityGate::default(),
+                budget: Budget::default(),
+                inbox: Inbox::default(),
+                turns: 0,
+                model: None,
+            },
+        );
+
+        // A user message opens the turn → CallModel (entity → Thinking on turn_cmd).
+        let user = Event {
+            origin: Origin::Human,
+            edge: 0,
+            at: 1,
+            wall: None,
+            input: LogicalInput::UserMessage {
+                to: 0,
+                text: "type into the field".into(),
+            },
+        };
+        let (world, commands) = tick(&world, &user);
+        let turn_cmd = commands
+            .iter()
+            .find_map(|c| match c {
+                Command::CallModel { cmd, .. } => Some(*cmd),
+                _ => None,
+            })
+            .expect("the turn emits a CallModel");
+
+        // The model responds with a `set_value` tool_use (stop_reason ToolUse):
+        // TurnSystem branches into ResolvingToolUses; ToolSystem emits the RunTool.
+        let responded = Event {
+            origin: Origin::Agent,
+            edge: 0,
+            at: 2,
+            wall: None,
+            input: LogicalInput::ModelResponded {
+                cmd: turn_cmd,
+                entity: 0,
+                fingerprint: Fingerprint("fp".into()),
+                blocks: vec![Block::ToolUse {
+                    id: "tu_set_value".into(),
+                    name: "set_value".into(),
+                    input: tool_input.clone(),
+                }],
+                meta: ModelMeta {
+                    usage: Usage::default(),
+                    model_id: "claude-x".into(),
+                    stop_reason: StopReason::ToolUse,
+                    capabilities: Capabilities(serde_json::json!({})),
+                    reasoning: ReasoningPolicy::Drop,
+                },
+            },
+        };
+        let (_world, commands) = tick(&world, &responded);
+
+        // The set_value tool_use folded to a RunTool carrying the input VERBATIM.
+        let run_tool = commands
+            .into_iter()
+            .find(|c| matches!(c, Command::RunTool { tool, .. } if tool == "set_value"))
+            .expect("a set_value tool_use must fold to a RunTool");
+        match &run_tool {
+            Command::RunTool { tool, args, .. } => {
+                assert_eq!(tool, "set_value");
+                assert_eq!(
+                    args, &tool_input,
+                    "the RunTool carries the model tool_use.input unchanged (the W2 executor args)"
+                );
+            }
+            other => panic!("expected RunTool, got {other:?}"),
+        }
+
+        // The W2 executor must ACCEPT those args: drive the RunTool through the LIVE
+        // driver with a capturing sink → exactly one SurfaceDrive + one ToolReturned.
+        let stamp = ResultStamp {
+            edge: 0,
+            app_edge: 1,
+            at: 9,
+            wall: None,
+        };
+        let mut log = MemoryEventLog::new();
+        let sink = CapturingSurfaceDriver::default();
+        let results = drive_live(
+            std::slice::from_ref(&run_tool),
+            stamp,
+            &SurfaceView::new(),
+            &ExplodingClient,
+            &sink,
+            &mut log,
+        )
+        .await
+        .expect("the W2 executor accepts the round-tripped set_value args");
+
+        {
+            let drives = sink.drives.lock().expect("lock drives");
+            assert_eq!(
+                drives.len(),
+                1,
+                "exactly one surface drive forwarded for the round-tripped set_value"
+            );
+        }
+        assert_eq!(results.len(), 1, "one ToolReturned recorded — the agent UI write's sole fact");
+        assert!(
+            matches!(results[0].input, LogicalInput::ToolReturned { .. }),
+            "the executor records a ToolReturned for the accepted args"
+        );
+    }
+
+    /// (A) GAP A end-to-end: driving a `CallModel` whose `ToolSet` carries
+    /// `set_value` through the LIVE driver assembles a `/v1/messages` request body
+    /// whose `tools` array declares the `set_value` schema — so the model is now TOLD
+    /// the tool EXISTS and can return a `set_value` tool_use (it provably could not
+    /// before, when every CallModel carried an empty ToolSet). A `CallModel` with an
+    /// empty `ToolSet` omits the `tools` key entirely (byte-identical to a pre-tools
+    /// call). The model client captures the assembled body to assert on it.
+    #[tokio::test]
+    async fn live_driver_declares_set_value_tool_on_a_surface_capable_call_model() {
+        /// A client that CAPTURES the assembled request body, then returns a stub
+        /// reply — so a test can assert the body declares the offered tools.
+        #[derive(Default)]
+        struct BodyCapturingClient {
+            body: std::sync::Mutex<Option<Json>>,
+        }
+        impl ModelCaller for BodyCapturingClient {
+            async fn call(&self, request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+                *self.body.lock().expect("lock body") = Some(request_body);
+                Ok((
+                    vec![Block::Text { text: "ok".into() }],
+                    ModelMeta {
+                        usage: Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                        },
+                        model_id: "claude-x-2026".into(),
+                        stop_reason: StopReason::EndTurn,
+                        capabilities: Capabilities(serde_json::json!({})),
+                        reasoning: ReasoningPolicy::Drop,
+                    },
+                ))
+            }
+        }
+
+        let stamp = ResultStamp {
+            edge: 0,
+            app_edge: 1,
+            at: 1,
+            wall: None,
+        };
+
+        // A surface-capable CallModel: its ToolSet carries `set_value`.
+        let surface_call = Command::CallModel {
+            cmd: 1,
+            entity: 0,
+            messages: History(vec![Msg {
+                role: Role::User,
+                content: vec![Block::Text {
+                    text: "type into the field".into(),
+                }],
+            }]),
+            tools: ToolSet(vec!["set_value".into()]),
+            params: sample_params(),
+            key: CommandKey,
+        };
+        let client = BodyCapturingClient::default();
+        let mut log = MemoryEventLog::new();
+        drive_live(
+            &[surface_call],
+            stamp,
+            &SurfaceView::new(),
+            &client,
+            &CapturingSurfaceDriver::default(),
+            &mut log,
+        )
+        .await
+        .expect("drive the surface-capable CallModel");
+
+        let body = client
+            .body
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("a request body was assembled");
+        let tools = body["tools"].as_array().expect("the body declares a `tools` array");
+        assert_eq!(tools.len(), 1, "exactly the one declared surface tool");
+        assert_eq!(tools[0]["name"], "set_value", "the model is told `set_value` EXISTS");
+        assert_eq!(
+            tools[0]["input_schema"]["type"], "object",
+            "the declaration carries the set_value input_schema"
+        );
+
+        // A tool-less CallModel (empty ToolSet) omits the `tools` key entirely —
+        // byte-identical to a pre-tools call (replay/fingerprint stability).
+        let plain_call = Command::CallModel {
+            cmd: 2,
+            entity: 0,
+            messages: History(vec![Msg {
+                role: Role::User,
+                content: vec![Block::Text { text: "hi".into() }],
+            }]),
+            tools: ToolSet::default(),
+            params: sample_params(),
+            key: CommandKey,
+        };
+        let plain_client = BodyCapturingClient::default();
+        let mut plain_log = MemoryEventLog::new();
+        drive_live(
+            &[plain_call],
+            stamp,
+            &SurfaceView::new(),
+            &plain_client,
+            &CapturingSurfaceDriver::default(),
+            &mut plain_log,
+        )
+        .await
+        .expect("drive the tool-less CallModel");
+        let plain_body = plain_client.body.lock().expect("lock").clone().expect("body");
+        assert!(
+            plain_body.get("tools").is_none(),
+            "an empty ToolSet omits the `tools` key (byte-identical to a pre-tools call)"
+        );
+    }
+
+    #[test]
+    fn replay_fold_ignores_stratum_two_records() {
+        // The recorded result for an original prompt.
+        let command = sample_call(0, "hello");
+        let recorded = recorded_response_for(&command, 2);
+        let LogicalInput::ModelResponded { fingerprint, .. } = &recorded.input else {
+            panic!("expected ModelResponded fixture");
+        };
+        let dispatch = LifecycleEvent::CommandDispatched {
+            at: 2,
+            cmd: 0,
+            kind: EffectKind::CallModel,
+            ctx: ActorCtx {
+                entity: 0,
+                origin: Origin::Agent,
+                edge: 0,
+            },
+            key: IdempotencyKey {
+                app_id: AppId::default(),
+                tick: 2,
+                effect_id: 0,
+            },
+            fingerprint: fingerprint.clone(),
+        };
+
+        // Log A: the stratum-1 result only.
+        let mut bare = MemoryEventLog::new();
+        bare.append(&recorded).expect("append result");
+
+        // Log B: the SAME stratum-1 result, PLUS stratum-2 dispatch-intents around it.
+        let mut with_wal = MemoryEventLog::new();
+        with_wal.append_lifecycle(&dispatch).expect("append intent");
+        with_wal.append(&recorded).expect("append result");
+        with_wal.append_lifecycle(&dispatch).expect("append intent");
+
+        // The replay path consumes `load()` (stratum 1 only), so the two logs
+        // present an IDENTICAL event sequence — stratum 2 is neutral on replay.
+        let events_bare = bare.load().expect("load bare");
+        let events_wal = with_wal.load().expect("load wal");
+        assert_eq!(
+            events_bare, events_wal,
+            "stratum-2 records must not reach the replay fold"
+        );
+
+        // And the replay driver yields IDENTICAL outcomes with or without them
+        // present — a World folded from either log is identical.
+        let mut c_bare = ReplayCursor::new(&events_bare);
+        let mut c_wal = ReplayCursor::new(&events_wal);
+        let r_bare = drive_replay(&[command.clone()], &mut c_bare).expect("replay bare");
+        let r_wal = drive_replay(&[command], &mut c_wal).expect("replay wal");
+        assert_eq!(
+            r_bare, r_wal,
+            "replay outcome must be identical with or without stratum 2 present"
+        );
+    }
+
+    // --- P1a Command round-trip tests ---------------------------------------
+    //
+    // `Command` deliberately does NOT derive `Serialize`/`Deserialize` (it owns
+    // `History` and `ModelConfig` which are not worth double-serialising just for
+    // these tests), so we verify round-trips via `Debug` equality and structural
+    // inspection of the variant fields instead.
+
+    #[test]
+    fn cancel_inference_is_constructible() {
+        let cmd = Command::CancelInference { cmd: 7 };
+        // Exhaustive destructure — proves no extra fields exist.
+        let Command::CancelInference { cmd: c } = cmd else {
+            panic!("unexpected variant");
+        };
+        assert_eq!(c, 7);
+    }
+
+    #[test]
+    fn run_tool_is_constructible() {
+        let cmd = Command::RunTool {
+            cmd: 8,
+            entity: 0,
+            tool: "get_weather".into(),
+            args: serde_json::json!({ "city": "Tokyo" }),
+            key: CommandKey,
+        };
+        let Command::RunTool { cmd: c, entity: e, tool: t, args: a, key: _ } = cmd else {
+            panic!("unexpected variant");
+        };
+        assert_eq!(c, 8);
+        assert_eq!(e, 0);
+        assert_eq!(t, "get_weather");
+        assert_eq!(a, serde_json::json!({ "city": "Tokyo" }));
+    }
+
+    #[test]
+    fn cancel_tool_is_constructible() {
+        let cmd = Command::CancelTool { cmd: 9 };
+        let Command::CancelTool { cmd: c } = cmd else {
+            panic!("unexpected variant");
+        };
+        assert_eq!(c, 9);
+    }
+
+    #[test]
+    fn request_human_action_is_constructible() {
+        use crate::agent::world::autonomy::{HumanAction, Notify};
+        let cmd = Command::RequestHumanAction {
+            cmd: 10,
+            entity: 1,
+            ask: HumanAction::Prompt { text: "Please confirm.".into() },
+            notify: Notify::Push,
+            key: CommandKey,
+        };
+        let Command::RequestHumanAction { cmd: c, entity: e, ask: _, notify: n, key: _ } = cmd
+        else {
+            panic!("unexpected variant");
+        };
+        assert_eq!(c, 10);
+        assert_eq!(e, 1);
+        assert_eq!(n, Notify::Push);
+    }
+
+    #[test]
+    fn abort_human_action_is_constructible() {
+        let cmd = Command::AbortHumanAction { cmd: 11 };
+        let Command::AbortHumanAction { cmd: c } = cmd else {
+            panic!("unexpected variant");
+        };
+        assert_eq!(c, 11);
+    }
+
+    #[test]
+    fn raise_interaction_is_constructible() {
+        use crate::agent::world::autonomy::AgentInteraction;
+        let cmd = Command::RaiseInteraction {
+            request_id: 5,
+            entity: 2,
+            interaction: AgentInteraction {
+                payload: serde_json::json!({ "kind": "approval" }),
+            },
+        };
+        let Command::RaiseInteraction { request_id: r, entity: e, interaction: _ } = cmd else {
+            panic!("unexpected variant");
+        };
+        assert_eq!(r, 5);
+        assert_eq!(e, 2);
+    }
+
+    #[test]
+    fn compact_is_constructible() {
+        let messages = History(vec![Msg {
+            role: Role::User,
+            content: vec![Block::Text { text: "old message".into() }],
+        }]);
+        let params = sample_params();
+        let cmd = Command::Compact {
+            cmd: 20,
+            entity: 3,
+            upto: 1,
+            messages: messages.clone(),
+            params: params.clone(),
+            key: CommandKey,
+        };
+        let Command::Compact {
+            cmd: c,
+            entity: e,
+            upto: u,
+            messages: m,
+            params: p,
+            key: _,
+        } = cmd
+        else {
+            panic!("unexpected variant");
+        };
+        assert_eq!(c, 20);
+        assert_eq!(e, 3);
+        assert_eq!(u, 1);
+        assert_eq!(m, messages);
+        assert_eq!(p, params);
+    }
+
+    #[test]
+    fn fingerprint_compact_is_deterministic_for_the_same_request() {
+        let messages = History(vec![Msg {
+            role: Role::User,
+            content: vec![Block::Text { text: "old msg".into() }],
+        }]);
+        let params = sample_params();
+
+        let a = fingerprint_compact(&messages, &params).expect("fp a");
+        let b = fingerprint_compact(&messages, &params).expect("fp b");
+        assert_eq!(a, b, "the same compact request must yield the same Fingerprint");
+
+        let other = History(vec![Msg {
+            role: Role::User,
+            content: vec![Block::Text { text: "different msg".into() }],
+        }]);
+        let c = fingerprint_compact(&other, &params).expect("fp c");
+        assert_ne!(a, c, "a different compact request must yield a different Fingerprint");
+    }
+
+    // --- P2-crash: resume reconciliation (replay → resume edge) --------------
+
+    /// A dispatch-intent fixture: the write-ahead `CommandDispatched` the live
+    /// driver appends BEFORE an effect, carrying the durable `cmd → ctx` index,
+    /// the idempotency `key`, and the request `fingerprint`.
+    fn dispatch(cmd: CmdId, kind: EffectKind, entity: EntityId, edge: EdgeId) -> LifecycleEvent {
+        LifecycleEvent::CommandDispatched {
+            at: 3,
+            cmd,
+            kind,
+            ctx: ActorCtx {
+                entity,
+                origin: Origin::Agent,
+                edge,
+            },
+            key: IdempotencyKey {
+                app_id: AppId::default(),
+                tick: 3,
+                effect_id: 0,
+            },
+            fingerprint: Fingerprint(format!("fp-{cmd}")),
+        }
+    }
+
+    /// A minimal stratum-1 tail: a session header plus a user message — NO result
+    /// for the dispatched `cmd` (truncated mid-effect by the crash).
+    fn truncated_tail() -> Vec<Event> {
+        vec![
+            Event {
+                origin: Origin::System,
+                edge: 0,
+                at: 0,
+                wall: Some(1_700_000_000),
+                input: LogicalInput::SessionStarted {
+                    seed: 7,
+                    surface_tools: Vec::new(),
+                },
+            },
+            Event {
+                origin: Origin::Human,
+                edge: 9,
+                at: 1,
+                wall: None,
+                input: LogicalInput::UserMessage {
+                    to: 0,
+                    text: "hello".into(),
+                },
+            },
+        ]
+    }
+
+    /// VC-2.2: a `CommandDispatched { CallModel }` with NO matching `ModelResponded`
+    /// in the tail (crash mid-`Thinking`) → resume synthesises AND LOGS a stratum-1
+    /// `InferenceCancelled { Crash }` carrying the dangling dispatch's
+    /// `cmd`/`entity`/`fingerprint`, with the Event envelope inheriting
+    /// `origin`/`edge` from the dispatch `ctx` (Inv 17). (Inv 5, 6, 10.)
+    #[test]
+    fn resume_synthesises_and_logs_inference_cancelled_for_a_thinking_crash() {
+        let mut log = MemoryEventLog::new();
+        for e in truncated_tail() {
+            log.append(&e).expect("append tail");
+        }
+        let outstanding = dispatch(5, EffectKind::CallModel, 0, 9);
+        log.append_lifecycle(&outstanding).expect("append intent");
+
+        let events = log.load().expect("load stratum-1");
+        let lifecycle = log.load_lifecycle().expect("load stratum-2");
+        let reconciled = resume(&events, &lifecycle, &mut log).expect("resume");
+
+        // Exactly one reconciliation: the outstanding CallModel settles.
+        assert_eq!(reconciled.len(), 1);
+        let settled = match &reconciled[0] {
+            Reconciliation::Settled(event) => event,
+            other => panic!("expected Settled, got {other:?}"),
+        };
+        // The Event envelope inherits origin/edge from the dispatch ctx (Inv 17).
+        assert_eq!(settled.origin, Origin::Agent, "origin inherited from ctx");
+        assert_eq!(settled.edge, 9, "edge inherited from ctx");
+        // The synthesised result fills cmd/entity/fingerprint from the dangling
+        // CommandDispatched and is a Crash cancellation with no partial.
+        match &settled.input {
+            LogicalInput::InferenceCancelled {
+                cmd,
+                entity,
+                fingerprint,
+                partial,
+                reason,
+            } => {
+                assert_eq!(*cmd, 5, "cmd from the dangling dispatch");
+                assert_eq!(*entity, 0, "entity from the dispatch ctx");
+                assert_eq!(*fingerprint, Fingerprint("fp-5".into()), "fingerprint bound back");
+                assert_eq!(*partial, None);
+                assert_eq!(*reason, CancelReason::Crash);
+            }
+            other => panic!("expected InferenceCancelled, got {other:?}"),
+        }
+
+        // The crash is a REAL logged stratum-1 Input (not a silent rewind): it is
+        // appended to the tail and binds the same cmd.
+        let after = log.load().expect("reload stratum-1");
+        assert_eq!(after.len(), 3, "the synthesised cancellation was appended");
+        assert!(
+            matches!(
+                &after[2].input,
+                LogicalInput::InferenceCancelled { cmd: 5, reason: CancelReason::Crash, .. }
+            ),
+            "the synthesised InferenceCancelled is durable in the tail"
+        );
+
+        // Feeding the synthesised Input to the TurnSystem settles Thinking → Idle.
+        use crate::agent::world::gates::EntityGate;
+        use crate::agent::world::systems::System;
+        use crate::agent::world::systems::turn::TurnSystem;
+        use crate::agent::world::world::{
+            Activity, Components, Identity, Lineage, Resources, World,
+        };
+        let model = ModelConfig {
+            model: "claude-x".into(),
+            max_tokens: 1024,
+            effort: Effort::Medium,
+        };
+        let mut world = World::new(0, Resources::new(7, model));
+        world.entities.insert(
+            0,
+            Components {
+                identity: Identity::Primary,
+                lineage: Lineage { parent: None, depth: 0 },
+                history: History::default(),
+                activity: Activity::Thinking { cmd: 5 },
+                gate: EntityGate::default(),
+                budget: crate::agent::world::budget::Budget::default(),
+                inbox: crate::agent::world::world::Inbox::default(),
+                turns: 0,
+                model: None,
+            },
+        );
+        let (settled_world, commands) = TurnSystem.step(&world, &settled.input);
+        assert!(commands.is_empty(), "a crash cancellation emits no continuation here");
+        assert!(
+            matches!(
+                settled_world.entities.get(&0).expect("entity").activity,
+                Activity::Idle
+            ),
+            "InferenceCancelled{{Crash}} settles Thinking → Idle (totality, Inv 10)"
+        );
+    }
+
+    /// VC-2.2: a non-idempotent effectful tool dispatch with no result in the tail
+    /// resolves with an `is_error` `ToolResult` (surfaced-as-failed), filling
+    /// `cmd`/`entity`/`fingerprint` from the dangling dispatch.
+    #[test]
+    fn resume_surfaces_a_non_idempotent_tool_as_is_error() {
+        let mut log = MemoryEventLog::new();
+        for e in truncated_tail() {
+            log.append(&e).expect("append tail");
+        }
+        log.append_lifecycle(&dispatch(8, EffectKind::RunTool, 0, 9))
+            .expect("append intent");
+
+        let events = log.load().expect("load stratum-1");
+        let lifecycle = log.load_lifecycle().expect("load stratum-2");
+        let reconciled = resume(&events, &lifecycle, &mut log).expect("resume");
+
+        assert_eq!(reconciled.len(), 1);
+        let settled = match &reconciled[0] {
+            Reconciliation::Settled(event) => event,
+            other => panic!("expected Settled, got {other:?}"),
+        };
+        match &settled.input {
+            LogicalInput::ToolReturned {
+                cmd,
+                entity,
+                fingerprint,
+                result,
+            } => {
+                assert_eq!(*cmd, 8, "cmd from the dangling dispatch");
+                assert_eq!(*entity, 0, "entity from the dispatch ctx");
+                assert_eq!(*fingerprint, Fingerprint("fp-8".into()));
+                // The crash result rides as an is_error ToolResult.
+                assert!(
+                    matches!(
+                        result.as_slice(),
+                        [Block::ToolResult { is_error: true, .. }]
+                    ),
+                    "a non-idempotent tool crash surfaces-as-failed (is_error)"
+                );
+            }
+            other => panic!("expected ToolReturned, got {other:?}"),
+        }
+    }
+
+    /// A key-deduped effect (`Compact`/`RequestHumanAction`/`SendPeer`/
+    /// `ScheduleTimer`) re-dispatches with the SAME `key` rather than settling.
+    #[test]
+    fn resume_redispatches_key_deduped_effects_with_the_same_key() {
+        let mut log = MemoryEventLog::new();
+        for e in truncated_tail() {
+            log.append(&e).expect("append tail");
+        }
+        let outstanding = dispatch(12, EffectKind::Compact, 0, 9);
+        log.append_lifecycle(&outstanding).expect("append intent");
+
+        let events = log.load().expect("load stratum-1");
+        let lifecycle = log.load_lifecycle().expect("load stratum-2");
+        let reconciled = resume(&events, &lifecycle, &mut log).expect("resume");
+
+        assert_eq!(reconciled.len(), 1);
+        match &reconciled[0] {
+            Reconciliation::Redispatch { cmd, kind, key } => {
+                assert_eq!(*cmd, 12);
+                assert_eq!(*kind, EffectKind::Compact);
+                // The SAME key is re-presented (downstream dedupes).
+                assert_eq!(key.tick, 3);
+                assert_eq!(key.effect_id, 0);
+            }
+            other => panic!("expected Redispatch, got {other:?}"),
+        }
+        // A re-dispatch logs NO stratum-1 result (the live driver re-emits it).
+        assert_eq!(log.load().expect("reload").len(), 2, "no result was synthesised");
+    }
+
+    /// A dispatch whose `cmd` already has a terminal result in the tail committed
+    /// before the crash — resume skips it (no double settlement).
+    #[test]
+    fn resume_skips_a_dispatch_that_already_has_a_result() {
+        let command = sample_call(7, "hello");
+        let recorded = recorded_response_for(&command, 2);
+
+        let mut log = MemoryEventLog::new();
+        for e in truncated_tail() {
+            log.append(&e).expect("append tail");
+        }
+        log.append(&recorded).expect("append result");
+        // The dispatch-intent for the SAME cmd that already resolved.
+        log.append_lifecycle(&dispatch(7, EffectKind::CallModel, 0, 9))
+            .expect("append intent");
+
+        let events = log.load().expect("load stratum-1");
+        let lifecycle = log.load_lifecycle().expect("load stratum-2");
+        let reconciled = resume(&events, &lifecycle, &mut log).expect("resume");
+
+        assert!(
+            reconciled.is_empty(),
+            "a dispatch with a logged result is settled — nothing to reconcile"
+        );
+    }
+}

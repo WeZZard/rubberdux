@@ -3,14 +3,26 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use teloxide::prelude::Bot;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
 use crate::error::Error;
-use crate::protocol::{self, AgentToHost};
+use crate::protocol::{self, AgentToHost, HostToAgent};
 use crate::vm::manager::VMManager;
 
 const DEFAULT_RPC_PORT: u16 = 19384;
+
+/// Default TCP port for the surface-client listener: the host endpoint the macOS
+/// GUI client connects to so the host's [`SurfaceRouter`] can relay surface frames
+/// between it and the App's worker subprocess. Distinct from the worker RPC port
+/// ([`DEFAULT_RPC_PORT`] 19384, which routes worker `Hello`s) and the gateway HTTP
+/// port (19385). Overridable via `RUBBERDUX_SURFACE_PORT`. The macOS client (W5)
+/// dials this port and registers with an `AgentToHost::Hello { app_id }` frame.
+const DEFAULT_SURFACE_PORT: u16 = 19386;
+
+/// Bound on a surface client's outbound drive queue. Drives arrive at human
+/// interaction speed; a small buffer absorbs bursts without unbounded growth.
+const SURFACE_CLIENT_DRIVE_CAPACITY: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Peer broker: the directory + relay (a switch, not an orchestrator)
@@ -163,6 +175,237 @@ impl PeerBroker {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Surface router: per-App surface frame routing (VC-P.1)
+// ---------------------------------------------------------------------------
+
+/// Delivery sink for `HostToAgent::SurfaceDrive` frames to the macOS app
+/// client. The router writes one frame per drive; the macOS client stream
+/// drains it. See `docs/agent/world/ecs-runtime.md` (Theme 2a).
+pub type SurfaceDriveSink = tokio::sync::mpsc::Sender<crate::protocol::HostToAgent>;
+
+/// Inbound sink for `AgentToHost` surface frames from the macOS app client.
+/// The router writes `SurfaceObservation`/`SurfaceMutated` frames here; the
+/// App's ECS World or worker bridge drains them. See
+/// `docs/agent/world/ecs-runtime.md` (Theme 2b; Inv 18).
+pub type SurfaceInboundSink = tokio::sync::mpsc::Sender<crate::protocol::AgentToHost>;
+
+/// Per-App surface routing table. Routes `HostToAgent::SurfaceDrive` from the
+/// worker socket to the correct per-App macOS client stream, and routes inbound
+/// `AgentToHost::{SurfaceObservation,SurfaceMutated}` from the client to the
+/// correct App's worker seam — both keyed by App identity rather than
+/// connection-accept order. Two Apps connecting in either order route correctly.
+/// See `docs/agent/world/ecs-runtime.md` (Theme 2a/2b; VC-P.1).
+pub struct SurfaceRouter {
+    /// Per-App macOS client drive sinks. The host writes `SurfaceDrive` frames
+    /// here; the macOS client stream delivers them to the native UI.
+    drives: Mutex<HashMap<String, SurfaceDriveSink>>,
+    /// Per-App worker inbound sinks. The macOS client writes
+    /// `SurfaceObservation`/`SurfaceMutated` frames here; the worker bridge or
+    /// ECS World folds them into `LogicalInput`s.
+    inbound: Mutex<HashMap<String, SurfaceInboundSink>>,
+}
+
+impl SurfaceRouter {
+    /// An empty router with no App registrations.
+    pub fn new() -> Self {
+        Self {
+            drives: Mutex::new(HashMap::new()),
+            inbound: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Register the macOS app client's drive sink for `app_id`. Called when a
+    /// client stream connects and identifies its App. Order-independent: two
+    /// Apps may register in any order and route correctly.
+    pub async fn register_client(&self, app_id: String, sink: SurfaceDriveSink) {
+        self.drives.lock().await.insert(app_id, sink);
+    }
+
+    /// Register the App's worker inbound seam for `app_id`. Called when the
+    /// worker's surface-observation channel is provisioned.
+    pub async fn register_worker(&self, app_id: String, sink: SurfaceInboundSink) {
+        self.inbound.lock().await.insert(app_id, sink);
+    }
+
+    /// Deregister the macOS client's drive sink for `app_id` (client disconnected).
+    pub async fn unregister_client(&self, app_id: &str) {
+        self.drives.lock().await.remove(app_id);
+    }
+
+    /// Deregister the worker's inbound seam for `app_id` (worker stopped).
+    pub async fn unregister_worker(&self, app_id: &str) {
+        self.inbound.lock().await.remove(app_id);
+    }
+
+    /// Route a `HostToAgent::SurfaceDrive` to `app_id`'s registered macOS
+    /// client. Returns `true` if delivered. A missing or closed sink is logged
+    /// and returns `false`; never blocks or propagates an error.
+    pub async fn route_drive(
+        &self,
+        app_id: &str,
+        frame: crate::protocol::HostToAgent,
+    ) -> bool {
+        let sink = self.drives.lock().await.get(app_id).cloned();
+        if let Some(sink) = sink {
+            match sink.try_send(frame) {
+                Ok(()) => return true,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    log::warn!(
+                        "[surface-router] SurfaceDrive for App `{app_id}`: client sink full, frame dropped"
+                    );
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    log::warn!(
+                        "[surface-router] SurfaceDrive for App `{app_id}`: client disconnected"
+                    );
+                    // Sink closed: client disconnected; remove the stale entry.
+                    self.drives.lock().await.remove(app_id);
+                }
+            }
+        } else {
+            log::debug!(
+                "[surface-router] SurfaceDrive for App `{app_id}`: no client registered"
+            );
+        }
+        false
+    }
+
+    /// Route an inbound `AgentToHost` surface frame (`SurfaceObservation` or
+    /// `SurfaceMutated`) from `app_id`'s macOS client to the App's worker seam.
+    /// Returns `true` if delivered.
+    pub async fn route_inbound(
+        &self,
+        app_id: &str,
+        frame: crate::protocol::AgentToHost,
+    ) -> bool {
+        let sink = self.inbound.lock().await.get(app_id).cloned();
+        if let Some(sink) = sink {
+            match sink.try_send(frame) {
+                Ok(()) => return true,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    log::warn!(
+                        "[surface-router] surface inbound for App `{app_id}`: worker seam full, frame dropped"
+                    );
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    log::warn!(
+                        "[surface-router] surface inbound for App `{app_id}`: worker seam closed"
+                    );
+                    // Sink closed: worker stopped; remove the stale entry.
+                    self.inbound.lock().await.remove(app_id);
+                }
+            }
+        } else {
+            log::debug!(
+                "[surface-router] surface inbound for App `{app_id}`: no worker seam registered"
+            );
+        }
+        false
+    }
+}
+
+/// Run the surface-client accept loop: the macOS GUI client connects here so the
+/// host's [`SurfaceRouter`] can relay surface frames between it and the App's
+/// worker subprocess. Each accepted connection is handled on its own task; an
+/// accept error is logged and the loop continues. Runs for the host's lifetime.
+///
+/// This is a dedicated raw-TCP length-prefixed-frame listener (the same framing
+/// as the worker RPC link), following the `accept_worker` pattern. It is NOT the
+/// gateway HTTP port (19385) and NOT the worker RPC port (19384, which routes
+/// worker `Hello`s). See `docs/agent/world/ecs-runtime.md`.
+pub async fn run_surface_client_listener(listener: TcpListener, router: Arc<SurfaceRouter>) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, addr)) => {
+                let router = router.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_surface_client(stream, router).await {
+                        log::warn!("[surface-client] connection from {addr} ended: {e}");
+                    }
+                });
+            }
+            Err(e) => log::error!("[surface-client] accept error: {e}"),
+        }
+    }
+}
+
+/// Handle one macOS surface client: perform the registration handshake, register
+/// its drive sink with the router, then pump the client's inbound surface frames
+/// to the App's worker.
+///
+/// REGISTRATION HANDSHAKE (the contract W5's macOS client targets): the client's
+/// FIRST frame MUST be [`AgentToHost::Hello`] carrying the App id it observes.
+/// The host then:
+/// - registers a drive sink with [`SurfaceRouter::register_client`] — a spawned
+///   task drains [`HostToAgent::SurfaceDrive`] frames the router routes and writes
+///   each to the client socket (the host→client drive leg), and
+/// - reads the client's [`AgentToHost::SurfaceObservation`]/[`SurfaceMutated`]
+///   frames and routes each to the App's worker via
+///   [`SurfaceRouter::route_inbound`] (the client→worker observation leg).
+///
+/// A non-`Hello` first frame is rejected; a clean EOF before registering is a
+/// no-op. On disconnect the client's drive sink is unregistered.
+async fn handle_surface_client(stream: TcpStream, router: Arc<SurfaceRouter>) -> Result<(), Error> {
+    let (mut reader, mut writer) = stream.into_split();
+
+    // The registration frame must be first on the wire so the host can route this
+    // client to the right App without relying on accept order.
+    let app_id = match protocol::read_message::<AgentToHost>(&mut reader).await? {
+        Some(AgentToHost::Hello { app_id }) => app_id,
+        Some(other) => {
+            return Err(Error::Rpc(format!(
+                "surface client's first frame was not a Hello registration: {other:?}"
+            )));
+        }
+        None => return Ok(()),
+    };
+    log::info!("[surface-client] registered for App `{app_id}`");
+
+    // Register the client's drive sink: a task drains the routed drive frames and
+    // writes each to the client socket. The router holds only the sender, keeping
+    // the relay stateless-per-frame.
+    let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel::<HostToAgent>(SURFACE_CLIENT_DRIVE_CAPACITY);
+    router.register_client(app_id.clone(), drive_tx).await;
+
+    let drive_app_id = app_id.clone();
+    let drive_task = tokio::spawn(async move {
+        while let Some(frame) = drive_rx.recv().await {
+            if let Err(e) = protocol::write_message(&mut writer, &frame).await {
+                log::warn!("[surface-client:{drive_app_id}] failed to write drive: {e}");
+                break;
+            }
+        }
+    });
+
+    // Inbound pump: route the client's observed/mutated surface frames to the
+    // App's worker. Other frames are ignored — only surface observations cross
+    // this seam.
+    let result = async {
+        loop {
+            match protocol::read_message::<AgentToHost>(&mut reader).await? {
+                Some(frame @ AgentToHost::SurfaceObservation { .. })
+                | Some(frame @ AgentToHost::SurfaceMutated { .. }) => {
+                    router.route_inbound(&app_id, frame).await;
+                }
+                Some(other) => log::debug!(
+                    "[surface-client:{app_id}] ignoring non-surface frame: {other:?}"
+                ),
+                None => {
+                    log::info!("[surface-client:{app_id}] disconnected");
+                    break;
+                }
+            }
+        }
+        Ok::<(), Error>(())
+    }
+    .await;
+
+    router.unregister_client(&app_id).await;
+    drive_task.abort();
+    result
+}
+
 /// The read/write halves of an accepted worker socket, paired so a caller can
 /// keep streaming after the routing decision has been made.
 pub struct WorkerStream {
@@ -228,6 +471,9 @@ pub struct HostConfig {
     pub vm_image: String,
     pub share_root: PathBuf,
     pub rpc_port: u16,
+    /// TCP port the macOS GUI surface client connects to. See
+    /// [`DEFAULT_SURFACE_PORT`] and `docs/agent/world/ecs-runtime.md`.
+    pub surface_port: u16,
     pub host_ip: String,
     pub agent_binary_path: Option<String>,
     pub agent_env: HashMap<String, String>,
@@ -256,6 +502,11 @@ impl HostConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_RPC_PORT);
 
+        let surface_port: u16 = std::env::var("RUBBERDUX_SURFACE_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_SURFACE_PORT);
+
         let host_ip =
             std::env::var("RUBBERDUX_HOST_IP").unwrap_or_else(|_| "192.168.64.1".to_string());
 
@@ -280,6 +531,7 @@ impl HostConfig {
             vm_image: image,
             share_root,
             rpc_port,
+            surface_port,
             host_ip,
             agent_binary_path: None,
             agent_env,
@@ -381,6 +633,28 @@ pub async fn run(config: HostConfig, bot: Option<Bot>) {
             }
         }
     };
+
+    // The surface router relays surface frames between each App's worker
+    // subprocess and the registered macOS GUI client, keyed by App id. The same
+    // router is shared with the surface-client listener (which registers clients
+    // and routes their observations inbound) and the App supervisor (whose per-App
+    // pump registers the worker and routes its drives outbound). See
+    // `docs/agent/world/ecs-runtime.md`.
+    let surface_router = Arc::new(SurfaceRouter::new());
+
+    // Stand up the surface-client listener: the dedicated host endpoint the macOS
+    // GUI client (W5) connects to. A bind failure disables the live surface relay
+    // but leaves the rest of the host serving.
+    match TcpListener::bind(("0.0.0.0", config.surface_port)).await {
+        Ok(listener) => {
+            log::info!("Surface-client listener bound to 0.0.0.0:{}", config.surface_port);
+            tokio::spawn(run_surface_client_listener(listener, surface_router.clone()));
+        }
+        Err(e) => log::warn!(
+            "Failed to bind surface-client listener on port {}: {e} (live surface relay disabled)",
+            config.surface_port
+        ),
+    }
 
     let mut vm_manager = VMManager::new(config.vm_image.clone(), config.share_root.clone());
     if let Some(mem) = config.memory_mb {
@@ -515,6 +789,7 @@ pub async fn run(config: HostConfig, bot: Option<Bot>) {
     let app_supervisor =
         match crate::app::runtime::local_supervisor::LocalSupervisor::bind_shared(
             app_store.clone(),
+            surface_router.clone(),
         )
         .await
         {
@@ -873,6 +1148,7 @@ mod tests {
             vm_image: "test".into(),
             share_root: PathBuf::from("./test-shares"),
             rpc_port: 19384,
+            surface_port: DEFAULT_SURFACE_PORT,
             host_ip: "192.168.64.1".into(),
             agent_binary_path: None,
             agent_env: HashMap::new(),
@@ -893,6 +1169,7 @@ mod tests {
             vm_image: "test".into(),
             share_root: PathBuf::from("./test-shares"),
             rpc_port: 19384,
+            surface_port: DEFAULT_SURFACE_PORT,
             host_ip: "192.168.64.1".into(),
             agent_binary_path: None,
             agent_env: HashMap::new(),
@@ -1010,6 +1287,7 @@ mod tests {
             vm_image: "test".into(),
             share_root: PathBuf::from("./test-shares"),
             rpc_port: 19384,
+            surface_port: DEFAULT_SURFACE_PORT,
             host_ip: "192.168.64.1".into(),
             agent_binary_path: None,
             agent_env: env,
@@ -1022,5 +1300,78 @@ mod tests {
         assert!(cmd.contains("TEST_KEY"));
         assert!(cmd.contains("test_value"));
         assert!(cmd.contains("export"));
+    }
+
+    // -- SurfaceRouter: per-App surface frame routing (VC-P.1) ---------------
+
+    /// [Verifies VC-P.1] Two Apps registered out of accept order still route
+    /// correctly by App identity: a `SurfaceDrive` for App-A reaches App-A's
+    /// client stub (not App-B's), and a `SurfaceObservation` from App-A's
+    /// client reaches App-A's worker seam (not App-B's). Proves the router is
+    /// keyed by App identity, not registration/accept order.
+    #[tokio::test]
+    async fn surface_router_routes_by_app_identity_not_accept_order() {
+        use crate::agent::world::surface::{Hash, IdempotencyKey, Viewport, WindowState};
+        use crate::protocol::{AgentToHost, HostToAgent, SurfaceObserved};
+
+        let router = SurfaceRouter::new();
+
+        // Register App-B before App-A — out of alphabetical / accept order —
+        // to prove routing does not depend on registration sequence.
+        let (drive_tx_b, mut drive_rx_b) = tokio::sync::mpsc::channel::<HostToAgent>(4);
+        let (obs_tx_b, mut obs_rx_b) = tokio::sync::mpsc::channel::<AgentToHost>(4);
+        router.register_client("app-b".into(), drive_tx_b).await;
+        router.register_worker("app-b".into(), obs_tx_b).await;
+
+        let (drive_tx_a, mut drive_rx_a) = tokio::sync::mpsc::channel::<HostToAgent>(4);
+        let (obs_tx_a, mut obs_rx_a) = tokio::sync::mpsc::channel::<AgentToHost>(4);
+        router.register_client("app-a".into(), drive_tx_a).await;
+        router.register_worker("app-a".into(), obs_tx_a).await;
+
+        // A SurfaceDrive for App-A must reach App-A's client stub only.
+        let drive_frame = HostToAgent::SurfaceDrive {
+            ops: vec![],
+            cmd: 1,
+            key: IdempotencyKey("cmd-1".into()),
+        };
+        assert!(
+            router.route_drive("app-a", drive_frame).await,
+            "route_drive must report delivery to App-A"
+        );
+        assert!(
+            drive_rx_a.recv().await.is_some(),
+            "SurfaceDrive must reach App-A's client stub"
+        );
+        assert!(
+            drive_rx_b.try_recv().is_err(),
+            "SurfaceDrive for App-A must NOT reach App-B's client stub"
+        );
+
+        // A SurfaceObservation from App-A's client must reach App-A's worker
+        // seam only, not App-B's.
+        let obs_frame = AgentToHost::SurfaceObservation {
+            observed: SurfaceObserved {
+                surface: 1,
+                version: 0,
+                ax_digest: Hash("digest-a".into()),
+                focus: None,
+                selection: None,
+                viewport: Viewport(String::new()),
+                window: WindowState(String::new()),
+                cursor: None,
+            },
+        };
+        assert!(
+            router.route_inbound("app-a", obs_frame).await,
+            "route_inbound must report delivery to App-A's worker seam"
+        );
+        assert!(
+            obs_rx_a.recv().await.is_some(),
+            "SurfaceObservation must reach App-A's worker seam"
+        );
+        assert!(
+            obs_rx_b.try_recv().is_err(),
+            "SurfaceObservation for App-A must NOT reach App-B's worker seam"
+        );
     }
 }

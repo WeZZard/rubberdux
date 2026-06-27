@@ -6,11 +6,14 @@
 //! the root `CLAUDE.md` "Design Documentation" section, so that the path-mirror
 //! mapping stays trustworthy without hand-maintained pointers.
 //!
-//! Three checks, matching that section:
+//! Four checks in total:
 //!   1. No orphan docs — every `docs/**/*.md` maps to an existing code path.
 //!   2. Valid mirrored location — the doc's directory mirrors a real code dir.
 //!   3. Comment-pointer resolution — every `docs/….md` referenced from source
 //!      resolves to a file that exists.
+//!   4. Functional-core purity — non-test code under `src/agent/world/systems/`
+//!      must not use ambient I/O (clock, RNG, env) or non-deterministic
+//!      collections (`HashMap`). See docs/agent/world/ecs-runtime.md Invariant 1.
 //!
 //! Checks 1 and 2 are the same mapping viewed two ways, so a single
 //! "the mirrored code directory must exist" test satisfies both.
@@ -38,6 +41,7 @@ pub fn lint() -> Result<(), String> {
 
     check_docs_mirror(&root, &mut violations)?;
     check_comment_pointers(&root, &mut violations)?;
+    check_systems_purity(&root, &mut violations)?;
 
     if violations.is_empty() {
         println!("design-doc lint: ok");
@@ -162,6 +166,85 @@ fn doc_pointers(line: &str) -> Vec<String> {
     out
 }
 
+/// Check 4: functional-core purity. Every `.rs` file under
+/// `src/agent/world/systems/` must not call ambient clock/RNG/env functions or
+/// use non-deterministic `HashMap` in non-test code.
+///
+/// See docs/agent/world/ecs-runtime.md Invariant 1: Systems read only
+/// `&World`/`&Input` — no ambient reads. This check is a mechanical build gate
+/// for that invariant.
+fn check_systems_purity(root: &Path, violations: &mut Vec<String>) -> Result<(), String> {
+    let systems_dir = root.join("src").join("agent").join("world").join("systems");
+    if !systems_dir.is_dir() {
+        // No systems directory yet — nothing to check.
+        return Ok(());
+    }
+
+    let mut files = Vec::new();
+    collect_files(&systems_dir, &mut files)?;
+
+    for file in files {
+        if file.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&file) else {
+            continue;
+        };
+        let rel = file.strip_prefix(root).unwrap_or(&file);
+        let purity_violations = scan_purity_violations(&content);
+        for (line_num, description) in purity_violations {
+            violations.push(format!(
+                "purity violation in {}:{}: {}",
+                rel.display(),
+                line_num,
+                description,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Scan the source text for purity violations in non-test code, returning a
+/// list of `(line_number, description)` pairs (1-based line numbers).
+///
+/// Heuristic for test exclusion: scanning stops at the first line that
+/// contains `#[cfg(test)]`, because everything after that marker is the test
+/// module where ambient I/O is permitted. This is deliberately pragmatic —
+/// it handles the standard Rust `#[cfg(test)] mod tests { … }` pattern
+/// without a full parser. The consequence is that a `#[cfg(test)]` annotation
+/// anywhere in the file (even a mid-file marker) ends non-test scanning; this
+/// errs on the side of false-negatives rather than false-positives in test code.
+fn scan_purity_violations(source: &str) -> Vec<(usize, String)> {
+    /// Patterns that are banned in non-test Systems code and the reason for each.
+    /// Each entry is `(needle, description)`.
+    const BANNED: &[(&str, &str)] = &[
+        ("SystemTime::now(", "ambient wall-clock (use Resources.wall / Event.wall instead)"),
+        ("Instant::now(", "ambient wall-clock (use Resources.wall / Event.wall instead)"),
+        ("rand::", "ambient randomness (use Resources.rng instead)"),
+        ("thread_rng(", "ambient randomness (use Resources.rng instead)"),
+        ("rngs::", "ambient randomness (use Resources.rng instead)"),
+        ("std::env::var", "ambient environment read (pass config through Resources instead)"),
+        ("std::env::args", "ambient environment read (pass config through Resources instead)"),
+        ("use std::collections::HashMap", "non-deterministic HashMap (use BTreeMap for deterministic iteration)"),
+        ("HashMap<", "non-deterministic HashMap (use BTreeMap for deterministic iteration)"),
+    ];
+
+    let mut out = Vec::new();
+    for (idx, line) in source.lines().enumerate() {
+        // Stop scanning at the first `#[cfg(test)]` — everything from here
+        // onwards is a test module where these constructs are permitted.
+        if line.contains("#[cfg(test)]") {
+            break;
+        }
+        for (needle, description) in BANNED {
+            if line.contains(needle) {
+                out.push((idx + 1, format!("`{needle}` — {description}")));
+            }
+        }
+    }
+    out
+}
+
 /// Recursively collect files under `dir`, skipping the directories in
 /// `SKIP_DIRS` at any depth.
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -184,4 +267,108 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scan_purity_violations;
+
+    /// A snippet of clean Systems code that respects every purity rule.
+    const CLEAN_SOURCE: &str = r#"
+use std::collections::BTreeMap;
+
+pub fn run(world: &World, input: &Input) -> Vec<Command> {
+    let wall = world.resources.wall.observed;
+    let mut map: BTreeMap<u32, u32> = BTreeMap::new();
+    map.insert(1, 2);
+    vec![]
+}
+"#;
+
+    /// A snippet that violates every banned pattern in non-test code.
+    const DIRTY_SOURCE: &str = r#"
+use std::collections::HashMap;
+use std::time::SystemTime;
+
+pub fn run(world: &World) -> Vec<Command> {
+    let now = SystemTime::now();
+    let instant = std::time::Instant::now();
+    let rng = rand::thread_rng();
+    let _r = rngs::StdRng::seed_from_u64(0);
+    let v = std::env::var("FOO").unwrap_or_default();
+    let args = std::env::args().collect::<Vec<_>>();
+    let mut map: HashMap<u32, u32> = HashMap::new();
+    vec![]
+}
+"#;
+
+    /// A snippet where violations appear only inside `#[cfg(test)]` — they
+    /// must not be flagged.
+    const TEST_GATED_SOURCE: &str = r#"
+pub fn run(world: &World) -> Vec<Command> {
+    vec![]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::SystemTime;
+
+    #[test]
+    fn example() {
+        let _ = SystemTime::now();
+        let mut m: HashMap<u32, u32> = HashMap::new();
+        m.insert(1, 2);
+    }
+}
+"#;
+
+    #[test]
+    fn clean_source_has_no_purity_violations() {
+        let violations = scan_purity_violations(CLEAN_SOURCE);
+        assert!(
+            violations.is_empty(),
+            "expected no violations in clean source, got: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn dirty_source_flags_every_banned_pattern() {
+        let violations = scan_purity_violations(DIRTY_SOURCE);
+        let needles = [
+            "SystemTime::now(",
+            "Instant::now(",
+            "rand::",
+            "thread_rng(",
+            "rngs::",
+            "std::env::var",
+            "std::env::args",
+            "use std::collections::HashMap",
+            "HashMap<",
+        ];
+        for needle in needles {
+            assert!(
+                violations.iter().any(|(_, desc)| desc.contains(needle)),
+                "expected `{needle}` to be flagged but it was not; violations: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gated_violations_are_ignored() {
+        let violations = scan_purity_violations(TEST_GATED_SOURCE);
+        assert!(
+            violations.is_empty(),
+            "violations inside #[cfg(test)] should not be flagged, got: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn system_time_now_is_flagged_with_line_number() {
+        let src = "fn foo() {\n    let t = SystemTime::now();\n}\n";
+        let violations = scan_purity_violations(src);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].0, 2, "expected line 2, got {}", violations[0].0);
+        assert!(violations[0].1.contains("SystemTime::now("));
+    }
 }
