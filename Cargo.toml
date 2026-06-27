@@ -85,6 +85,17 @@ name = "app_system"
 path = "tests/system/app/main.rs"
 harness = false
 
+# Full-stack system test for the live UI-manipulation loop (VC-E.1): daemon +
+# worker + macOS surface client. `harness = false` for the same reason as
+# `app_system`: the target's own `main` re-enters worker mode when the
+# `LocalSupervisor` spawns it with `--agent`. Run from the repo root with
+# RUBBERDUX_LLM_* credentials. Invoked as `cargo test --test system
+# app::surface_drive`.
+[[test]]
+name = "system"
+path = "tests/system/main.rs"
+harness = false
+
 [[test]]
 name = "e2e"
 path = "tests/e2e/runner.rs"

@@ -45,4 +45,7 @@ pub enum Error {
 
     #[error("peer error: {0}")]
     Peer(String),
+
+    #[error("world: {0}")]
+    World(String),
 }

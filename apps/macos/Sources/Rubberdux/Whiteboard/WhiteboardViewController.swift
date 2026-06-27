@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import Network
 
 // MARK: - WhiteboardViewController
 
@@ -81,6 +82,25 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
     /// front. Reused across raises.
     private let interactionPopover = InteractionPopoverController()
 
+    // MARK: - Agent surface drive
+
+    /// The single bidirectional surface client, shared by the drive controller
+    /// (inbound `SurfaceDrive` → M-apply) and the observation reporter (outbound
+    /// observations/mutations → M-observe). It is connected to the host's surface
+    /// endpoint and registered for this board's App. Retained for the controller's
+    /// lifetime so its connection and `driveSubject` subscription stay live.
+    private var surfaceSocket: SurfaceSocket?
+
+    /// Applies inbound agent `SurfaceDrive`s to the whiteboard's real AppKit/AX
+    /// elements (M-apply). Retained for the controller's lifetime so its
+    /// `driveSubject` subscription stays live. See `SurfaceDriveController`.
+    private var surfaceDriveController: SurfaceDriveController?
+
+    /// Reports human edits and observed AX state back to the host (M-observe).
+    /// Retained for the controller's lifetime so its notification/AX observations
+    /// stay live. See `SurfaceObservationReporter`.
+    private var surfaceObservationReporter: SurfaceObservationReporter?
+
     /// Whether the board window is the front, key surface. When `true` a raised
     /// interaction is presented as a popover; when `false` it only updates the
     /// icon badge and the pending list. Tracked via window/app notifications.
@@ -158,7 +178,60 @@ final class WhiteboardViewController: NSViewController, BoardViewDelegate {
         }
         subscribeToBoard()
         observeFrontSurface()
+        wireSurfaceClient()
         loadApps()
+    }
+
+    // MARK: - Agent surface client
+
+    /// The TCP port of the host's dedicated surface-client listener. Defaults to
+    /// 19386 — distinct from the daemon's HTTP port — and is overridable via
+    /// `RUBBERDUX_SURFACE_PORT` so a non-default host binding stays reachable, the
+    /// same key the host reads when it binds the listener.
+    private var surfacePort: UInt16 {
+        if let raw = ProcessInfo.processInfo.environment["RUBBERDUX_SURFACE_PORT"],
+           let value = UInt16(raw) {
+            return value
+        }
+        return 19386
+    }
+
+    /// The App id this board registers as in its `Hello` handshake, so the host's
+    /// `SurfaceRouter` relays this App's drives to the board and the board's
+    /// observations back to the App's worker. Sourced from `RUBBERDUX_SURFACE_APP_ID`
+    /// so the live host/worker and this client agree on the App identity; falls
+    /// back to a board-wide default for local runs with no live drive.
+    private var surfaceAppId: String {
+        ProcessInfo.processInfo.environment["RUBBERDUX_SURFACE_APP_ID"] ?? "whiteboard"
+    }
+
+    /// Build the single surface client, connect it to the host's surface endpoint,
+    /// send the `Hello` registration as its FIRST frame, then share it between the
+    /// `SurfaceDriveController` (inbound `SurfaceDrive` → M-apply) and the
+    /// `SurfaceObservationReporter` (outbound observations/mutations → M-observe).
+    /// Both address the board's own view as the surface root, so an `ElementId`
+    /// indexes the identical flattened subtree on the apply and observe sides.
+    ///
+    /// The client targets the daemon's host at `surfacePort` (default 19386) —
+    /// the host's dedicated surface-client listener, distinct from its HTTP port —
+    /// and registers as `surfaceAppId` so the host's `SurfaceRouter` routes by App
+    /// identity. The send is non-blocking and a closed socket is tolerated (the
+    /// `NWConnection` simply drops queued frames), mirroring the board/interaction
+    /// socket wiring above. See docs/agent/world/ecs-runtime.md.
+    private func wireSurfaceClient() {
+        let host = NWEndpoint.Host(apiClient.baseURL.host ?? "localhost")
+        let port = NWEndpoint.Port(rawValue: surfacePort) ?? 19386
+        let socket = SurfaceSocket(host: host, port: port)
+        surfaceSocket = socket
+
+        // Register before wiring the reporter: the host requires the `Hello` as the
+        // very first frame on the wire, ahead of any observation.
+        socket.connect()
+        socket.register(appId: surfaceAppId)
+
+        let target = AccessibilitySurfaceDriveTarget(root: view)
+        surfaceDriveController = SurfaceDriveController(socket: socket, target: target)
+        surfaceObservationReporter = SurfaceObservationReporter(socket: socket, root: view)
     }
 
     // MARK: - Data loading

@@ -2,6 +2,33 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
+use crate::agent::world::surface::{
+    Cause, ElementId, Hash, IdempotencyKey, Point, Selection, SurfaceId, SurfaceOp,
+    SurfaceVersion, Viewport, WindowState,
+};
+use crate::agent::world::world::CmdId;
+
+// ---------------------------------------------------------------------------
+// Surface protocol types
+// ---------------------------------------------------------------------------
+
+/// Protocol-level mirror of the `SurfaceObserved` logical-input payload.
+/// Carries the `surface` key inline (which `SurfaceState` omits because the
+/// per-World state is stored keyed by `SurfaceId`). Serde shape is
+/// byte-identical to the `LogicalInput::SurfaceObserved` variant fields.
+/// See docs/agent/world/ecs-runtime.md.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SurfaceObserved {
+    pub surface: SurfaceId,
+    pub version: SurfaceVersion,
+    pub ax_digest: Hash,
+    pub focus: Option<ElementId>,
+    pub selection: Option<Selection>,
+    pub viewport: Viewport,
+    pub window: WindowState,
+    pub cursor: Option<Point>,
+}
+
 /// Messages sent from a worker (VM agent or native app worker) to the host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentToHost {
@@ -51,6 +78,30 @@ pub enum AgentToHost {
     Interaction {
         interaction: crate::agent::interaction::AgentInteraction,
     },
+    /// The macOS app worker reports an observed AX surface snapshot to the host
+    /// so the worker bridge can fold it into a `SurfaceObserved` logical input.
+    /// See docs/agent/world/ecs-runtime.md (Theme 2b).
+    SurfaceObservation { observed: SurfaceObserved },
+    /// The macOS app worker reports a human-driven UI mutation to the host so
+    /// the worker bridge can fold it into a `SurfaceMutated` logical input.
+    /// Only `cause = Human` signals reach this frame; `Command`/`Peer` echoes
+    /// are deduped in the worker before sending. See
+    /// docs/agent/world/ecs-runtime.md (Theme 1e).
+    SurfaceMutated { op: SurfaceOp, cause: Cause },
+    /// RELAY frame (worker → host): the World driver in the worker subprocess ran
+    /// a `set_value` surface tool and is driving the UI. The host's
+    /// [`SurfaceRouter`](crate::host::SurfaceRouter) routes the batch on to the
+    /// registered macOS client as [`HostToAgent::SurfaceDrive`], keyed by App id.
+    /// Distinct from the host→app `HostToAgent::SurfaceDrive` (which the host
+    /// emits to the client); this is the worker's OUTBOUND leg of that relay.
+    /// `cmd`/`key` are forwarded so the client can stamp the resulting native
+    /// echo with `Cause::Command { cmd, key }` for dedup (Theme 1e / Inv 18). See
+    /// docs/agent/world/ecs-runtime.md (Theme 2a; SurfaceDrive).
+    SurfaceDrive {
+        ops: Vec<SurfaceOp>,
+        cmd: CmdId,
+        key: IdempotencyKey,
+    },
 }
 
 /// Messages sent from the host to a worker (VM agent or native app worker).
@@ -87,6 +138,30 @@ pub enum HostToAgent {
     InteractionAnswer {
         response: crate::agent::interaction::InteractionResponse,
     },
+    /// The host drives the macOS app's UI by sending a batch of `SurfaceOp`s
+    /// to the native app worker. `cmd` and `key` are forwarded so the app can
+    /// stamp the resulting native UI-change echo with
+    /// `Cause::Command { cmd, key }` for echo dedup (Theme 1e). See
+    /// docs/agent/world/ecs-runtime.md (Theme 2a).
+    SurfaceDrive {
+        ops: Vec<SurfaceOp>,
+        cmd: CmdId,
+        key: IdempotencyKey,
+    },
+    /// RELAY frame (host → worker): the host relays a macOS client's observed AX
+    /// surface snapshot to the App's worker subprocess. The worker bridge folds
+    /// it into a `SurfaceObserved` logical input for the World driver. Counterpart
+    /// of the app→host [`AgentToHost::SurfaceObservation`], carried over the
+    /// separate host↔worker RPC link by [`SurfaceRouter`](crate::host::SurfaceRouter).
+    /// See docs/agent/world/ecs-runtime.md (Theme 2b).
+    SurfaceObservation { observed: SurfaceObserved },
+    /// RELAY frame (host → worker): the host relays a macOS client's human-driven
+    /// UI mutation to the App's worker subprocess. The worker bridge folds it into
+    /// a `SurfaceMutated` logical input (only `cause = Human` survives the client's
+    /// echo dedup). Counterpart of the app→host [`AgentToHost::SurfaceMutated`],
+    /// carried over the host↔worker RPC link. See docs/agent/world/ecs-runtime.md
+    /// (Theme 1e; Inv 18).
+    SurfaceMutated { op: SurfaceOp, cause: Cause },
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +208,10 @@ pub async fn read_message<T: for<'de> Deserialize<'de>>(
 mod tests {
     use super::*;
     use crate::agent::external::{UIInteractionRequest, UIInteractionResponse, QuestionOption};
+    use crate::agent::world::surface::{
+        Cause, Hash, IdempotencyKey, PeerEnvelopeId, Route, Selection, SurfaceOp, Viewport,
+        WindowState,
+    };
     use tokio::net::TcpListener;
 
     #[tokio::test]
@@ -492,5 +571,215 @@ mod tests {
         assert!(result.is_none());
 
         sender.await.unwrap();
+    }
+
+    #[test]
+    fn test_surface_observation_roundtrip() {
+        let msg = AgentToHost::SurfaceObservation {
+            observed: SurfaceObserved {
+                surface: 1,
+                version: 42,
+                ax_digest: Hash("digest-abc".into()),
+                focus: Some(7),
+                selection: Some(Selection("sel-1".into())),
+                viewport: Viewport("vp-1".into()),
+                window: WindowState("ws-1".into()),
+                cursor: Some((100, 200)),
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("SurfaceObservation"));
+        let back: AgentToHost = serde_json::from_str(&json).unwrap();
+        match back {
+            AgentToHost::SurfaceObservation { observed } => {
+                assert_eq!(observed.surface, 1);
+                assert_eq!(observed.version, 42);
+                assert_eq!(observed.ax_digest, Hash("digest-abc".into()));
+                assert_eq!(observed.focus, Some(7));
+                assert_eq!(observed.cursor, Some((100, 200)));
+            }
+            _ => panic!("Expected SurfaceObservation"),
+        }
+    }
+
+    #[test]
+    fn test_surface_mutated_roundtrip() {
+        let msg = AgentToHost::SurfaceMutated {
+            op: SurfaceOp::SetValue {
+                surface: 2,
+                element: 5,
+                value: serde_json::json!("hello"),
+                base_version: Some(3),
+            },
+            cause: Cause::Human,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("SurfaceMutated"));
+        let back: AgentToHost = serde_json::from_str(&json).unwrap();
+        match back {
+            AgentToHost::SurfaceMutated { op, cause } => {
+                assert_eq!(cause, Cause::Human);
+                match op {
+                    SurfaceOp::SetValue { surface, element, .. } => {
+                        assert_eq!(surface, 2);
+                        assert_eq!(element, 5);
+                    }
+                    _ => panic!("Expected SetValue"),
+                }
+            }
+            _ => panic!("Expected SurfaceMutated"),
+        }
+    }
+
+    #[test]
+    fn test_surface_mutated_peer_cause_roundtrip() {
+        let msg = AgentToHost::SurfaceMutated {
+            op: SurfaceOp::Click {
+                surface: 3,
+                element: 9,
+                point: None,
+                base_version: None,
+            },
+            cause: Cause::Peer {
+                envelope: PeerEnvelopeId("env-xyz".into()),
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: AgentToHost = serde_json::from_str(&json).unwrap();
+        match back {
+            AgentToHost::SurfaceMutated { cause, .. } => match cause {
+                Cause::Peer { envelope } => assert_eq!(envelope, PeerEnvelopeId("env-xyz".into())),
+                _ => panic!("Expected Peer cause"),
+            },
+            _ => panic!("Expected SurfaceMutated"),
+        }
+    }
+
+    #[test]
+    fn test_relay_agent_surface_drive_roundtrip() {
+        // RELAY frame: worker → host. The worker's outbound drive leg.
+        let msg = AgentToHost::SurfaceDrive {
+            ops: vec![SurfaceOp::SetValue {
+                surface: 4,
+                element: 8,
+                value: serde_json::json!("relayed"),
+                base_version: Some(5),
+            }],
+            cmd: 77,
+            key: IdempotencyKey("cmd-77".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("SurfaceDrive"));
+        assert!(json.contains("cmd-77"));
+        let back: AgentToHost = serde_json::from_str(&json).unwrap();
+        match back {
+            AgentToHost::SurfaceDrive { ops, cmd, key } => {
+                assert_eq!(ops.len(), 1);
+                assert_eq!(cmd, 77);
+                assert_eq!(key, IdempotencyKey("cmd-77".into()));
+            }
+            _ => panic!("Expected AgentToHost::SurfaceDrive"),
+        }
+    }
+
+    #[test]
+    fn test_relay_host_surface_observation_roundtrip() {
+        // RELAY frame: host → worker. The relayed macOS client observation.
+        let msg = HostToAgent::SurfaceObservation {
+            observed: SurfaceObserved {
+                surface: 9,
+                version: 12,
+                ax_digest: Hash("digest-relay".into()),
+                focus: Some(3),
+                selection: None,
+                viewport: Viewport("vp".into()),
+                window: WindowState("ws".into()),
+                cursor: Some((10, 20)),
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("SurfaceObservation"));
+        let back: HostToAgent = serde_json::from_str(&json).unwrap();
+        match back {
+            HostToAgent::SurfaceObservation { observed } => {
+                assert_eq!(observed.surface, 9);
+                assert_eq!(observed.version, 12);
+                assert_eq!(observed.ax_digest, Hash("digest-relay".into()));
+                assert_eq!(observed.focus, Some(3));
+                assert_eq!(observed.cursor, Some((10, 20)));
+            }
+            _ => panic!("Expected HostToAgent::SurfaceObservation"),
+        }
+    }
+
+    #[test]
+    fn test_relay_host_surface_mutated_roundtrip() {
+        // RELAY frame: host → worker. The relayed human-driven client mutation.
+        let msg = HostToAgent::SurfaceMutated {
+            op: SurfaceOp::SetValue {
+                surface: 6,
+                element: 1,
+                value: serde_json::json!("hand-typed"),
+                base_version: None,
+            },
+            cause: Cause::Human,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("SurfaceMutated"));
+        let back: HostToAgent = serde_json::from_str(&json).unwrap();
+        match back {
+            HostToAgent::SurfaceMutated { op, cause } => {
+                assert_eq!(cause, Cause::Human);
+                match op {
+                    SurfaceOp::SetValue { surface, element, .. } => {
+                        assert_eq!(surface, 6);
+                        assert_eq!(element, 1);
+                    }
+                    _ => panic!("Expected SetValue"),
+                }
+            }
+            _ => panic!("Expected HostToAgent::SurfaceMutated"),
+        }
+    }
+
+    #[test]
+    fn test_surface_drive_roundtrip() {
+        let msg = HostToAgent::SurfaceDrive {
+            ops: vec![
+                SurfaceOp::SetValue {
+                    surface: 1,
+                    element: 3,
+                    value: serde_json::json!(42),
+                    base_version: Some(7),
+                },
+                SurfaceOp::Navigate {
+                    surface: 1,
+                    route: Route("settings".into()),
+                    base_version: None,
+                },
+            ],
+            cmd: 99,
+            key: IdempotencyKey("tick-99-effect-0".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("SurfaceDrive"));
+        assert!(json.contains("tick-99-effect-0"));
+        let back: HostToAgent = serde_json::from_str(&json).unwrap();
+        match back {
+            HostToAgent::SurfaceDrive { ops, cmd, key } => {
+                assert_eq!(ops.len(), 2);
+                assert_eq!(cmd, 99);
+                assert_eq!(key, IdempotencyKey("tick-99-effect-0".into()));
+                match &ops[0] {
+                    SurfaceOp::SetValue { surface, element, base_version, .. } => {
+                        assert_eq!(*surface, 1);
+                        assert_eq!(*element, 3);
+                        assert_eq!(*base_version, Some(7));
+                    }
+                    _ => panic!("Expected SetValue as first op"),
+                }
+            }
+            _ => panic!("Expected SurfaceDrive"),
+        }
     }
 }
