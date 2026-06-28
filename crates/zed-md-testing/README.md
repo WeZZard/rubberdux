@@ -133,4 +133,4 @@ This means Zed found Homebrew's Rust instead of rustup's. Solutions:
 
 ## License
 
-MIT
+AGPL-3.0-or-later

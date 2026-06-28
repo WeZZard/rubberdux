@@ -121,6 +121,22 @@ async fn test_full_api_round_trip() {
     let (status, json) = response_json(app, "/api/v1/health").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["status"], "ok");
+    assert_eq!(json["license"], "AGPL-3.0-or-later");
+    assert_eq!(json["legal_url"], "/api/v1/legal");
+    assert_eq!(json["source_url"], "https://github.com/WeZZard/rubberdux");
+
+    // --- Legal metadata endpoint ---
+    let app = full_app(Arc::clone(&state));
+    let (status, json) = response_json(app, "/api/v1/legal").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["name"], "rubberdux");
+    assert_eq!(json["version"], "0.1.0");
+    assert_eq!(json["license"], "AGPL-3.0-or-later");
+    assert_eq!(
+        json["license_url"],
+        "https://www.gnu.org/licenses/agpl-3.0.html"
+    );
+    assert_eq!(json["source_url"], "https://github.com/WeZZard/rubberdux");
 
     // --- List all entries ---
     let app = full_app(Arc::clone(&state));

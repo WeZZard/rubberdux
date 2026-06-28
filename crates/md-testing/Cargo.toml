@@ -3,7 +3,7 @@ name = "md-testing"
 version = "0.1.0"
 edition = "2024"
 description = "Markdown test case parser and linter for rubberdux"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 pulldown-cmark = "0.13"
