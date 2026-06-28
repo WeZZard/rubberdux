@@ -28,13 +28,18 @@ use tokio::net::tcp::OwnedReadHalf;
 use tokio::sync::Mutex;
 
 use crate::agent::world::driver::WorldDriver;
-use crate::agent::world::effects::{Command, SurfaceDriver};
+use crate::agent::world::effects::{Command, CommandKey, PeerSender, SurfaceDriver};
 use crate::agent::world::event_log::FilesystemEventLog;
-use crate::agent::world::inputs::LogicalInput;
+use crate::agent::world::inputs::{
+    Authorization, DeliveryOutcome, DurableEnvelope, LogicalInput, PeerPayload,
+};
 use crate::agent::world::model_client::MessagesClient;
 use crate::agent::world::snapshot::SnapshotStore;
-use crate::agent::world::surface::{classify_native_signal, IdempotencyKey, NativeSignal, SurfaceOp};
-use crate::agent::world::world::{Effort, ModelConfig};
+use crate::agent::world::surface::{
+    classify_native_signal, IdempotencyKey, NativeSignal, PeerEnvelopeId, SurfaceOp,
+};
+use crate::agent::world::world::{Effort, ModelConfig, PeerId};
+use crate::app::peer::NodeId;
 use crate::error::Error;
 use crate::protocol::{self, AgentToHost, HostToAgent};
 use crate::session::{SessionId, SessionManager};
@@ -99,13 +104,13 @@ async fn run_app_worker_inner(
     let (world_input_tx, world_input_rx) =
         tokio::sync::mpsc::channel::<LogicalInput>(WORLD_INPUT_CHANNEL_CAPACITY);
 
-    // The peer-messaging transport is retained as no-op scaffolding for this
-    // milestone: the World driver raises no peer requests yet (peer-send outbound
-    // is DEFERRED to a later task), so nothing pushes to `peer_tx` and the
-    // forwarder idles. Held alive so `peer_rx` stays open until worker exit. See
+    // The peer-messaging transport: the World driver's outbound `WorkerPeerSender`
+    // (built below, on the drive path) forwards each `Command::SendPeer` onto
+    // `peer_tx`, and `forward_peer_requests` drains `peer_rx`, writing each as an
+    // `AgentToHost::PeerSend` the host's broker relays. The send is non-blocking
+    // (a bounded `try_send`), so a peer drive never stalls the World tick. See
     // docs/app/peer/decentralized-messaging.md.
     let (peer_tx, peer_rx) = tokio::sync::mpsc::channel::<PeerRequest>(PEER_CHANNEL_CAPACITY);
-    let _peer_tx = peer_tx;
 
     // The interaction queue is retained as no-op scaffolding: the World driver
     // raises no interactions yet (interaction-raise outbound is DEFERRED), so the
@@ -158,8 +163,16 @@ async fn run_app_worker_inner(
     // replacement for the legacy AgentLoop's `OutputPort` forwarding.
     let driver_writer = writer.clone();
     let driver_app_id = app_id.to_string();
+    // The World driver's outbound peer sink: forwards each `Command::SendPeer` to
+    // the host broker over `peer_tx` (replacing the inert `UnattachedPeerSender` on
+    // this worker's drive path). It owns `peer_tx`, keeping the forwarder's `peer_rx`
+    // open for the worker's lifetime. See docs/agent/world/ecs-runtime.md.
+    let peer_sender = WorkerPeerSender {
+        peer_tx,
+        from: app_id.to_string(),
+    };
     let driver_task = tokio::spawn(async move {
-        run_world_driver(driver, world_input_rx, driver_writer, &driver_app_id).await;
+        run_world_driver(driver, world_input_rx, driver_writer, peer_sender, &driver_app_id).await;
     });
 
     // Worker → host for raised interactions: drain the queue's observer and write
@@ -283,6 +296,56 @@ impl SurfaceDriver for WorkerSurfaceDriver {
     }
 }
 
+/// The subprocess worker's [`PeerSender`]: the real outbound peer sink that REPLACES
+/// the inert `UnattachedPeerSender` on the World driver's drive path. When the agent
+/// emits a `Command::SendPeer`, `drive_live` hands it here; this wraps the drive in a
+/// [`DurableEnvelope`] (so the receiving worker reconstructs the inbound peer input
+/// verbatim) and forwards it onto `peer_tx` as a [`PeerRequest::Send`], which
+/// `forward_peer_requests` writes as an `AgentToHost::PeerSend` the host's broker
+/// relays (`local_supervisor` → `PeerBroker::relay`). The forward is non-blocking (a
+/// bounded `try_send`) so a peer drive never stalls the tick. It reports
+/// [`DeliveryOutcome::Queued`] best-effort: the AUTHORITATIVE routing verdict lives in
+/// the host broker (an in-process host injects the broker-backed `BrokerPeerSender`,
+/// which returns the real outcome); recording a durable ack is a later pass. See
+/// docs/agent/world/ecs-runtime.md (§645; the World↔broker boundary).
+struct WorkerPeerSender {
+    /// The worker's peer-request channel into `forward_peer_requests`.
+    peer_tx: tokio::sync::mpsc::Sender<PeerRequest>,
+    /// This worker's App id — the sender identity stamped into `auth.from`.
+    from: String,
+}
+
+impl PeerSender for WorkerPeerSender {
+    async fn send(
+        &self,
+        to: &PeerId,
+        payload: &PeerPayload,
+        _key: &CommandKey,
+        envelope: &PeerEnvelopeId,
+    ) -> Result<DeliveryOutcome, Error> {
+        let durable = DurableEnvelope {
+            id: envelope.clone(),
+            payload: payload.clone(),
+            auth: Authorization {
+                from: PeerId {
+                    app_id: self.from.clone(),
+                    node_id: NodeId::LOCAL.to_string(),
+                },
+                // Shape-level token (verification is a later enforcement pass).
+                token: self.from.clone(),
+            },
+        };
+        let wire = serde_json::to_value(&durable)?;
+        // Fire-and-forget onto the host: a full/closed channel drops the drive rather
+        // than blocking the tick (best-effort; the durable broker hardens this).
+        let _ = self.peer_tx.try_send(PeerRequest::Send {
+            to: to.app_id.clone(),
+            payload: wire,
+        });
+        Ok(DeliveryOutcome::Queued)
+    }
+}
+
 /// Run the World tick-driver loop over an already-opened [`WorldDriver`]
 /// (resumed or freshly bootstrapped at startup by [`open_world_driver`]): drain
 /// `world_input_rx`, driving each input to quiescence and forwarding the derived
@@ -293,11 +356,35 @@ async fn run_world_driver(
     mut driver: WorldDriver<MessagesClient, WorkerSurfaceDriver, FilesystemEventLog>,
     mut world_input_rx: tokio::sync::mpsc::Receiver<LogicalInput>,
     writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    peer_sender: WorkerPeerSender,
     app_id: &str,
 ) {
     while let Some(input) = world_input_rx.recv().await {
-        match driver.submit(input).await {
+        // The inbound peer envelope this input folds (captured BEFORE the input is
+        // moved into submit): a successful submit has durably appended the
+        // `DriveRequested`/`PeerDelivered` to the World's stratum-1 log, so the
+        // worker can ack the DURABLE fold back to the host broker — the receiver→
+        // broker confirmation that makes the sender's `Delivered` non-optimistic
+        // (INV-3) and advances the durable inbox (INV-4). A redelivery the receiver's
+        // stratum-1 dedup folded as a NO-OP is STILL acked so the broker advances
+        // past it. See docs/agent/world/ecs-runtime.md §"Durable peer delivery".
+        let folded_envelope = peer_envelope_of(&input);
+        // Drive each input under the real peer sender so a `Command::SendPeer`
+        // reaches the host broker (not the inert `UnattachedPeerSender`).
+        match driver.submit_with_peer_sender(input, &peer_sender).await {
             Ok(notifications) => {
+                if let Some(envelope) = folded_envelope {
+                    let ack = AgentToHost::PeerDeliverAck { envelope: envelope.0 };
+                    let mut w = writer.lock().await;
+                    if let Err(e) = protocol::write_message(&mut w, &ack).await {
+                        log::error!(
+                            "[app-worker:{}] failed to ack peer fold: {}",
+                            app_id,
+                            e
+                        );
+                        return;
+                    }
+                }
                 for notification in notifications {
                     let frame = AgentToHost::EntryNotification {
                         entry: notification.entry,
@@ -557,6 +644,63 @@ fn bridge_inbound_surface_frame(frame: AgentToHost) -> Option<LogicalInput> {
     }
 }
 
+/// Bridge an inbound `HostToAgent::PeerDeliver { from, payload }` into the World's
+/// peer-edge input — REPLACING the legacy flattening to `UserMessage { to: 0 }`. The
+/// broker relays the sender's [`DurableEnvelope`] (id + payload + auth) as `payload`:
+///
+/// - `PeerPayload::Drive` → `LogicalInput::DriveRequested` (the surface ops + prompt
+///   the target's PeerDriveSystem applies as a projection + Inbox enqueue), and
+/// - `PeerPayload::Message` → `LogicalInput::PeerDelivered` (a generic peer message).
+///
+/// `from` is the broker's authoritative sender App id on the local node, rebuilt as a
+/// World-side [`PeerId`] so the driver stamps the input `Origin::Peer` on
+/// `edge_for(Peer(from))` and PeerDriveSystem's authorization (`auth.from == from`)
+/// resolves. A payload that is NOT a `DurableEnvelope` (a legacy/plain message, e.g. a
+/// drained inbox entry) is delivered as `PeerDelivered` carrying the raw payload under
+/// a sender-derived envelope id. See docs/agent/world/ecs-runtime.md (Theme 4a/4b;
+/// DriveRequested; PeerDelivered).
+/// The inbound peer envelope this `LogicalInput` folds, if any: a `DriveRequested`
+/// or `PeerDelivered` carries the sender-assigned [`PeerEnvelopeId`] the worker acks
+/// back to the host broker after the durable fold (the receiver→broker durable-fold
+/// confirmation, INV-3/INV-4). `None` for every non-peer input.
+fn peer_envelope_of(input: &LogicalInput) -> Option<PeerEnvelopeId> {
+    match input {
+        LogicalInput::DriveRequested { envelope, .. }
+        | LogicalInput::PeerDelivered { envelope, .. } => Some(envelope.clone()),
+        _ => None,
+    }
+}
+
+fn bridge_peer_deliver(from: &str, payload: serde_json::Value) -> LogicalInput {
+    let from_peer = PeerId {
+        app_id: from.to_string(),
+        node_id: NodeId::LOCAL.to_string(),
+    };
+    match serde_json::from_value::<DurableEnvelope>(payload.clone()) {
+        Ok(envelope) => match envelope.payload {
+            PeerPayload::Drive(drive) => LogicalInput::DriveRequested {
+                from: from_peer,
+                envelope: envelope.id,
+                drive,
+                auth: envelope.auth,
+            },
+            PeerPayload::Message(message) => LogicalInput::PeerDelivered {
+                from: from_peer,
+                envelope: envelope.id,
+                payload: message,
+            },
+        },
+        // A legacy/plain payload carries no durable envelope: deliver it as a generic
+        // peer message keyed by a sender-derived envelope id (best-effort — durable
+        // idempotency is the broker's later pass).
+        Err(_) => LogicalInput::PeerDelivered {
+            envelope: PeerEnvelopeId(format!("{from}/{}/legacy", NodeId::LOCAL)),
+            from: from_peer,
+            payload,
+        },
+    }
+}
+
 /// Convert an ECS-World surface-drive Command to a `HostToAgent::SurfaceDrive`
 /// frame for dispatch to the macOS app client. Returns `None` when the Command
 /// is not a UI surface drive (i.e. `tool != "set_value"`). The `cmd` and `key`
@@ -584,9 +728,9 @@ fn surface_drive_frame(command: &Command) -> Option<HostToAgent> {
 
 /// Read host frames until disconnect or shutdown, bridging them into the worker:
 /// a `UserMessage` becomes a `LogicalInput::UserMessage` submitted to the World
-/// driver's input queue; a `PeerDeliver` is likewise submitted as a turn the App
-/// reacts to (peer-origin ATTRIBUTION is DEFERRED — the World `UserMessage` input
-/// carries no peer marker yet); a `PeerListResult` fulfills the oldest pending
+/// driver's input queue; a `PeerDeliver` is mapped by `bridge_peer_deliver` to an
+/// `Origin::Peer` `DriveRequested`/`PeerDelivered` on the peer edge (no longer
+/// flattened to a `UserMessage`); a `PeerListResult` fulfills the oldest pending
 /// `peer_list`. A relayed `SurfaceObservation`/`SurfaceMutated` (the host→worker
 /// leg of the surface relay) is re-wrapped as its `AgentToHost` form and pushed
 /// onto `surface_obs_tx`, where `bridge_surface_inbound` folds it into the World
@@ -623,16 +767,14 @@ async fn bridge_host_messages(
                 }
             }
             Ok(Some(HostToAgent::PeerDeliver { from, payload })) => {
-                // A peer message is delivered as a turn the App reacts to. The
-                // payload's `text` is the message body; an opaque payload without
-                // text is rendered as-is. Peer-origin ATTRIBUTION (a Peer marker on
-                // the input) is DEFERRED; for this milestone it drives a plain turn.
-                let text = payload
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| payload.to_string());
-                match world_input_tx.try_send(LogicalInput::UserMessage { to: 0, text }) {
+                // A peer message becomes an `Origin::Peer` input on the peer edge — a
+                // cross-World `DriveRequested` or a generic `PeerDelivered` — NEVER
+                // flattened to a `UserMessage` (the World records A acting inside B in
+                // B's own log, Theme 4b). The driver stamps `Origin::Peer` on
+                // `edge_for(Peer(from))`. Submitting only ENQUEUES, so the pump stays
+                // non-blocking (root CLAUDE.md UX rule).
+                let input = bridge_peer_deliver(&from, payload);
+                match world_input_tx.try_send(input) {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         log::warn!(
@@ -936,6 +1078,107 @@ mod tests {
                 assert!(!key.0.is_empty(), "key must be non-empty (P0 placeholder)");
             }
             other => panic!("expected SurfaceDrive frame, got {:?}", other),
+        }
+    }
+
+    /// [Verifies VC-3.2] An inbound `PeerDeliver` carrying a `DurableEnvelope` whose
+    /// payload is a `Drive` maps to `LogicalInput::DriveRequested`, preserving the
+    /// surface ops, prompt, envelope, and auth — no flattening to `UserMessage`.
+    #[test]
+    fn peer_deliver_drive_envelope_maps_to_drive_requested() {
+        use crate::agent::world::inputs::DriveCommand;
+
+        let from = "lead-app";
+        let durable = DurableEnvelope {
+            id: PeerEnvelopeId("env-drive-1".into()),
+            payload: PeerPayload::Drive(DriveCommand {
+                surface_ops: vec![SurfaceOp::SetValue {
+                    surface: 1,
+                    element: 2,
+                    value: serde_json::json!("typed by peer"),
+                    base_version: None,
+                }],
+                prompt: Some("please continue".into()),
+            }),
+            auth: Authorization {
+                from: PeerId {
+                    app_id: from.into(),
+                    node_id: "local".into(),
+                },
+                token: from.into(),
+            },
+        };
+        let payload = serde_json::to_value(&durable).expect("serialise durable envelope");
+
+        match bridge_peer_deliver(from, payload) {
+            LogicalInput::DriveRequested {
+                from: f,
+                envelope,
+                drive,
+                auth,
+            } => {
+                assert_eq!(
+                    f,
+                    PeerId {
+                        app_id: from.into(),
+                        node_id: "local".into()
+                    },
+                    "from is rebuilt as the local-node sender PeerId"
+                );
+                assert_eq!(envelope, PeerEnvelopeId("env-drive-1".into()));
+                assert_eq!(drive.surface_ops.len(), 1, "the drive ops are preserved");
+                assert_eq!(drive.prompt.as_deref(), Some("please continue"));
+                assert_eq!(auth.token, from, "the auth is preserved");
+                assert_eq!(auth.from, f, "auth.from matches the sender (authorization passes)");
+            }
+            other => panic!("expected DriveRequested, got {other:?}"),
+        }
+    }
+
+    /// [Verifies VC-3.2] A `DurableEnvelope` whose payload is a `Message` maps to
+    /// `LogicalInput::PeerDelivered` (a generic peer message), not a `UserMessage`.
+    #[test]
+    fn peer_deliver_message_envelope_maps_to_peer_delivered() {
+        let from = "peer-x";
+        let durable = DurableEnvelope {
+            id: PeerEnvelopeId("env-msg-1".into()),
+            payload: PeerPayload::Message(serde_json::json!({ "text": "hi" })),
+            auth: Authorization {
+                from: PeerId {
+                    app_id: from.into(),
+                    node_id: "local".into(),
+                },
+                token: from.into(),
+            },
+        };
+        let payload = serde_json::to_value(&durable).expect("serialise durable envelope");
+
+        match bridge_peer_deliver(from, payload) {
+            LogicalInput::PeerDelivered {
+                from: f,
+                envelope,
+                payload,
+            } => {
+                assert_eq!(f.app_id, "peer-x");
+                assert_eq!(envelope, PeerEnvelopeId("env-msg-1".into()));
+                assert_eq!(payload["text"], "hi");
+            }
+            other => panic!("expected PeerDelivered, got {other:?}"),
+        }
+    }
+
+    /// A legacy/plain `PeerDeliver` payload (no durable envelope) still maps to a
+    /// `PeerDelivered` carrying the raw payload — never a `UserMessage` and never a
+    /// decode error.
+    #[test]
+    fn peer_deliver_legacy_payload_maps_to_peer_delivered_raw() {
+        let payload = serde_json::json!({ "text": "legacy" });
+        match bridge_peer_deliver("old-app", payload) {
+            LogicalInput::PeerDelivered { from, payload, .. } => {
+                assert_eq!(from.app_id, "old-app");
+                assert_eq!(payload["text"], "legacy");
+            }
+            other => panic!("expected PeerDelivered, got {other:?}"),
         }
     }
 

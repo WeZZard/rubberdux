@@ -314,6 +314,7 @@ mod tests {
                 budget,
                 inbox,
                 turns: 0,
+                spawned: 0,
                 model: None,
             },
         );

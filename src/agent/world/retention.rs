@@ -159,6 +159,7 @@ mod tests {
                 budget: Budget::default(),
                 inbox: Inbox::default(),
                 turns: 0,
+                spawned: 0,
                 model: None,
             },
         );

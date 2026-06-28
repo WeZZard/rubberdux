@@ -231,6 +231,7 @@ mod tests {
                 budget: crate::agent::world::budget::Budget::default(),
                 inbox: crate::agent::world::world::Inbox::default(),
                 turns: 0,
+                spawned: 0,
                 model: None,
             },
         );

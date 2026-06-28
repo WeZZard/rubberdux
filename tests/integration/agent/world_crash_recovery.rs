@@ -27,9 +27,8 @@ use serde_json::Value as Json;
 use rubberdux::agent::world::budget::Budget;
 use rubberdux::agent::world::effects::{
     Command, CommandKey, ModelCaller, Reconciliation, ResultStamp, SurfaceDriver, ToolSet,
-    drive_live, fingerprint_call, resume,
+    UnattachedPeerSender, drive_live, fingerprint_call, resume,
 };
-use rubberdux::agent::world::surface::SurfaceView;
 use rubberdux::agent::world::event_log::{EventLog, MemoryEventLog};
 use rubberdux::agent::world::gates::EntityGate;
 use rubberdux::agent::world::history::{Block, History, Msg, Role};
@@ -73,6 +72,7 @@ fn genesis(seed: u64, model: &ModelConfig) -> World {
             budget: Budget::default(),
             inbox: Inbox::default(),
             turns: 0,
+            spawned: 0,
             model: None,
         },
     );
@@ -88,6 +88,12 @@ fn offline_model() -> ModelConfig {
         max_tokens: 1024,
         effort: Effort::Medium,
     }
+}
+
+/// A trivial World whose perceived surface view is empty — the `&World` a
+/// CallModel-only `drive_live` reads only `resources.surfaces` (empty) from.
+fn surfaceless_world() -> World {
+    World::new(0, Resources::new(7, offline_model()))
 }
 
 fn session_started(seed: u64) -> Event {
@@ -250,9 +256,10 @@ async fn vc_2_1_wal_dispatch_intent_precedes_result_and_result_inherits_ctx() {
     let results = drive_live(
         &[command.clone()],
         stamp,
-        &SurfaceView::new(),
+        &surfaceless_world(),
         &StubClient,
         &NoSurfaceDrive,
+        &UnattachedPeerSender,
         &mut ordered,
     )
     .await
@@ -327,9 +334,10 @@ async fn vc_2_1_wal_dispatch_intent_precedes_result_and_result_inherits_ctx() {
     let mem_results = drive_live(
         &[command],
         stamp,
-        &SurfaceView::new(),
+        &surfaceless_world(),
         &StubClient,
         &NoSurfaceDrive,
+        &UnattachedPeerSender,
         &mut memory,
     )
     .await

@@ -10,14 +10,23 @@
 //!
 //! The inbox is an append-only JSONL log, mirroring the App registry's
 //! `members.jsonl`/`merge_log.jsonl` idioms (`crate::app::registry::store`):
-//! each line is one [`PeerEnvelope`]. Draining reads the file, hands back the
-//! envelopes, and truncates the log so a delivered message is not re-delivered.
+//! each line is one [`PeerEnvelope`]. It is the durable, reconstructable QUEUE the
+//! broker fsyncs an envelope into BEFORE delivery and from which the restore-drain
+//! redelivers — an envelope is removed ([`Mailbox::advance`]) ONLY AFTER the
+//! receiver durably folds it (its stratum-1 World log records the envelope id),
+//! never up-front, so a crash mid-drain cannot lose the undelivered remainder. The
+//! dedup authority is the RECEIVER's World fold, NOT a broker-side ledger: there is
+//! deliberately NO pre-apply "delivered" record here that could suppress a
+//! redelivery the effectively-once guarantee depends on. See
+//! docs/agent/world/ecs-runtime.md §"Durable peer delivery".
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::world::inputs::DurableEnvelope;
+use crate::agent::world::surface::PeerEnvelopeId;
 use crate::app::peer::PeerId;
 use crate::error::Error;
 
@@ -37,10 +46,24 @@ pub struct PeerEnvelope {
     pub payload: serde_json::Value,
 }
 
+impl PeerEnvelope {
+    /// The [`DurableEnvelope`] (id + payload + auth) carried in this envelope's
+    /// payload, when the payload is one. `None` for a legacy/plain payload that
+    /// predates the durable protocol — such an envelope is delivered best-effort
+    /// (undeduped). See docs/agent/world/ecs-runtime.md (§"Durable peer delivery").
+    pub fn durable(&self) -> Option<DurableEnvelope> {
+        serde_json::from_value::<DurableEnvelope>(self.payload.clone()).ok()
+    }
+}
+
 /// The append-only inbox for one App, rooted at its on-disk directory. Holds the
 /// peer-message envelopes addressed to the App while its worker was not running,
 /// drained in arrival order when the App is restored.
 pub struct Mailbox {
+    /// The durable inbox queue (`inbox.jsonl`): the reconstructable outbox of
+    /// envelopes awaiting the App's restore. Redelivered in arrival order on
+    /// restore; an envelope is removed only AFTER the receiver durably folds it
+    /// ([`Mailbox::advance`]), never up-front.
     path: PathBuf,
 }
 
@@ -61,7 +84,10 @@ impl Mailbox {
     /// Append one envelope to the inbox. Called by the broker when a message is
     /// addressed to an App whose worker is not running. Creates the file and any
     /// missing parent directories on first append, mirroring the JSONL append
-    /// idiom in `crate::app::registry::store`.
+    /// idiom in `crate::app::registry::store`. The write is `fsync`'d so an
+    /// accepted-but-undelivered peer drive survives a crash right after acceptance
+    /// — the durable outbox the queued set is reconstructable from (durable peer
+    /// delivery, point 1). See docs/agent/world/ecs-runtime.md.
     pub fn enqueue(&self, envelope: &PeerEnvelope) -> Result<(), Error> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(Error::Io)?;
@@ -73,7 +99,33 @@ impl Mailbox {
             .append(true)
             .open(&self.path)
             .map_err(Error::Io)?;
-        std::io::Write::write_all(&mut file, line.as_bytes()).map_err(Error::Io)
+        std::io::Write::write_all(&mut file, line.as_bytes()).map_err(Error::Io)?;
+        // fsync: the durable outbox must survive a crash immediately after an
+        // accepted send, so an undelivered peer drive is never lost.
+        file.sync_all().map_err(Error::Io)
+    }
+
+    /// `fsync` `envelope` into the durable inbox queue IDEMPOTENTLY by `id`: a
+    /// no-op (returns `false`) if an envelope with the same durable id is already
+    /// queued — it is already durable from a prior attempt. The durable relay
+    /// fsyncs-before-deliver on EVERY attempt (INV-3), so a retry of the same
+    /// logical send must NOT pile up duplicate inbox entries that a single
+    /// per-envelope advance would then leave behind; a distinct id is always
+    /// appended (returns `true`). See docs/agent/world/ecs-runtime.md.
+    pub fn enqueue_unique(
+        &self,
+        envelope: &PeerEnvelope,
+        id: &PeerEnvelopeId,
+    ) -> Result<bool, Error> {
+        let already = self
+            .peek()?
+            .into_iter()
+            .any(|e| e.durable().map(|d| d.id).as_ref() == Some(id));
+        if already {
+            return Ok(false);
+        }
+        self.enqueue(envelope)?;
+        Ok(true)
     }
 
     /// Whether the inbox currently holds any undelivered envelopes.
@@ -82,6 +134,14 @@ impl Mailbox {
             Ok(meta) => meta.len() == 0,
             Err(_) => true,
         }
+    }
+
+    /// The number of envelopes currently queued in the inbox. `0` when the
+    /// inbox does not exist or is empty. Used by the broker's RejectNewest cap
+    /// check (see docs/agent/world/ecs-runtime.md §"Durable peer delivery"
+    /// §1335–1338): a full inbox rejects the incoming send without enqueueing.
+    pub fn depth(&self) -> Result<usize, Error> {
+        Ok(self.peek()?.len())
     }
 
     /// Read the queued envelopes without removing them. A missing inbox yields an
@@ -128,6 +188,80 @@ impl Mailbox {
             Err(e) => return Err(Error::Io(e)),
         }
         Ok(envelopes)
+    }
+
+    /// ADVANCE the durable inbox past one envelope: remove the FIRST queued entry
+    /// whose [`DurableEnvelope`] id is `id`, rewriting the remainder (`fsync`'d).
+    /// Returns whether a matching envelope was removed.
+    ///
+    /// This is the crash-safe per-envelope advance (INV-4): the broker/restore-drain
+    /// calls it ONLY AFTER the receiver durably folds the envelope (its stratum-1
+    /// World log records the id). Because the removal happens strictly AFTER the
+    /// durable fold, a crash in the window between fold and advance leaves the
+    /// envelope queued — it is redelivered on the next restore and DEDUPED at the
+    /// receiver's stratum-1 log (a NO-OP), never lost and never double-applied. The
+    /// inbox is never truncated up-front, so the undelivered remainder always
+    /// survives. See docs/agent/world/ecs-runtime.md §"Durable peer delivery".
+    pub fn advance(&self, id: &PeerEnvelopeId) -> Result<bool, Error> {
+        let queued = self.peek()?;
+        let mut removed = false;
+        let mut kept: Vec<PeerEnvelope> = Vec::with_capacity(queued.len());
+        for envelope in queued {
+            if !removed && envelope.durable().map(|d| d.id).as_ref() == Some(id) {
+                removed = true; // drop exactly the first matching entry
+            } else {
+                kept.push(envelope);
+            }
+        }
+        if removed {
+            self.rewrite(&kept)?;
+        }
+        Ok(removed)
+    }
+
+    /// Remove and return the HEAD envelope of the durable inbox, rewriting the
+    /// remainder (`fsync`'d); `None` when the inbox is empty. The arrival-order
+    /// advance for a legacy/plain queued envelope that carries no durable id (so
+    /// [`Mailbox::advance`] cannot key on one). Like `advance`, it is called only
+    /// after the head has been delivered, so the remainder is never lost up-front.
+    pub fn remove_first(&self) -> Result<Option<PeerEnvelope>, Error> {
+        let mut queued = self.peek()?;
+        if queued.is_empty() {
+            return Ok(None);
+        }
+        let head = queued.remove(0);
+        self.rewrite(&queued)?;
+        Ok(Some(head))
+    }
+
+    /// Rewrite the inbox to exactly `envelopes` (`fsync`'d). An empty result removes
+    /// the file so a later `enqueue` re-creates a fresh log, mirroring `drain`'s
+    /// truncate. The whole-file rewrite is the single-host broker's atomic-enough
+    /// advance: the inbox is read fully (`peek`) before it is rewritten.
+    fn rewrite(&self, envelopes: &[PeerEnvelope]) -> Result<(), Error> {
+        if envelopes.is_empty() {
+            match fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::Io(e)),
+            }
+            return Ok(());
+        }
+        let mut body = String::new();
+        for envelope in envelopes {
+            body.push_str(&serde_json::to_string(envelope).map_err(Error::Json)?);
+            body.push('\n');
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+            .map_err(Error::Io)?;
+        std::io::Write::write_all(&mut file, body.as_bytes()).map_err(Error::Io)?;
+        // fsync: the advance must be durable so a crash right after it never
+        // resurrects an already-folded envelope.
+        file.sync_all().map_err(Error::Io)
     }
 }
 
@@ -209,6 +343,113 @@ mod tests {
         let drained = mailbox.drain().unwrap();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].payload["text"], "two");
+    }
+
+    // -- durable inbox queue: crash-safe per-envelope advance (INV-4) ----------
+
+    /// A durable envelope (id + payload + auth) carrying envelope id `id`.
+    fn durable(id: &str) -> crate::agent::world::inputs::DurableEnvelope {
+        use crate::agent::world::inputs::{Authorization, DurableEnvelope, PeerPayload};
+        use crate::agent::world::world::PeerId as WorldPeerId;
+        DurableEnvelope {
+            id: PeerEnvelopeId(id.into()),
+            payload: PeerPayload::Message(serde_json::json!({ "text": "x" })),
+            auth: Authorization {
+                from: WorldPeerId { app_id: "a".into(), node_id: "local".into() },
+                token: "a".into(),
+            },
+        }
+    }
+
+    /// A queued [`PeerEnvelope`] whose payload IS the durable envelope `id` — the
+    /// shape the broker fsyncs into the inbox queue on the durable path.
+    fn queued(id: &str) -> PeerEnvelope {
+        PeerEnvelope {
+            from: PeerId::local(AppId("a".into())),
+            payload: serde_json::to_value(durable(id)).unwrap(),
+        }
+    }
+
+    /// `advance(id)` removes EXACTLY the first queued envelope with that durable id,
+    /// `fsync`'d, leaving the rest in arrival order — the per-envelope advance the
+    /// drain performs ONLY after the receiver durably folds the head (INV-4).
+    #[test]
+    fn advance_removes_one_envelope_by_id_and_keeps_the_remainder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mailbox = Mailbox::in_dir(dir.path());
+        mailbox.enqueue(&queued("env-1")).unwrap();
+        mailbox.enqueue(&queued("env-2")).unwrap();
+
+        // Advancing past env-1 leaves env-2 still queued.
+        assert!(mailbox.advance(&PeerEnvelopeId("env-1".into())).unwrap());
+        let rest = mailbox.peek().unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].durable().map(|d| d.id), Some(PeerEnvelopeId("env-2".into())));
+
+        // Advancing past a not-queued id removes nothing.
+        assert!(!mailbox.advance(&PeerEnvelopeId("missing".into())).unwrap());
+        assert_eq!(mailbox.peek().unwrap().len(), 1);
+
+        // Advancing past env-2 empties the inbox.
+        assert!(mailbox.advance(&PeerEnvelopeId("env-2".into())).unwrap());
+        assert!(mailbox.is_empty());
+    }
+
+    /// A crash-window scenario at the queue level: an envelope fsynced into the
+    /// inbox BEFORE delivery is NOT removed up-front — it survives until the
+    /// receiver confirms a durable fold, so a crash before the advance leaves it
+    /// redeliverable. Re-reading the inbox after the "crash" still finds it.
+    #[test]
+    fn enqueued_envelope_survives_until_advanced() {
+        let dir = tempfile::tempdir().unwrap();
+        let mailbox = Mailbox::in_dir(dir.path());
+        mailbox.enqueue(&queued("env-9")).unwrap();
+
+        // "Crash" before any advance: a fresh Mailbox over the same dir still sees
+        // the envelope — it was never dropped or deduped away.
+        let reopened = Mailbox::in_dir(dir.path());
+        let surviving = reopened.peek().unwrap();
+        assert_eq!(surviving.len(), 1, "the un-advanced envelope persists across a crash");
+        assert_eq!(surviving[0].durable().map(|d| d.id), Some(PeerEnvelopeId("env-9".into())));
+
+        // Only after a durable-fold confirmation does the advance remove it.
+        assert!(reopened.advance(&PeerEnvelopeId("env-9".into())).unwrap());
+        assert!(reopened.is_empty());
+    }
+
+    /// `remove_first` pops the arrival-order head (`fsync`'d), the advance for a
+    /// legacy/plain queued envelope that carries no durable id.
+    #[test]
+    fn remove_first_pops_the_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let mailbox = Mailbox::in_dir(dir.path());
+        mailbox.enqueue(&envelope("a", "first")).unwrap();
+        mailbox.enqueue(&envelope("b", "second")).unwrap();
+
+        let head = mailbox.remove_first().unwrap().expect("a head");
+        assert_eq!(head.payload["text"], "first");
+        let rest = mailbox.peek().unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].payload["text"], "second");
+
+        assert!(mailbox.remove_first().unwrap().is_some());
+        assert!(mailbox.remove_first().unwrap().is_none(), "an empty inbox pops None");
+    }
+
+    #[test]
+    fn durable_extracts_the_full_envelope() {
+        let envelope = PeerEnvelope {
+            from: PeerId::local(AppId("a".into())),
+            payload: serde_json::to_value(durable("env-1")).unwrap(),
+        };
+        assert_eq!(envelope.durable().map(|d| d.id), Some(PeerEnvelopeId("env-1".into())));
+
+        // A plain (legacy) payload carries no durable envelope.
+        let plain = PeerEnvelope {
+            from: PeerId::local(AppId("a".into())),
+            payload: serde_json::json!({ "x": 1 }),
+        };
+        assert!(plain.durable().is_none());
     }
 
     #[test]

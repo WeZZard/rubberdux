@@ -95,16 +95,60 @@ pub struct WindowState(pub String);
 pub struct IdempotencyKey(pub String);
 
 // ---------------------------------------------------------------------------
-// PeerEnvelopeId — durable peer-message identity
+// PeerEnvelopeId — sender-assigned, retry-stable cross-process delivery key
 // ---------------------------------------------------------------------------
 
-/// A durable envelope id assigned by the sender of a cross-World peer
-/// message. Used in `Cause::Peer` to correlate a native UI change echo with
-/// the originating `DriveRequested`, so the echo can be DROPPED (deduped)
-/// without logging a redundant `SurfaceMutated` (Theme 1e). Exact encoding
-/// fixed by the federation pass. See docs/agent/world/ecs-runtime.md.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The sender-assigned, retry-stable cross-process delivery key for a peer
+/// message.  This is the idempotency handle the receiver's stratum-1 log
+/// dedups by (see docs/agent/world/ecs-runtime.md §"Durable peer delivery"):
+///
+/// - **Stable across retries.** The sender must assign the SAME id to every
+///   attempt to deliver the same logical message.  A redelivered envelope
+///   whose `PeerEnvelopeId` is already present in the receiver log is
+///   deduplicated (logged as trace, never re-applied), giving
+///   effectively-once semantics despite at-least-once transport.
+///
+/// - **Distinct per logical message.** Each distinct logical send MUST use a
+///   unique id so independent messages are never silently collapsed.
+///
+/// - **Does not cross from per-cmd fingerprint.** The per-`cmd`
+///   `Fingerprint`/`IdempotencyKey` live inside one process and are NOT
+///   transmitted to the receiver; `PeerEnvelopeId` is the SOLE
+///   cross-process correlation handle.
+///
+/// The inner string is opaque at this level; the canonical encoding is fixed
+/// by the federation pass.  Use [`PeerEnvelopeId::new`] to build a key with
+/// a documented stability contract.
+///
+/// The `Cause::Peer` echo-dedup use (Theme 1e) remains a valid secondary
+/// use: correlating a native UI change echo with the originating
+/// `DriveRequested` so the echo is dropped rather than logged as a redundant
+/// `SurfaceMutated`.  That use is fully preserved by this type.
+///
+/// See docs/agent/world/ecs-runtime.md §"Durable peer delivery".
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PeerEnvelopeId(pub String);
+
+impl PeerEnvelopeId {
+    /// Build a sender-assigned delivery key from the sender's `app_id`,
+    /// `node_id`, and a sender-local monotone sequence number.
+    ///
+    /// **Stability contract:** the same `(app_id, node_id, seq)` triple
+    /// always produces the same `PeerEnvelopeId`, so the sender can
+    /// re-construct the identical key on every retry of the same logical
+    /// send.
+    ///
+    /// **Uniqueness contract:** `seq` must be distinct for each distinct
+    /// logical message within the same sender so independent sends are never
+    /// silently deduplicated at the receiver.
+    ///
+    /// This method is the CANONICAL path for constructing a delivery key; the
+    /// resulting id is opaque to the receiver (the receiver deduplicates by
+    /// identity, not by parsing the inner string).
+    pub fn new(app_id: &str, node_id: &str, seq: u64) -> Self {
+        PeerEnvelopeId(format!("{app_id}/{node_id}/{seq}"))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SurfaceOp — payload-bearing surface mutation (Theme 2a)
@@ -1011,6 +1055,51 @@ mod tests {
             "ops apply in Vec order, each bumping the version"
         );
         assert_eq!(next.get(&1).map(|s| s.version), Some(2));
+    }
+
+    // --- PeerEnvelopeId — sender-assigned delivery key (VC-4.2) -----------
+
+    /// [Verifies VC-4.2] `PeerEnvelopeId::new` builds a key that is
+    /// **stable across retries** (same inputs → same id) and **distinct per
+    /// logical message** (different seq → different id), proving the
+    /// stability contract required for effectively-once delivery.
+    /// The key also round-trips through serde-canonical JSON unchanged.
+    #[test]
+    fn peer_envelope_id_is_stable_across_retries_and_round_trips() {
+        let app_id = "2026-01-01-00-00-00-000000-000000-UTC";
+        let node_id = "node-a";
+
+        // Stability: same (app_id, node_id, seq) → identical id on every call.
+        let a = PeerEnvelopeId::new(app_id, node_id, 7);
+        let b = PeerEnvelopeId::new(app_id, node_id, 7);
+        assert_eq!(a, b, "same inputs must produce the same delivery key (retry-stable)");
+
+        // Uniqueness: distinct seq → distinct id (different logical messages).
+        let c = PeerEnvelopeId::new(app_id, node_id, 8);
+        assert_ne!(a, c, "different seq must produce a different delivery key");
+
+        // Round-trip: serde-canonical, no HashMap, no float.
+        round_trip(&a);
+        round_trip(&c);
+
+        // Distinct sender identity → distinct id even for the same seq.
+        let d = PeerEnvelopeId::new("other-app", node_id, 7);
+        assert_ne!(a, d, "different app_id must produce a different delivery key");
+    }
+
+    /// [Verifies VC-4.2] The existing `Cause::Peer` echo-dedup use is
+    /// UNAFFECTED by the promotion: `classify_native_signal` still returns
+    /// `DropEcho` for a `Cause::Peer` carrying a `PeerEnvelopeId` built via
+    /// the new constructor.
+    #[test]
+    fn peer_envelope_id_promotion_does_not_break_echo_dedup() {
+        let envelope = PeerEnvelopeId::new("2026-01-01-00-00-00-000000-000000-UTC", "node-b", 1);
+        let cause = Cause::Peer { envelope };
+        assert_eq!(
+            classify_native_signal(&cause),
+            NativeSignal::DropEcho,
+            "Cause::Peer still classified as DropEcho after PeerEnvelopeId promotion"
+        );
     }
 
     /// [Verifies VC-U.1] Echo dedup: only a `Cause::Human` native signal becomes a

@@ -234,6 +234,15 @@ struct Resources {
     ids:       IdAlloc,        // monotonic id allocator — mints `cmd`/`request_id`/`edge_id`/
                                // `timer_id` as PURE functions of World state, never shell-
                                // assigned (Correlate by identity); the SOLE id minter
+    applied_envelopes: BTreeSet<PeerEnvelopeId>,
+                               // receiver-stratum-1 dedup set — records every INBOUND peer
+                               // envelope id that has been durably folded into this World. THE
+                               // SOLE dedup authority for at-least-once peer redelivery: a
+                               // second `DriveRequested`/`PeerDelivered` whose `PeerEnvelopeId`
+                               // is already present is a NO-OP fold (trace, not re-applied).
+                               // There is NO broker-side permanent dedup ledger — this in-World
+                               // set, rebuilt by replaying the stratum-1 log, is the only
+                               // record (see *Durable peer delivery*).
 }
 
 // Boundedness caps — every queue, growing structure, and retry loop carries an explicit brake.
@@ -297,16 +306,29 @@ type EdgeId = u32;
 // so a lead agent can be Assisted on its human edge and Driven on its app edges at once.
 struct Edge { id: EdgeId, counterpart: Counterpart }
 enum Counterpart {
-    Human,          // a human-facing surface (the native client UI)
-    Peer(PeerId),   // a peer App process
+    Human,          // a human-facing surface (the native client UI); well-known conventional
+                    // edge HUMAN_EDGE (0); pre-bound by convention, NEVER logged as EdgeBound
+    App,            // this App's own macOS surface (the layer agent set_value writes target);
+                    // well-known conventional edge APP_EDGE (1); likewise never logged as EdgeBound
+    Peer(PeerId),   // a peer App process; edge_for(Peer(_)) mints one stable edge per peer and
+                    // logs EdgeBound the first time — the only case that mints+logs (Inv 6)
 }
-// DETERMINISTIC edge binding (Theme 4a). `edge_for(Counterpart) -> EdgeId` resolves the LOCAL edge
-// for a durable `Counterpart` — keyed by the `Counterpart` itself, never chosen out-of-band — so a
-// receiver binds an inbound `DriveRequested`/`PeerDelivered` (`Counterpart::Peer(from)`) to a stable
-// local edge in the LOG rather than ad hoc. The FIRST time an edge is created for a `Counterpart`,
-// the binding is logged as an `EdgeBound { edge, counterpart }` Input so replay reproduces the same
-// `EdgeId`; thereafter `edge_for` returns the bound edge from `Resources.edges`.
-// fn edge_for(c: Counterpart) -> EdgeId  // pure lookup over Resources.edges; mints + logs EdgeBound on first use
+// DETERMINISTIC edge binding (Theme 4a; `src/agent/world/edge.rs`). Two-halves design:
+//   • PURE LOOKUP CORE `edge_for(&Resources, &Counterpart) -> Option<EdgeId>` — side-effect-free
+//     resolution over `Resources.edges`. Returns Some for already-bound counterparts; None only for
+//     an unseen Peer (the signal the caller uses to mint a fresh binding via `bind`).
+//   • MINT-AND-LOG SEAM `bind(&Resources, &Counterpart) -> (EdgeId, Option<LogicalInput>)` — on
+//     the FIRST use of a NEW Peer counterpart mints a fresh EdgeId (reserved above the well-known
+//     ids so it never collides with 0 or 1) as a pure function of Resources, and returns an
+//     `EdgeBound { edge, counterpart }` Input the shell logs so replay reproduces the same EdgeId
+//     (Inv 6). Thereafter `edge_for` returns the bound edge and `bind` returns (edge, None).
+// WELL-KNOWN conventional edges (Human=0 / App=1) are PRE-BOUND BY CONVENTION and are NEVER
+// stored in `Resources.edges` nor emitted as `EdgeBound` — `edge_for(Human)` returns Some(0)
+// and `bind(Human)` returns (0, None) always, so routing the driver's edges through this seam
+// changes no recorded byte and all existing fixtures stay byte-identical. ONLY a brand-new
+// Peer counterpart mints and logs an `EdgeBound` (Inv 6).
+// fn edge_for(resources: &Resources, c: &Counterpart) -> Option<EdgeId>  // pure lookup
+// fn bind(resources: &Resources, c: &Counterpart) -> (EdgeId, Option<LogicalInput>)
 
 struct ModelConfig { model: String, max_tokens: u32, effort: Effort }
 enum Autonomy { AskEverything, GateTier(Tier), RunFree }
@@ -470,9 +492,19 @@ enum LogicalInput {
     // the parent's `Child` slot like any other result — a logged, correlated event, NOT an implicit
     // in-World fold whose timing depends on System order. Correlated by IDENTITY (`child` entity +
     // `tool_use_id`), not by a request fingerprint: the child has no shell-dispatched request to
-    // hash; on replay it is regenerated deterministically when the child entity reaches its EndTurn
-    // (the child's own log reproduces it). `result` is the child's final answer (or an `is_error`
-    // ToolResult on a child terminal failure — see SupervisionSystem, Totality).
+    // hash; on replay it is regenerated deterministically when the child entity reaches Idle after
+    // its terminal EndTurn (the child's own log reproduces it). REGENERATION MECHANISM (FD-complete,
+    // Inv 7 named exception): the imperative shell driver calls `regenerate_child_returns(&World)` —
+    // a PURE FUNCTION of World state — after each tick; it returns a `ChildReturned` for every child
+    // entity that has settled to `Idle` while its parent's `Child` slot is still `Pending`. These
+    // inputs are folded through the same `settle_child_returned` path (correlated by `(child,
+    // tool_use_id)` identity, Inv 16) so the parent resumes. A child terminal failure is settled
+    // `is_error` by SupervisionSystem in the SAME tick, so a failed/cancelled child's slot is
+    // already `Done` before regeneration runs and is silently skipped. Replay reproduces the
+    // `ChildReturned` directly (the child's own log drives its Idle transition), byte-identical and
+    // without a fingerprinted dispatch boundary (deliberately NON-fingerprinted — Inv 7).
+    // `result` is the child's final answer (or an `is_error` ToolResult on terminal failure — see
+    // SupervisionSystem, Totality).
     ChildReturned    { parent: EntityId, child: EntityId, tool_use_id: ToolUseId, result: ToolResult },
     ToolAborted      { cmd: CmdId, entity: EntityId },         // ack of CancelTool (no fingerprint: an abort has no request payload to hash)
     HumanActionDone  { cmd: CmdId, entity: EntityId, fingerprint: Fingerprint, result: HumanResult },  // Provided | Declined | Timeout
@@ -666,9 +698,14 @@ per-state abort duals so cancellation is total:
 have NO shell-dispatched Command/fingerprint and do not violate the dual rule — they are explicit,
 named exceptions:
 
-- `ChildReturned` (Theme 5b) — a deterministic IN-WORLD derived input keyed by `(child,
-  tool_use_id)`; it is produced when the child entity reaches its `EndTurn` (regenerated by the
-  child's own replay), so it has no originating shell Command and no fingerprint.
+- `ChildReturned` (Theme 5b; FD-complete) — a deterministic IN-WORLD derived input keyed by
+  `(child, tool_use_id)`; it is produced when the child entity settles to `Idle` after its
+  terminal `EndTurn`. The shell driver calls `regenerate_child_returns(&World)` — a pure function
+  of World state — after each tick and folds each returned input through the existing
+  `settle_child_returned` path (correlated by `(child, tool_use_id)` identity, Inv 16), so the
+  parent resumes without a shell-dispatched Command or fingerprint. Replay reproduces it directly
+  from the child's own log replay reaching that `Idle` transition — the deliberately
+  NON-fingerprinted exception to Inv 7.
 - `ToolAborted`/`HumanActionAborted` — `cmd`-keyed abort acks of `CancelTool`/`AbortHumanAction`,
   deliberately non-fingerprinted (an abort has no request payload to hash).
 
@@ -755,16 +792,20 @@ this schedule; the per-System bullets describe each System's role within its pha
   On `Cancel` (via CancelSystem) emit one `CancelTool` per `Pending` `Local` slot and enter
   `Cancelling`.
 - **SubagentSystem** — owns the `Child` slot kind: for each `Child` `ToolSlot`, if `depth <
-  depth_cap` AND the subtree's `EntityLimits.spawned < fanout_cap` spawn a child Entity, bump
-  `spawned`, and bind it into the slot (`SlotKind::Child(child_entity)`, `Pending { cmd: None }` —
-  a child has NO shell-dispatched command, so the slot is resolved by `(child, tool_use_id)` identity,
-  not by `cmd`); if `depth == depth_cap`
-  OR `spawned == fanout_cap` DENY the spawn and resolve the slot INLINE with a `ToolResult {
-  is_error: true }` ("sub-agent depth cap reached" / "fan-out budget exhausted") — slot `Done`
-  immediately (B6 — a denied spawn must not deadlock; the fan-out cap bounds a flat spawn storm
-  that `depth_cap` alone does not — *Boundedness and backpressure*). A spawned child's completion
-  arrives as a `ChildReturned { parent, child, tool_use_id, result }` Input (correlated by `child`
-  + `tool_use_id`): record its `result` into the matching `Child` slot and set it `Done`. When a
+  depth_cap` AND `Components.spawned < budget.limits.fanout_cap` (or `fanout_cap == 0` ⇒ unbounded)
+  spawn a child Entity, bump the CUMULATIVE `Components.spawned` counter (NEVER decremented on
+  child completion — a finished child does NOT refund budget), and bind the child into the slot
+  (`SlotKind::Child(child_entity)`, `Pending { cmd: None }` — a child has NO shell-dispatched
+  command, so the slot is resolved by `(child, tool_use_id)` identity, not by `cmd`); if
+  `depth == depth_cap` OR `spawned == fanout_cap` (and `fanout_cap != 0`) DENY the spawn and
+  resolve the slot INLINE with a `ToolResult { is_error: true }` ("sub-agent depth cap reached" /
+  "fan-out budget exhausted") — slot `Done` immediately (B6 — a denied spawn must not deadlock;
+  the fan-out cap bounds a flat spawn storm that `depth_cap` alone does not —
+  *Boundedness and backpressure*). A spawned child's completion arrives as a `ChildReturned {
+  parent, child, tool_use_id, result }` Input (FD-complete; regenerated by the shell driver calling
+  `regenerate_child_returns(&World)` after each tick — a pure function of World state — and folded
+  by identity `(child, tool_use_id)`, Inv 16): record its `result` into the matching `Child` slot
+  and set it `Done`. When a
   child Entity reaches a TERMINAL non-viable state — crash-reconciliation with no recovery, or
   `EntityGate::Halted` that cannot proceed — the **SupervisionSystem** (or this explicit rule in
   `SubagentSystem`) detects it and resolves that child's `Child` slot with an `is_error`
@@ -862,18 +903,24 @@ this schedule; the per-System bullets describe each System's role within its pha
   `base_version: Some(v)` that no longer matches the current `SurfaceVersion` is REJECTED with an
   `is_error` result (optimistic concurrency), and each applied change BUMPS that surface/element's
   `SurfaceVersion`. Activity is unchanged by a surface update.
-- **PeerDriveSystem** — owns the `Peer` slot kind. Outbound: a `drive_peer` `ToolSlot` emits
-  `SendPeer`, recording the emitted `cmd` in the slot's `Pending { cmd: Some(cmd) }`; the sender
-  records `PeerSendOutcome { Delivered | Queued | Rejected }` so its own replay is stable, and that
-  outcome resolves the `Peer` slot whose `Pending` `cmd` matches (slot `Done`): `Delivered`/`Queued`
-  → a success `ToolResult`; `Rejected` → an `is_error` `ToolResult`. (Delivery is durable and
-  effectively-once — see *Durable peer delivery*.) Inbound: a `DriveRequested`/`PeerDelivered`
-  (origin Peer) BINDS to `edge_for(Counterpart::Peer(from))` (Theme 4a — logging an `EdgeBound` the
-  first time that edge is created), so the receiver's edge is in the log, not chosen out-of-band; a
-  `DriveRequested` is then authorized, its `surface_ops` applied to this client's surface view as a
-  PROJECTION of the `DriveRequested` Input itself (no separate `SurfaceMutated` record — the
-  `DriveRequested` log entry IS the record), and any `prompt` enqueued to the Inbox (B10 — the
-  cross-World contract is acked and recorded in the target's log). The receiver-side
+- **PeerDriveSystem** (`src/agent/world/systems/peer.rs`) — owns the `Peer` slot kind. **Outbound:**
+  a `drive_peer` `ToolSlot` emits `Command::SendPeer { cmd, to, payload, key }`, recording the
+  emitted `cmd` in the slot's `Pending { cmd: Some(cmd) }`; the sender records
+  `PeerSendOutcome { Delivered | Queued | Rejected }` (the SOLE dual of `SendPeer`, Theme 4b) so its
+  own replay is stable, and that outcome settles the `Peer` slot whose `Pending` `cmd` matches (slot
+  `Done`): `Delivered`/`Queued` → a success `ToolResult`; `Rejected` → an `is_error` `ToolResult`.
+  (The broker reports `Delivered` ONLY after `await_fold` resolves — see *Durable peer delivery*.)
+  **Inbound:** a `DriveRequested`/`PeerDelivered` (origin Peer) BINDS to
+  `edge_for(Counterpart::Peer(from))` (`src/agent/world/edge.rs`, Theme 4a — logging an `EdgeBound`
+  the first time that edge is created), so the receiver's edge is in the log, not chosen out-of-band.
+  The fold first checks `Resources.applied_envelopes` for the inbound `PeerEnvelopeId`: if already
+  present, the fold is a NO-OP trace (never re-applied — stratum-1 dedup, the SOLE dedup authority).
+  An absent envelope is then authorized (P0 shape-level: non-empty token AND `auth.from == from`); on
+  success, `surface_ops` are applied as a PROJECTION of the `DriveRequested` input (no separate
+  `SurfaceMutated` record — the `DriveRequested` log entry IS the record), any `prompt` is enqueued
+  to the primary agent's Inbox (B10), and the envelope id is recorded in `Resources.applied_envelopes`
+  ATOMICALLY as part of the same fold. An invalid `Authorization` is REJECTED — the World is returned
+  unchanged (no surface mutation, no Inbox enqueue, no envelope recorded). The receiver-side
   `DriveRequested`/`PeerDelivered` are EXOGENOUS envelope-delivery inputs correlated by
   `PeerEnvelopeId`, NOT duals of the sender's `SendPeer` (Theme 4b).
 
@@ -1019,26 +1066,39 @@ reach the receiver — the cross-process correlation handle is the sender-assign
 **effectively-once = at-least-once + idempotency-by-envelope-id**, WITHOUT any atomic cross-log
 transaction (there is none — the two Apps own independent logs):
 
-1. **Broker fsyncs the envelope.** On `SendPeer` the broker durably records the envelope (id +
-   payload + auth) with an `fsync` before it attempts delivery, so a crash cannot lose an accepted
-   drive; an undelivered envelope to an offline peer sits in the durable outbox (`PeerSendOutcome::
-   Queued`) and is retried on the peer's restore.
-2. **Receiver appends idempotently, keyed by envelope id.** The receiver appends the inbound
-   `DriveRequested`/`PeerDelivered` to ITS stratum-1 log **idempotently keyed by `envelope`**: a
-   redelivery whose `PeerEnvelopeId` is already present is deduped (logged-as-trace, not re-applied),
-   so an at-least-once retry lands AT MOST ONCE in the receiver's log.
-3. **Sender records `Delivered` only after a durable receiver ack.** `PeerSendOutcome::Delivered` is
-   recorded on the sender ONLY after the receiver durably appended (and acked) the envelope; until
-   then the outcome is `Queued` (retry pending) or `Rejected` (inbox cap / auth fail). The sender's
-   own `Delivered` is thus never optimistic.
+1. **Broker fsyncs the envelope.** On `SendPeer` the broker (`src/host.rs PeerBroker`) durably
+   records the envelope (id + payload + auth) into the receiver's `inbox.jsonl`
+   (`src/app/peer/mailbox.rs`) with an `fsync` BEFORE delivery, so a crash cannot lose an accepted
+   drive; an undelivered envelope to an offline peer sits in the durable inbox queue
+   (`PeerSendOutcome::Queued`) and is retried on the peer's restore.
+2. **Receiver deduplicates at the WORLD FOLD, keyed by `PeerEnvelopeId`.** The inbound
+   `DriveRequested`/`PeerDelivered` inputs are always logged as EXOGENOUS stratum-1 inputs (they are
+   free variables, never filtered at the log-append boundary). The DEDUP authority is the receiver's
+   World state: **`Resources.applied_envelopes: BTreeSet<PeerEnvelopeId>`** records every envelope
+   that has been durably folded. `PeerDriveSystem` checks `applied_envelopes` BEFORE projecting
+   surface ops or enqueuing a prompt; if the envelope is already present, the fold is a NO-OP (logged
+   as a trace, never re-applied). The envelope id is recorded in `applied_envelopes` **atomically
+   as part of the same fold** — not before it, not in a separate broker step. **There is NO
+   broker-side permanent `delivered.jsonl` dedup ledger.** The in-World `applied_envelopes` set,
+   rebuilt by replaying the stratum-1 log, is the sole dedup record.
+3. **Sender records `Delivered` only after a durable receiver fold ack.** The receiver's worker
+   (`src/app/runtime/worker.rs`) emits an `AgentToHost::PeerDeliverAck { envelope }` frame AFTER the
+   tick that folds the input and records it in `applied_envelopes`. The broker's
+   `PeerBroker::confirm_fold` receives this ack (driven by `local_supervisor.rs`), which resolves the
+   matching `PeerBroker::await_fold` waiter. Only after `await_fold` returns `true` does the broker
+   report `DeliveryOutcome::Delivered` to the sender — the sender's `PeerSendOutcome::Delivered` is
+   thus never optimistic. If `await_fold` times out or the connection drops, the outcome is `Queued`.
 
-**Crash model.** A crash between the receiver's durable append and the sender's ack leaves the
-sender to RETRY the same envelope; the receiver dedupes it by `envelope` id and re-acks — so the
-worst case is a retried, idempotently-deduped delivery, **never two disagreeing logs**. There is no
-two-phase commit across the two Apps: each log is independently durable, and the envelope id is the
-sole reconciliation key (the broker outbox is itself reconstructable from the sender's
-`PeerSendOutcome{Queued}` + the receiver's `DriveRequested`/`PeerDelivered` — *Single source of
-truth*).
+**Crash model.** A crash BEFORE the fold leaves no record in `applied_envelopes` (the fold never
+ran), so a redelivery re-folds in full — at-least-once transport combined with this in-World
+idempotency is effectively-once with **no crash window that both dedups and drops** a message. A
+crash AFTER the fold but before the `PeerDeliverAck` reaches the broker leaves the receiver's
+`applied_envelopes` intact, so the next redelivery is a no-op fold and the `PeerDeliverAck` is
+re-sent — the worst case is a retried, idempotently-deduped delivery, **never two disagreeing logs**.
+There is no two-phase commit across the two Apps: each log is independently durable, and the
+`PeerEnvelopeId` is the sole reconciliation key (the broker's inbox queue is itself reconstructable
+from the sender's `PeerSendOutcome{Queued}` + the receiver's `DriveRequested`/`PeerDelivered` log —
+*Single source of truth*).
 
 ---
 
@@ -1272,10 +1332,16 @@ the loop.
 ### Fan-out budget — bound sub-agent spawning
 
 `depth_cap` bounds NESTING along a path; it does NOT bound the TOTAL number of children a subtree
-spawns (a flat fan-out of thousands is within depth 1). `Components.limits.spawned` counts
-sub-agents spawned in a subtree against `Resources.fanout_cap`; **SubagentSystem** denies a spawn
-once either `depth == depth_cap` OR `spawned == fanout_cap`, synthesizing an `is_error` `ToolResult`
-into the spawning `ToolUse` (the same B6 no-deadlock rule). Depth and fan-out are independent bounds.
+spawns (a flat fan-out of thousands is within depth 1). `Components.spawned` — a CUMULATIVE counter
+stored directly on the entity, bumped by **SubagentSystem** on each successful spawn and NEVER
+decremented on child completion — counts sub-agents ever spawned against `Components.budget.limits.fanout_cap`
+(per-entity, not a world-wide resource; `0` ⇒ unbounded). **SubagentSystem** denies a spawn once
+either `depth == depth_cap` OR `spawned == fanout_cap` (when `fanout_cap != 0`), synthesizing an
+`is_error` `ToolResult` into the spawning `ToolUse` (the same B6 no-deadlock rule). Depth and
+fan-out are independent bounds. Because finished children remain in `world.entities` in the current
+model this cumulative form is observationally equivalent to a live-direct-children count, but the
+cumulative design is explicit, future-proof, and matches the as-built code: a completed child never
+silently refunds the budget.
 
 ### Restore snapshots — bound replay, reconciliation, and memory
 

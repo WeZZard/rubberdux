@@ -33,9 +33,9 @@ use serde_json::Value as Json;
 
 use rubberdux::agent::world::budget::{Budget, Limits};
 use rubberdux::agent::world::effects::{
-    Command, ModelCaller, ResultStamp, SurfaceDriver, drive_live, fingerprint_call,
+    Command, ModelCaller, ResultStamp, SurfaceDriver, UnattachedPeerSender, drive_live,
+    fingerprint_call,
 };
-use rubberdux::agent::world::surface::SurfaceView;
 use rubberdux::agent::world::event_log::{EventLog, MemoryEventLog};
 use rubberdux::agent::world::gates::EntityGate;
 use rubberdux::agent::world::history::{Block, History, Role};
@@ -90,6 +90,7 @@ fn genesis(seed: u64, model: &ModelConfig, limits: Limits) -> World {
             },
             inbox: Inbox::default(),
             turns: 0,
+            spawned: 0,
             model: None,
         },
     );
@@ -110,6 +111,12 @@ fn offline_model() -> ModelConfig {
         max_tokens: 1024,
         effort: Effort::Medium,
     }
+}
+
+/// A trivial World whose perceived surface view is empty — the `&World` these
+/// CallModel/steering `drive_live` calls read only `resources.surfaces` (empty) from.
+fn surfaceless_world() -> World {
+    World::new(0, Resources::new(7, offline_model()))
 }
 
 // ---------------------------------------------------------------------------
@@ -264,9 +271,10 @@ async fn collect_stratum2(
         drive_live(
             &commands,
             stamp,
-            &SurfaceView::new(),
+            &surfaceless_world(),
             &StubClient,
             &NoSurfaceDrive,
+            &UnattachedPeerSender,
             &mut throwaway,
         )
         .await
@@ -540,9 +548,10 @@ async fn vc_2_3_inbox_overflow_drops_oldest_and_live_driver_logs_message_dropped
     let results = drive_live(
         &commands,
         stamp,
-        &SurfaceView::new(),
+        &surfaceless_world(),
         &exploding,
         &NoSurfaceDrive,
+        &UnattachedPeerSender,
         &mut log,
     )
     .await

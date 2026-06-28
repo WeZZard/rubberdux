@@ -28,6 +28,8 @@ mod live_gate;
 mod app {
     #[path = "counterfactual_branch_live.rs"]
     pub mod counterfactual_branch_live;
+    #[path = "peer_drive_loopback.rs"]
+    pub mod peer_drive_loopback;
     #[path = "session_resume.rs"]
     pub mod session_resume;
     #[path = "surface_drive.rs"]
@@ -89,9 +91,16 @@ fn main() {
     // worker's resume path (`WorldDriver::open` over the latest session) in-process.
     let want_session_resume =
         case == "session_resume" || args.iter().any(|a| a.contains("session_resume"));
+    // The VC-3.2 cross-World peer-drive LIVE loopback (`app::peer_drive_loopback`):
+    // selected by `RUBBERDUX_SYSTEM_E2E_CASE=peer_drive_loopback` or a matching test
+    // filter. Two local Worlds over the real broker — no surface/macOS harness, no VM.
+    let want_peer_drive_loopback = case == "peer_drive_loopback"
+        || args.iter().any(|a| a.contains("peer_drive_loopback"));
 
     if want_counterfactual {
         runtime.block_on(app::counterfactual_branch_live::run());
+    } else if want_peer_drive_loopback {
+        runtime.block_on(app::peer_drive_loopback::run());
     } else if want_session_resume {
         runtime.block_on(app::session_resume::run());
     } else if want_mixed_replay {

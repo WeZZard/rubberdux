@@ -19,7 +19,7 @@
 //! with backoff while the host process stays up. The lifecycle is documented in
 //! `docs/app/runtime/worker-lifecycle.md`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -29,6 +29,7 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::world::event_log::{EventLog, FilesystemEventLog};
 use crate::app::registry::store::AppStore;
 use crate::app::runtime::lifecycle::{AppLifecycle, ResumeState, idle_window};
 use crate::app::runtime::worker_handle::WorkerHandle;
@@ -41,6 +42,7 @@ use crate::app::peer::PeerId;
 use crate::app::peer::mailbox::Mailbox;
 use crate::host::{
     AcceptedWorker, PeerBroker, PeerRouteOutcome, SurfaceRouter, WorkerStream, accept_worker,
+    reconstruct_outbox,
 };
 use crate::protocol::{self, AgentToHost, HostToAgent};
 use crate::trajectory::TrajectoryEvent;
@@ -469,6 +471,14 @@ impl LocalSupervisor {
         // arrival order as `PeerDeliver` frames so the worker reacts to them.
         // See docs/app/peer/decentralized-messaging.md.
         self.drain_peer_inbox(id).await;
+
+        // Retry this App's reconstructed OUTBOX (PB-outbox): any still-`Queued` peer
+        // sends it recorded — rebuilt from the durable World log, NOT held only in
+        // memory — are redelivered to their destinations' durable inboxes, where the
+        // receiver's stratum-1 dedup makes an already-applied one a no-op
+        // (effectively-once with PB-broker). See docs/agent/world/ecs-runtime.md
+        // §"Durable peer delivery" (OUTBOX RECONSTRUCTION).
+        self.retry_reconstructed_outbox(id).await;
         Ok(())
     }
 
@@ -483,30 +493,156 @@ impl LocalSupervisor {
     async fn drain_peer_inbox(&self, id: &AppId) {
         let home = self.store.addressable_home(id);
         let mailbox = Mailbox::in_dir(&home);
-        let envelopes = match mailbox.drain() {
-            Ok(envelopes) => envelopes,
-            Err(e) => {
-                log::warn!("failed to drain peer inbox for App `{id}`: {e}");
+        // Redeliver from the durable inbox queue ONE envelope at a time, advancing
+        // past each only AFTER the receiver durably folds it (INV-4): the inbox is
+        // never truncated up-front, so a crash mid-drain cannot lose the undelivered
+        // remainder. The receiver's STRATUM-1 dedup (its World log's
+        // `applied_envelopes`) makes a redelivery of an already-folded envelope a
+        // NO-OP, so re-draining after a crash is safe — effectively-once, with NO
+        // pre-apply broker ledger that could suppress a redelivery. See
+        // docs/agent/world/ecs-runtime.md §"Durable peer delivery".
+        loop {
+            // Peek the head WITHOUT removing it (the advance happens only after a
+            // durable-fold confirmation, below).
+            let head = match mailbox.peek() {
+                Ok(mut queued) if !queued.is_empty() => queued.remove(0),
+                Ok(_) => return, // inbox drained
+                Err(e) => {
+                    log::warn!("failed to peek peer inbox for App `{id}`: {e}");
+                    return;
+                }
+            };
+
+            // Deliver the head to the now-live worker. Take the handle's frame sender
+            // under the lock, then release it before awaiting the fold confirmation
+            // (which the worker's own pump resolves) so the pump is never blocked.
+            {
+                let runtimes = self.runtimes.lock().await;
+                let Some(handle) = runtimes.get(id) else {
+                    return; // worker gone; the inbox is untouched, retried next restore
+                };
+                let frame = HostToAgent::PeerDeliver {
+                    from: head.from.app_id.to_string(),
+                    payload: head.payload.clone(),
+                };
+                if let Err(e) = handle.send_frame(frame).await {
+                    log::warn!("failed to deliver queued peer message to App `{id}`: {e}");
+                    return; // leave the head + remainder queued for the next restore
+                }
+            }
+
+            // ADVANCE past the head only after the receiver durably folds it. A
+            // durable envelope carries an id the worker acks via `PeerDeliverAck`
+            // (routed to `PeerBroker::confirm_fold`); a legacy/plain payload has no
+            // id, so it is advanced best-effort once handed off.
+            match head.durable().map(|d| d.id) {
+                Some(env_id) => {
+                    if self.peer_broker.await_fold(&env_id).await {
+                        if let Err(e) = mailbox.advance(&env_id) {
+                            log::warn!("failed to advance peer inbox for App `{id}`: {e}");
+                            return;
+                        }
+                    } else {
+                        // No durable-fold confirmation in time: leave the head (and
+                        // the remainder) queued for the next restore. INV-4 — never
+                        // advance without a confirmation, so nothing is lost.
+                        log::debug!(
+                            "[app-worker:{id}] no durable-fold ack for {}; left queued for next restore",
+                            env_id.0
+                        );
+                        return;
+                    }
+                }
+                None => {
+                    // Legacy/plain payload (no durable id): best-effort advance by
+                    // arrival order once delivered.
+                    if let Err(e) = mailbox.remove_first() {
+                        log::warn!("failed to advance peer inbox for App `{id}`: {e}");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Retry the restoring App's reconstructed OUTBOX (PB-outbox): the still-`Queued`
+    /// peer sends it never recorded a `Delivered` for, rebuilt from its durable World
+    /// log via [`reconstruct_outbox`](crate::host::reconstruct_outbox)
+    /// (`PeerSendOutcome{Queued}` minus later `Delivered`) rather than held only in
+    /// memory. For each DISTINCT outstanding destination the queued envelope is
+    /// REDELIVERED through the durable inbox: a live target is re-drained directly
+    /// ([`drain_peer_inbox`](Self::drain_peer_inbox)); an offline target is woken
+    /// ([`ensure_active`](Self::ensure_active), which drains on restore), mirroring the
+    /// live wake-on-`Queued`. The receiver's stratum-1 dedup makes an already-applied
+    /// redelivery a NO-OP (effectively-once with PB-broker). A no-op when the log has
+    /// no outstanding queued sends. See docs/agent/world/ecs-runtime.md
+    /// §"Durable peer delivery" (OUTBOX RECONSTRUCTION).
+    ///
+    /// Returns a boxed (named) future rather than an `async fn`'s opaque one for the
+    /// same reason as [`start_worker`](Self::start_worker): the offline-wake path
+    /// calls back into [`ensure_active`](Self::ensure_active), and a concrete
+    /// `Pin<Box<dyn Future + Send>>` is the cut point that breaks the otherwise-cyclic
+    /// `Send` inference.
+    fn retry_reconstructed_outbox<'a>(
+        &'a self,
+        id: &'a AppId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            // The App's durable World log lives under its session dir's `latest` link
+            // (`world-events.jsonl`); a missing log loads empty (no prior session yet).
+            let world_log = self
+                .app_session_dir(id)
+                .join("latest")
+                .join("world-events.jsonl");
+            let events = match FilesystemEventLog::new(world_log).load() {
+                Ok(events) => events,
+                Err(e) => {
+                    log::warn!(
+                        "[app-worker:{id}] could not load World log to reconstruct the peer outbox: {e}"
+                    );
+                    return;
+                }
+            };
+            let outbox = reconstruct_outbox(events.iter().map(|e| &e.input));
+            if outbox.is_empty() {
                 return;
             }
-        };
-        if envelopes.is_empty() {
-            return;
-        }
-        let runtimes = self.runtimes.lock().await;
-        let Some(handle) = runtimes.get(id) else {
-            return;
-        };
-        for envelope in envelopes {
-            let frame = HostToAgent::PeerDeliver {
-                from: envelope.from.app_id.to_string(),
-                payload: envelope.payload,
-            };
-            if let Err(e) = handle.send_frame(frame).await {
-                log::warn!("failed to deliver queued peer message to App `{id}`: {e}");
-                break;
+
+            // The distinct destinations of the still-queued sends, keyed by app-id
+            // string (a deterministic `BTreeSet`, not a `HashMap`, keeps the retry
+            // order free of a hidden input — `AppId` is not `Ord`, so the inner
+            // string is the key).
+            let mut targets: BTreeSet<String> = BTreeSet::new();
+            for entry in outbox.values() {
+                targets.insert(entry.to.app_id.clone());
             }
-        }
+
+            for target in targets {
+                let target = AppId(target);
+                if target == *id {
+                    continue; // a peer never addresses itself; skip defensively
+                }
+                let live = self.runtimes.lock().await.contains_key(&target);
+                if live {
+                    // The target is up: re-drain its durable inbox now so the queued
+                    // envelope is redelivered immediately (a no-op if already folded).
+                    self.drain_peer_inbox(&target).await;
+                } else if let Some(supervisor) = self.me.upgrade() {
+                    // The target is offline: wake it (restore drains its inbox),
+                    // mirroring the live wake-on-`Queued`. Detached so restore stays
+                    // non-blocking (root CLAUDE.md UX rule). A dangling `me` (the
+                    // by-value `bind` path) skips the wake; the envelope drains on the
+                    // target's own next restore.
+                    tokio::spawn(async move {
+                        if let Err(e) = supervisor.ensure_active(&target).await {
+                            log::warn!(
+                                "failed to wake peer `{target}` to retry a queued send: {e}"
+                            );
+                        }
+                    });
+                }
+            }
+        })
     }
 
     /// Start the background idle sweeper: a tokio task that periodically
@@ -895,44 +1031,42 @@ impl SupervisionTask {
                             // accept router; a second one is unexpected. Ignore.
                         }
                         Some(AgentToHost::PeerSend { to, payload }) => {
-                            // Relay through the broker, which resolves the target
-                            // and decides deliver-vs-queue. The pump makes no
-                            // routing decision of its own (the host is a switch).
-                            // `to` is an App id on the local node for now; the
-                            // PeerId carries the node so federation needs no change
-                            // here. See docs/app/peer/decentralized-messaging.md.
+                            // Relay through the broker on its OWN task. A DURABLE
+                            // relay does fsync-before-deliver and then AWAITS the
+                            // receiver's durable-fold confirmation before reporting
+                            // `Delivered` (INV-3) — which would otherwise block this
+                            // frame pump for up to the fold-ack timeout. Spawning
+                            // keeps the pump non-blocking (root CLAUDE.md UX rule)
+                            // and detaches the wake-on-Queued restore (which spawns
+                            // the target's own pump). The pump makes no routing
+                            // decision of its own (the host is a switch). `to` is an
+                            // App id on the local node for now; the PeerId carries
+                            // the node so federation needs no change here. See
+                            // docs/app/peer/decentralized-messaging.md.
+                            let broker = self.peer_broker.clone();
+                            let supervisor = self.supervisor.clone();
+                            let source = self.app_id.clone();
                             let from = PeerId::local(self.app_id.clone());
                             let to_peer = PeerId::local(AppId(to));
-                            match self.peer_broker.relay(from, to_peer, payload).await {
-                                Ok(PeerRouteOutcome::Delivered) => log::debug!(
-                                    "[app-worker:{}] peer_send delivered",
-                                    self.app_id
-                                ),
-                                Ok(PeerRouteOutcome::Queued { wake }) => {
-                                    // The target's worker is offline; the broker
-                                    // queued the envelope to its inbox. Restore the
-                                    // target through the supervisor's own restore
-                                    // path (`ensure_active`, which drains the inbox)
-                                    // so it picks the message up. The broker owns no
-                                    // supervision, so the wake happens here. If the
-                                    // owning supervisor is gone, skip the wake and
-                                    // let the next restore drain the inbox.
-                                    log::debug!(
-                                        "[app-worker:{}] peer_send queued, waking {}",
-                                        self.app_id,
-                                        wake.app_id
-                                    );
-                                    match self.supervisor.upgrade() {
-                                        Some(supervisor) => {
-                                            // Run the restore on its own task: the
-                                            // restore spawns the target's pump, so
-                                            // awaiting it inline would make this
-                                            // pump's future recursively reference
-                                            // itself. Detaching keeps both pumps
-                                            // independent and the pump non-blocking.
-                                            let source = self.app_id.clone();
-                                            let target = wake.app_id.clone();
-                                            tokio::spawn(async move {
+                            tokio::spawn(async move {
+                                match broker.relay(from, to_peer, payload).await {
+                                    Ok(PeerRouteOutcome::Delivered) => {
+                                        log::debug!("[app-worker:{source}] peer_send delivered");
+                                    }
+                                    Ok(PeerRouteOutcome::Queued { wake }) => {
+                                        // The target was offline or did not confirm a
+                                        // durable fold in time; the envelope persists
+                                        // in its durable inbox. Restore the target
+                                        // (`ensure_active`, which drains the inbox) so
+                                        // it picks the message up. If the owning
+                                        // supervisor is gone, the next restore drains.
+                                        log::debug!(
+                                            "[app-worker:{source}] peer_send queued, waking {}",
+                                            wake.app_id
+                                        );
+                                        match supervisor.upgrade() {
+                                            Some(supervisor) => {
+                                                let target = wake.app_id.clone();
                                                 if let Err(e) =
                                                     supervisor.ensure_active(&target).await
                                                 {
@@ -940,24 +1074,34 @@ impl SupervisionTask {
                                                         "[app-worker:{source}] peer_send wake of {target} failed: {e}"
                                                     );
                                                 }
-                                            });
+                                            }
+                                            None => log::debug!(
+                                                "[app-worker:{source}] peer_send queued to {} but supervisor is gone; drains on next restore",
+                                                wake.app_id
+                                            ),
                                         }
-                                        None => log::debug!(
-                                            "[app-worker:{}] peer_send queued to {} but supervisor is gone; drains on next restore",
-                                            self.app_id,
-                                            wake.app_id
-                                        ),
                                     }
+                                    Ok(PeerRouteOutcome::Rejected) => {
+                                        log::debug!("[app-worker:{source}] peer_send rejected");
+                                    }
+                                    Err(e) => log::warn!(
+                                        "[app-worker:{source}] peer_send relay failed: {e}"
+                                    ),
                                 }
-                                Ok(PeerRouteOutcome::Rejected) => log::debug!(
-                                    "[app-worker:{}] peer_send rejected",
-                                    self.app_id
-                                ),
-                                Err(e) => log::warn!(
-                                    "[app-worker:{}] peer_send relay failed: {e}",
-                                    self.app_id
-                                ),
-                            }
+                            });
+                        }
+                        Some(AgentToHost::PeerDeliverAck { envelope }) => {
+                            // This worker durably folded an inbound peer delivery (its
+                            // stratum-1 World log appended the `DriveRequested`/
+                            // `PeerDelivered`): confirm the fold to the broker so a
+                            // durable relay reports `Delivered` (INV-3) and the
+                            // restore-drain advances the durable inbox past it (INV-4).
+                            // This is the receiver→broker durable-fold confirmation.
+                            self.peer_broker
+                                .confirm_fold(&crate::agent::world::surface::PeerEnvelopeId(
+                                    envelope,
+                                ))
+                                .await;
                         }
                         Some(AgentToHost::PeerList) => {
                             // Answer "who can I talk to right now?" from the

@@ -39,7 +39,10 @@ use crate::agent::runtime::port::EntryNotification;
 use crate::provider::moonshot::Message;
 use crate::error::Error;
 
-use super::effects::{drive_live, ModelCaller, ResultStamp, SurfaceDriver};
+use super::edge;
+use super::effects::{
+    drive_live, ModelCaller, PeerSender, ResultStamp, SurfaceDriver, UnattachedPeerSender,
+};
 use super::event_log::EventLog;
 use super::gates::EntityGate;
 use super::history::{Block, History, Msg, Role};
@@ -47,8 +50,8 @@ use super::inputs::{Event, LogicalInput, Origin};
 use super::replay::{outstanding_cmds, restore};
 use super::snapshot::{capture, SnapshotStore};
 use super::world::{
-    Activity, Components, EdgeId, EntityId, Identity, Inbox, Lineage, ModelConfig, Resources, Tick,
-    Timestamp, World,
+    Activity, Components, Counterpart, EdgeId, EntityId, Identity, Inbox, Lineage, ModelConfig,
+    Resources, Tick, Timestamp, World,
 };
 
 /// The primary entity's id. The shell SEEDS this `Idle` entity at startup because
@@ -58,17 +61,28 @@ use super::world::{
 /// docs/agent/world/ecs-runtime.md (Genesis; IntakeSystem).
 const PRIMARY_ENTITY: EntityId = 0;
 
-/// The single counterpart relationship the P0 driver routes on: the human edge.
-/// Host `UserMessage`s and CONVERSATION results (the model call) are stamped onto
-/// it deterministically.
-const HUMAN_EDGE: EdgeId = 0;
+/// The human conversation edge the P0 driver routes host `UserMessage`s and
+/// CONVERSATION results (the model call) onto — resolved through the pure
+/// [`edge::bind`] seam over the WELL-KNOWN `Counterpart::Human`, which is pre-bound
+/// by convention to `edge::HUMAN_EDGE` and logs NOTHING, so routing the driver's
+/// edges through the binding seam changes no recorded byte. See
+/// docs/agent/world/ecs-runtime.md (`edge_for`; Mode-as-projection).
+fn human_edge(world: &World) -> EdgeId {
+    // The seam never mints or logs for a well-known counterpart (its `EdgeBound`
+    // is always `None`), so the binding it would log is discarded here.
+    edge::bind(&world.resources, &Counterpart::Human).0
+}
 
 /// The DISTINCT app/surface edge the agent's SURFACE-WRITE results (the `set_value`
-/// `ToolReturned`) are stamped onto, kept separate from `HUMAN_EDGE` so the per-edge
-/// mode projection (Inv 19) folds the agent's surface drive as `Driven` (agent-only
-/// on this edge) while the human conversation edge stays `Assisted` — the design's
-/// concurrent per-edge modes. See docs/agent/world/ecs-runtime.md (Mode-as-projection).
-const APP_EDGE: EdgeId = 1;
+/// `ToolReturned`) are stamped onto, kept separate from the human edge so the
+/// per-edge mode projection (Inv 19) folds the agent's surface drive as `Driven`
+/// (agent-only on this edge) while the human conversation edge stays `Assisted` —
+/// the design's concurrent per-edge modes. Resolved through the pure [`edge::bind`]
+/// seam over the WELL-KNOWN `Counterpart::App` (pre-bound to `edge::APP_EDGE`, logs
+/// NOTHING). See docs/agent/world/ecs-runtime.md (Mode-as-projection; `edge_for`).
+fn app_edge(world: &World) -> EdgeId {
+    edge::bind(&world.resources, &Counterpart::App).0
+}
 
 /// The surface-manipulation tools the live whiteboard App offers its surface-capable
 /// ROOT entity, so a live model call is told `set_value` EXISTS and can request it
@@ -150,7 +164,7 @@ where
         // records empty tools, so their requests stay byte-identical to a pre-tools call.
         let session = Event {
             origin: Origin::System,
-            edge: HUMAN_EDGE,
+            edge: human_edge(&world),
             at: 0,
             wall: now_wall(),
             input: LogicalInput::SessionStarted {
@@ -329,10 +343,40 @@ where
     /// the LIVE driver — re-folding each result `Event` until no Commands remain
     /// (the tool-loop continuation `CallModel` results re-enter `tick` here).
     /// Finally it derives the new assistant `History` as `EntryNotification`s.
+    //
+    // The production worker now drives via `submit_with_peer_sender` (to inject the
+    // real peer sender), so the bin has no caller of this peer-sender-free convenience
+    // — the lib tests and offline harnesses do. Allowed unused, like the sibling
+    // resume-only helpers, until an in-process host drives a non-peer World through it.
+    #[allow(dead_code)]
     pub async fn submit(&mut self, input: LogicalInput) -> Result<Vec<EntryNotification>, Error> {
+        // The non-worker path keeps the inert `UnattachedPeerSender`: no production
+        // model is told `drive_peer` exists, so no `SendPeer` is emitted to reach it.
+        self.submit_with_peer_sender(input, &UnattachedPeerSender)
+            .await
+    }
+
+    /// Submit one input, driving its tick's effects through the supplied
+    /// [`PeerSender`] — the SEAM the WORKER uses to inject the real
+    /// `PeerBroker`-backed sender so a `Command::SendPeer` reaches the broker and the
+    /// recorded `PeerSendOutcome` reflects the real `DeliveryOutcome` (the non-worker
+    /// [`submit`](Self::submit) keeps the inert `UnattachedPeerSender`). Otherwise
+    /// identical to `submit`: it stamps the input's `Event` envelope — `Origin::Peer`
+    /// on `edge_for(Peer(from))` for an inbound peer input, else the human edge —
+    /// APPENDS it (log-before-apply, Inv 4), folds it, then drains the tick's Commands
+    /// through the live driver under this sender. See docs/agent/world/ecs-runtime.md
+    /// (§645; the World↔broker boundary; Theme 4a/4b).
+    pub async fn submit_with_peer_sender<P: PeerSender>(
+        &mut self,
+        input: LogicalInput,
+        peer_sender: &P,
+    ) -> Result<Vec<EntryNotification>, Error> {
+        // Resolve (and, for a fresh peer, mint+log+fold) the edge this input is
+        // stamped on so an inbound peer drive lands on its replayable peer edge.
+        let edge = self.input_edge(&input)?;
         let event = Event {
             origin: origin_for(&input),
-            edge: HUMAN_EDGE,
+            edge,
             at: self.next_at,
             wall: now_wall(),
             input,
@@ -345,8 +389,46 @@ where
         self.world = next;
         self.maybe_snapshot();
 
-        self.drive_to_quiescence(commands).await?;
+        self.drive_to_quiescence(commands, peer_sender).await?;
         Ok(self.derive_entry_notifications())
+    }
+
+    /// Resolve the `EdgeId` a submitted input is stamped on, binding a fresh peer
+    /// edge when one is needed. A conversation/surface input routes to the human
+    /// edge; an inbound peer input (`DriveRequested`/`PeerDelivered`) routes to
+    /// `edge_for(Peer(from))` — and on the FIRST input from a peer this MINTS the
+    /// edge and LOGS+FOLDS an `EdgeBound` (at its own fresh tick, log-before-apply,
+    /// Inv 4) so the binding is replayable (Inv 6) and the peer input that follows
+    /// lands on a stable, identity-keyed edge with `Origin::Peer`. `tick` applies the
+    /// `EdgeBound` to `Resources` identically on the live and replay paths, so a
+    /// re-resolution reuses this id and a reconstruction stays byte-identical. See
+    /// docs/agent/world/ecs-runtime.md (`edge_for`; `EdgeBound`; Theme 4a).
+    fn input_edge(&mut self, input: &LogicalInput) -> Result<EdgeId, Error> {
+        let counterpart = match input {
+            LogicalInput::DriveRequested { from, .. }
+            | LogicalInput::PeerDelivered { from, .. } => Counterpart::Peer(from.clone()),
+            _ => return Ok(human_edge(&self.world)),
+        };
+        let (edge, logged) = edge::bind(&self.world.resources, &counterpart);
+        if let Some(edge_bound) = logged {
+            // Log + fold the binding BEFORE the peer input so `Resources.edges`
+            // records it; `tick` folds the `EdgeBound` (the same fold replay applies).
+            let bound_event = Event {
+                origin: Origin::System,
+                edge,
+                at: self.next_at,
+                // An edge binding is an in-World derivation, not an externally
+                // observed effect; recording `None` keeps it free of any clock read.
+                wall: None,
+                input: edge_bound,
+            };
+            self.next_at += 1;
+            self.log.append(&bound_event)?;
+            let (next, _no_commands) = super::systems::tick(&self.world, &bound_event);
+            self.world = next;
+            self.maybe_snapshot();
+        }
+        Ok(edge)
     }
 
     /// Drive a tick's emitted Commands to quiescence: dispatch each batch through
@@ -354,13 +436,21 @@ where
     /// through `tick`, and repeat while the fold keeps emitting Commands. Each
     /// `drive_live` call drives ONE tick's worth of effects and stamps its results
     /// at a fresh monotonic tick.
-    async fn drive_to_quiescence(&mut self, mut commands: Vec<crate::agent::world::effects::Command>) -> Result<(), Error> {
+    async fn drive_to_quiescence<P: PeerSender>(
+        &mut self,
+        mut commands: Vec<crate::agent::world::effects::Command>,
+        peer_sender: &P,
+    ) -> Result<(), Error> {
+        // Settle any child that reached its terminal `EndTurn` BEFORE any Command
+        // remained to drive, so the parent resumes even when the settling tick
+        // emitted no further Command (the COMPLETION half of fan-out).
+        commands.append(&mut self.settle_returned_children()?);
         while !commands.is_empty() {
             let stamp = ResultStamp {
-                edge: HUMAN_EDGE,
+                edge: human_edge(&self.world),
                 // Agent surface-write results route to the DISTINCT app edge so
-                // `mode(APP_EDGE)` folds Driven, independent of the human edge (GAP B).
-                app_edge: APP_EDGE,
+                // `mode(app_edge)` folds Driven, independent of the human edge (GAP B).
+                app_edge: app_edge(&self.world),
                 at: self.next_at,
                 wall: now_wall(),
             };
@@ -374,9 +464,13 @@ where
             let results = drive_live(
                 &commands,
                 stamp,
-                &self.world.resources.surfaces,
+                &self.world,
                 &self.client,
                 &self.surface_driver,
+                // The injected peer sender: the WORKER threads the real
+                // `PeerBroker`-backed sender here; the non-worker path passes the
+                // inert `UnattachedPeerSender`.
+                peer_sender,
                 &mut self.log,
             )
             .await?;
@@ -388,8 +482,62 @@ where
                 self.maybe_snapshot();
                 commands.append(&mut cmds);
             }
+
+            // After folding this batch's results, settle any child that just reached
+            // its terminal `EndTurn` into its parent's `Child` slot — regenerating the
+            // non-fingerprinted `ChildReturned` (Inv 7) — so the parent resumes and the
+            // continuation it emits is driven by the next loop turn.
+            commands.append(&mut self.settle_returned_children()?);
         }
         Ok(())
+    }
+
+    /// Settle every child entity that has reached its terminal `EndTurn` into its
+    /// parent's `Child` slot, so the parent resumes — the COMPLETION half of
+    /// in-process fan-out. For each owed return — a PURE FUNCTION of `World` state
+    /// (the named, deliberately NON-fingerprinted Inv 7 exception, computed by
+    /// [`subagent::regenerate_child_returns`]) — it APPENDS the regenerated
+    /// `ChildReturned` to the log at a fresh tick (log-before-apply, Inv 4) and folds
+    /// it through `tick`, returning the continuation Commands the parent's
+    /// all-slots-`Done` advance emits. Because the input is identity-correlated and
+    /// never fingerprinted, a faithful replay re-applies it directly from the log
+    /// (it is NOT stood in for by the fingerprint cursor), so a recorded fan-out log
+    /// reconstructs the parent's resume deterministically with ZERO model calls.
+    ///
+    /// One return is folded per step and the owed set RECOMPUTED, so a child that
+    /// resumes a parent which is ITSELF mid-fan-out (nested fan-out) is never missed;
+    /// the set strictly shrinks each step (a settled slot goes `Done` and folding a
+    /// `ChildReturned` creates no new `Idle` child), so it terminates. The regenerated
+    /// input carries NO wall reading and NO fingerprint: it is an in-World derivation,
+    /// not an externally-observed effect result. See docs/agent/world/ecs-runtime.md
+    /// (`ChildReturned` regeneration; Inv 7; SubagentSystem).
+    fn settle_returned_children(
+        &mut self,
+    ) -> Result<Vec<crate::agent::world::effects::Command>, Error> {
+        let mut commands = Vec::new();
+        while let Some(input) =
+            super::systems::subagent::regenerate_child_returns(&self.world)
+                .into_iter()
+                .next()
+        {
+            let event = Event {
+                origin: Origin::Agent,
+                edge: human_edge(&self.world),
+                at: self.next_at,
+                // An in-World derivation has no external observation wall (it is a pure
+                // function of World state); recording `None` keeps the regeneration free
+                // of any clock reading, so a replay reproduces it identically.
+                wall: None,
+                input,
+            };
+            self.next_at += 1;
+            self.log.append(&event)?;
+            let (next, mut cmds) = super::systems::tick(&self.world, &event);
+            self.world = next;
+            self.maybe_snapshot();
+            commands.append(&mut cmds);
+        }
+        Ok(commands)
     }
 
     /// Fold the `Settled` reconciliations [`restore`](super::replay::restore)
@@ -419,7 +567,9 @@ where
 
         self.next_at = self.world.clock + 1;
         self.last_snapshot_at = self.world.clock;
-        self.drive_to_quiescence(commands).await
+        // Resume re-dispatches no `SendPeer` itself (a `SendPeer` crash-tail is a
+        // `Redispatch` this P0 driver does not re-issue), so the inert sender suffices.
+        self.drive_to_quiescence(commands, &UnattachedPeerSender).await
     }
 
     /// Capture and persist a World snapshot when the latest tick advance crossed
@@ -546,6 +696,7 @@ fn primary_idle_components() -> Components {
         budget: crate::agent::world::budget::Budget::default(),
         inbox: Inbox::default(),
         turns: 0,
+        spawned: 0,
         model: None,
     }
 }
@@ -556,6 +707,10 @@ fn primary_idle_components() -> Components {
 fn origin_for(input: &LogicalInput) -> Origin {
     match input {
         LogicalInput::UserMessage { .. } | LogicalInput::SurfaceMutated { .. } => Origin::Human,
+        // Inbound peer inputs are `Peer`-origin free variables: a peer driving this
+        // World feeds mode-as-projection ⇒ Driven on its peer edge (mirroring the App
+        // edge). See docs/agent/world/ecs-runtime.md (Origin; Theme 4a; PeerDriveSystem).
+        LogicalInput::DriveRequested { .. } | LogicalInput::PeerDelivered { .. } => Origin::Peer,
         _ => Origin::System,
     }
 }
@@ -879,16 +1034,17 @@ mod tests {
         // agent-origin `ToolReturned` there (the agent UI write's sole fact, Inv 18).
         let app_writes: Vec<&Event> = events
             .iter()
-            .filter(|e| e.edge == APP_EDGE && matches!(e.input, LogicalInput::ToolReturned { .. }))
+            .filter(|e| {
+                e.edge == edge::APP_EDGE && matches!(e.input, LogicalInput::ToolReturned { .. })
+            })
             .collect();
         assert_eq!(app_writes.len(), 1, "the set_value write lands on the app edge");
         assert_eq!(app_writes[0].origin, Origin::Agent, "the write is agent-origin");
 
         // No surface write contaminates the human conversation edge.
         assert!(
-            !events.iter().any(
-                |e| e.edge == HUMAN_EDGE && matches!(e.input, LogicalInput::ToolReturned { .. })
-            ),
+            !events.iter().any(|e| e.edge == edge::HUMAN_EDGE
+                && matches!(e.input, LogicalInput::ToolReturned { .. })),
             "no surface write is stamped on the human conversation edge (GAP B)"
         );
 
@@ -896,12 +1052,12 @@ mod tests {
         // the Human `UserMessage` keeps it Assisted (concurrent per-edge modes).
         let window = 16;
         assert_eq!(
-            mode(&events, APP_EDGE, window),
+            mode(&events, edge::APP_EDGE, window),
             Mode::Driven,
             "the agent-only app edge folds Driven (GAP B / Inv 19)"
         );
         assert_eq!(
-            mode(&events, HUMAN_EDGE, window),
+            mode(&events, edge::HUMAN_EDGE, window),
             Mode::Assisted,
             "the human conversation edge stays Assisted (Human + Agent), never Driven"
         );
@@ -1204,7 +1360,7 @@ mod tests {
         // (without re-running compaction, which depends on context conditions).
         let session = Event {
             origin: Origin::System,
-            edge: HUMAN_EDGE,
+            edge: edge::HUMAN_EDGE,
             at: 0,
             wall: now_wall(),
             input: LogicalInput::SessionStarted {
@@ -1238,7 +1394,7 @@ mod tests {
             ctx: ActorCtx {
                 entity: PRIMARY_ENTITY,
                 origin: Origin::Agent,
-                edge: HUMAN_EDGE,
+                edge: edge::HUMAN_EDGE,
             },
             key: IdempotencyKey {
                 app_id: AppId::default(),
@@ -1312,6 +1468,170 @@ mod tests {
         assert!(
             !crosses_snapshot_boundary(0, 100, 0),
             "interval 0 (unbounded) never crosses"
+        );
+    }
+
+    // --- FD-complete: child-EndTurn → ChildReturned completion bridge ----------
+
+    /// A `ModelCaller` that drives a one-child fan-out then ends: the PARENT's first
+    /// call requests a `spawn_subagent`, the CHILD's call ends its turn with a fixed
+    /// answer, and the parent's CONTINUATION call ends the parent. It counts its calls
+    /// so the test proves exactly three model calls bracket the one fan-out.
+    struct SpawnThenEndCaller {
+        calls: AtomicUsize,
+    }
+
+    impl ModelCaller for SpawnThenEndCaller {
+        async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let (blocks, stop_reason) = match n {
+                0 => (
+                    vec![Block::ToolUse {
+                        id: "tu_child".into(),
+                        name: "spawn_subagent".into(),
+                        input: serde_json::json!({ "prompt": "research X" }),
+                    }],
+                    StopReason::ToolUse,
+                ),
+                1 => (
+                    vec![Block::Text {
+                        text: "child answer".into(),
+                    }],
+                    StopReason::EndTurn,
+                ),
+                _ => (
+                    vec![Block::Text {
+                        text: "final synthesis".into(),
+                    }],
+                    StopReason::EndTurn,
+                ),
+            };
+            Ok((
+                blocks,
+                ModelMeta {
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                    model_id: "claude-stub".into(),
+                    stop_reason,
+                    capabilities: Capabilities(serde_json::json!({})),
+                    reasoning: ReasoningPolicy::Drop,
+                },
+            ))
+        }
+    }
+
+    /// VC-1.1 (lib-scope): when a child entity settles to `Idle` after its terminal
+    /// `EndTurn`, the live driver regenerates `ChildReturned{parent,child,tool_use_id,
+    /// result=child's final answer}` as a PURE FUNCTION of World state (the named
+    /// non-fingerprinted Inv 7 exception), folds it into the parent's `Child` slot via
+    /// the existing settle path, and the parent RESUMES to its own `EndTurn`. The
+    /// regenerated input is APPENDED to the log but carries NO fingerprint, so a full
+    /// `fold_log` of the recorded fan-out log reconstructs the live World
+    /// BYTE-IDENTICALLY with ZERO model calls — the parent's resume is reproduced
+    /// deterministically without a fingerprinted boundary. Offline: stub model + no-op
+    /// surface driver + `MemoryEventLog`, no network.
+    #[tokio::test]
+    async fn child_endturn_regenerates_child_returned_and_parent_resumes() {
+        let mut driver = WorldDriver::bootstrap(
+            7,
+            stub_model(),
+            SpawnThenEndCaller {
+                calls: AtomicUsize::new(0),
+            },
+            NoSurfaceDrive,
+            MemoryEventLog::new(),
+        )
+        .expect("bootstrap the driver");
+
+        driver
+            .submit(LogicalInput::UserMessage {
+                to: PRIMARY_ENTITY,
+                text: "delegate the research".into(),
+            })
+            .await
+            .expect("the fan-out turn drives to quiescence");
+
+        // Exactly three model calls bracket the one fan-out: parent spawn, child turn,
+        // parent continuation — proving the parent actually RESUMED (a stuck parent
+        // would never reach its continuation call).
+        assert_eq!(
+            driver.client.calls.load(Ordering::SeqCst),
+            3,
+            "parent spawn + child EndTurn + parent continuation"
+        );
+
+        // The parent settled back to Idle, and exactly one child Entity was spawned
+        // (also settled Idle after its EndTurn).
+        let parent = driver.world.entities.get(&PRIMARY_ENTITY).expect("parent");
+        assert!(matches!(parent.activity, Activity::Idle), "the parent resumed → Idle");
+        assert_eq!(driver.world.entities.len(), 2, "the parent + one spawned child");
+        let child_id = *driver
+            .world
+            .entities
+            .keys()
+            .find(|id| **id != PRIMARY_ENTITY)
+            .expect("a child Entity was spawned");
+        assert!(matches!(
+            driver.world.entities.get(&child_id).expect("child").activity,
+            Activity::Idle
+        ));
+
+        // The parent's continuation carries the CHILD'S FINAL ANSWER as the assembled
+        // tool_result — proving the regenerated `result` is the child's answer (a pure
+        // function of World state), folded into the parent's slot by identity.
+        let tool_result = &parent.history.0[2];
+        assert!(matches!(tool_result.role, Role::User), "the assembled tool_result Msg");
+        match &tool_result.content[0] {
+            Block::ToolResult { tool_use_id, content, is_error } => {
+                assert_eq!(tool_use_id, "tu_child", "result paired with the Child slot's id");
+                assert!(!is_error, "a successful child result is not an error");
+                assert!(
+                    matches!(content.as_slice(), [Block::Text { text }] if text == "child answer"),
+                    "the parent receives the child's final answer"
+                );
+            }
+            other => panic!("expected the child's ToolResult, got {other:?}"),
+        }
+
+        // The PRODUCTION construction path recorded a `ChildReturned` in the log (not a
+        // test-only fixture), carrying the child's final answer and NO fingerprint.
+        let events = driver.log.load().expect("load the recorded log");
+        let child_returns: Vec<&Event> = events
+            .iter()
+            .filter(|e| matches!(e.input, LogicalInput::ChildReturned { .. }))
+            .collect();
+        assert_eq!(child_returns.len(), 1, "exactly one ChildReturned was regenerated + logged");
+        match &child_returns[0].input {
+            LogicalInput::ChildReturned { parent, child, tool_use_id, result } => {
+                assert_eq!(*parent, PRIMARY_ENTITY);
+                assert_eq!(*child, child_id);
+                assert_eq!(tool_use_id, "tu_child");
+                match result {
+                    Block::ToolResult { content, is_error, .. } => {
+                        assert!(!is_error);
+                        assert!(matches!(
+                            content.as_slice(),
+                            [Block::Text { text }] if text == "child answer"
+                        ));
+                    }
+                    other => panic!("expected a ToolResult, got {other:?}"),
+                }
+            }
+            other => panic!("expected ChildReturned, got {other:?}"),
+        }
+
+        // DETERMINISM (Inv 6/7/9): a full `fold_log` of the RECORDED fan-out log — with
+        // NO ModelCaller, so ZERO model calls by construction — reconstructs the live
+        // World byte-identically. The regenerated `ChildReturned` is re-applied directly
+        // from the log (it is the identity-correlated, non-fingerprinted exception), so
+        // an offline replay reaches the parent's resume without a fingerprinted boundary.
+        let refolded = crate::agent::world::replay::fold_log(genesis_world(7, stub_model()), &events);
+        assert_eq!(
+            serde_json::to_vec(&refolded).expect("serialize the refolded World"),
+            serde_json::to_vec(&driver.world).expect("serialize the live World"),
+            "a recorded fan-out log folds back to the live World byte-identically (Inv 9)"
         );
     }
 }

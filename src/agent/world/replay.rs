@@ -55,7 +55,7 @@ use std::collections::BTreeSet;
 
 use crate::agent::world::effects::{
     drive_live, drive_replay, resume, Command, ModelCaller, Reconciliation, ReplayCursor, Replayed,
-    ResultStamp, SurfaceDriver,
+    ResultStamp, SurfaceDriver, UnattachedPeerSender,
 };
 use crate::agent::world::event_log::EventLog;
 use crate::agent::world::inputs::{Event, LogicalInput};
@@ -127,6 +127,8 @@ pub fn is_model_call_result(input: &LogicalInput) -> bool {
 /// `SessionStarted` header and the named non-fingerprinted derived exceptions
 /// (`ToolAborted`, `ChildReturned`, `HumanActionAborted`), which are in-World
 /// identity-correlated results, not shell-dispatched effect results.
+/// `DriveRequested`/`PeerDelivered` are EXOGENOUS (free inbound peer inputs);
+/// `PeerSendOutcome` is DERIVED (the sender's `SendPeer` ack, fingerprinted).
 pub fn is_exogenous(input: &LogicalInput) -> bool {
     !matches!(
         input,
@@ -136,6 +138,7 @@ pub fn is_exogenous(input: &LogicalInput) -> bool {
             | LogicalInput::ToolReturned { .. }
             | LogicalInput::HumanActionDone { .. }
             | LogicalInput::Compacted { .. }
+            | LogicalInput::PeerSendOutcome { .. }
     )
 }
 
@@ -493,9 +496,12 @@ where
                     let results = drive_live(
                         &commands,
                         stamp,
-                        &world.resources.surfaces,
+                        &world,
                         client,
                         surface_driver,
+                        // Placeholder peer sender; a peer-drive branch's outbound send
+                        // is the worker's broker concern, inert on these replay paths.
+                        &UnattachedPeerSender,
                         log,
                     )
                     .await?;
@@ -604,6 +610,7 @@ mod tests {
                 budget: Budget::default(),
                 inbox: Inbox::default(),
                 turns: 0,
+                spawned: 0,
                 model: None,
             },
         );

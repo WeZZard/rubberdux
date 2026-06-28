@@ -14,6 +14,7 @@ pub mod budget;
 pub mod compaction;
 pub mod subagent;
 pub mod supervision;
+pub mod peer;
 pub mod surface;
 
 use crate::agent::world::effects::Command;
@@ -176,6 +177,17 @@ const REGISTRY: &[(Phase, &'static dyn System)] = &[
     // touches only the parent's slot, disjoint from TurnSystem's child settle. See
     // docs/agent/world/ecs-runtime.md (SupervisionSystem; Tick discipline phase 5).
     (Phase::TurnAdvance, &supervision::SupervisionSystem),
+    // PeerDriveSystem owns the `Peer` slot kind — cross-World drives (phase 5). On the
+    // branching `ModelResponded` it emits each fresh `Peer` slot's `SendPeer` (or
+    // DENIES a malformed `drive_peer` inline `is_error`, Inv 10); on the sender-local
+    // `PeerSendOutcome` it settles the matching `Peer` slot by `cmd` (Inv 16) and
+    // shares the all-slots-Done continuation via `tool::advance`. It ALSO folds an
+    // inbound `DriveRequested` (origin Peer): a gate-proof exogenous settle that
+    // authorizes the drive, projects its `surface_ops` (no separate `SurfaceMutated`),
+    // and enqueues its `prompt` to the Inbox. Runs after ToolSystem so a mixed turn's
+    // `Local` slots already carry their cmds before its all-Done check. See
+    // docs/agent/world/ecs-runtime.md (PeerDriveSystem; Tick discipline phase 5).
+    (Phase::TurnAdvance, &peer::PeerDriveSystem),
 ];
 
 /// The pure tick reducer: process EXACTLY ONE `Event` through the registered
@@ -202,6 +214,20 @@ pub fn tick(world: &World, event: &Event) -> (World, Vec<Command>) {
     world.clock = event.at;
 
     let input = &event.input;
+
+    // Structural counterpart→edge binding: an `EdgeBound` records the inbound peer's
+    // edge into `Resources.edges` BEFORE the phase Systems run, so a re-resolution
+    // (`edge_for`) is stable across that peer's inputs and a reconstruction folds the
+    // SAME binding (Inv 6). It belongs to no phase — a structural fold like the
+    // wall/clock fold above — and is folded identically by the LIVE driver and a
+    // replay, so both produce byte-identical `Resources`. A no-op for every
+    // pre-federation log (only a fresh `Peer` ever logs one). See
+    // docs/agent/world/ecs-runtime.md (EdgeBound; edge_for; Theme 4a).
+    if let LogicalInput::EdgeBound { edge, counterpart } = input {
+        world.resources =
+            crate::agent::world::edge::fold_edge_bound(&world.resources, *edge, counterpart);
+    }
+
     let mut commands: Vec<Command> = Vec::new();
 
     // Phases 1–5: run each phase's Systems in the fixed phase order (Inv 12).
@@ -255,6 +281,7 @@ mod tests {
                 budget: crate::agent::world::budget::Budget::default(),
                 inbox: crate::agent::world::world::Inbox::default(),
                 turns: 0,
+                spawned: 0,
                 model: None,
             },
         );

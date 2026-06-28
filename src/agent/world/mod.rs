@@ -6,6 +6,7 @@ pub mod event_log;
 pub mod effects;
 pub mod gates;
 pub mod budget;
+pub mod edge;
 pub mod edges;
 pub mod autonomy;
 pub mod lifecycle;
