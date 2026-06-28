@@ -31,6 +31,10 @@ pub struct AgentLoopBuilder {
     pub recorder: Option<SharedTrajectoryRecorder>,
     pub workspace: Option<Arc<crate::workspace::Workspace>>,
     pub mindset: Option<Arc<crate::mindset::Mindset>>,
+    /// Channel processors keyed by channel name. Lives only in a host build
+    /// because `crate::channel` (and its `ChannelProcessor` trait) is gated
+    /// behind the `host` feature — an agent-only build has no channel surface.
+    #[cfg(feature = "host")]
     pub channel_processors: std::collections::HashMap<String, std::sync::Arc<dyn crate::channel::processor::ChannelProcessor>>,
     pub guardrails: Option<crate::guardrail::GuardrailChain>,
     pub external_cwd: Option<std::path::PathBuf>,
@@ -64,6 +68,7 @@ impl AgentLoopBuilder {
             recorder: None,
             workspace: None,
             mindset: None,
+            #[cfg(feature = "host")]
             channel_processors: std::collections::HashMap::new(),
             guardrails: None,
             external_cwd: None,
@@ -109,6 +114,7 @@ impl AgentLoopBuilder {
         self
     }
 
+    #[cfg(feature = "host")]
     pub fn with_channel_processor(
         mut self,
         name: impl Into<String>,
@@ -203,6 +209,7 @@ impl AgentLoopBuilder {
                 r.register(Box::new(crate::tool::task::TaskTool::new(ws.clone())));
             }
 
+            #[cfg(feature = "host")]
             for (_, processor) in &self.channel_processors {
                 for tool in processor.tools() {
                     r.register(tool);
@@ -288,6 +295,7 @@ impl AgentLoopBuilder {
             cancel: cancel.clone(),
             compaction: Box::new(EvictOldestTurns),
             context_tx: Some(context_tx.clone()),
+            #[cfg(feature = "host")]
             channel_processors: self.channel_processors,
             guardrails: self.guardrails.unwrap_or_else(crate::guardrail::GuardrailChain::new),
         };

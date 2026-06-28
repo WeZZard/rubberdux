@@ -70,6 +70,7 @@ pub fn spawn_subagent(
             cancel: cancel_clone.clone(),
             compaction: Box::new(EvictOldestTurns),
             context_tx: None,
+            #[cfg(feature = "host")]
             channel_processors: std::collections::HashMap::new(),
             guardrails: crate::guardrail::GuardrailChain::new(),
         };

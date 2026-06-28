@@ -29,11 +29,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value as Json;
 
-use rubberdux::agent::world::effects::{
-    Command, ModelCaller, ReplayCursor, Replayed, drive_replay, fingerprint_call,
-};
+use rubberdux::agent::world::effects::{Command, ModelCaller, fingerprint_call};
 use rubberdux::agent::world::gates::EntityGate;
 use rubberdux::agent::world::history::{Block, History, Msg, Role};
+use rubberdux::agent::world::replay;
 use rubberdux::agent::world::inputs::{
     Capabilities, Event, Fingerprint, LogicalInput, ModelMeta, Origin, ReasoningPolicy, StopReason,
     Usage,
@@ -84,14 +83,7 @@ fn genesis(seed: u64, model: &ModelConfig) -> World {
 /// cross a recorded boundary, so replay reseeds `Rng` from the log's `SessionStarted`
 /// header rather than from any live source.
 fn genesis_from_log(events: &[Event], model: &ModelConfig) -> Result<World, Error> {
-    let seed = events
-        .iter()
-        .find_map(|e| match &e.input {
-            LogicalInput::SessionStarted { seed, .. } => Some(*seed),
-            _ => None,
-        })
-        .ok_or_else(|| Error::World("recorded log has no SessionStarted header".into()))?;
-    Ok(genesis(seed, model))
+    replay::genesis_from_log(events, |seed| genesis(seed, model))
 }
 
 /// The world-default `ModelConfig`. Its `model` id rides in the request the re-emitted
@@ -133,80 +125,25 @@ impl ModelCaller for ExplodingClient {
 /// present in the log, so there is nothing to dispatch and the emitted Commands are
 /// discarded. This is the canonical ("live") World the replay must reproduce byte-for-byte.
 fn fold_log(events: &[Event], model: &ModelConfig) -> Result<World, Error> {
-    let mut world = genesis_from_log(events, model)?;
-    for ev in events {
-        let (next, _commands) = tick(&world, ev);
-        world = next;
-    }
-    Ok(world)
+    Ok(replay::fold_log(genesis_from_log(events, model)?, events))
 }
 
 // ---------------------------------------------------------------------------
 // replay_log — the REPLAY driver: stand in model-call results from the cursor
 // ---------------------------------------------------------------------------
 
-/// Whether an input is a model-call RESULT the replay driver stands in for via the
-/// `ReplayCursor` (the `CallModel` duals). Every OTHER recorded input — the exogenous
-/// free variables AND the `ToolReturned` tool results, whose RunTool-dispatch replay is
-/// a later milestone — is re-applied directly by the loop, exactly as crash-resume
-/// re-applies a recorded Input through the reducer.
-fn is_model_call_result(input: &LogicalInput) -> bool {
-    matches!(
-        input,
-        LogicalInput::ModelResponded { .. }
-            | LogicalInput::ModelFailed { .. }
-            | LogicalInput::InferenceCancelled { .. }
-    )
-}
-
-/// Fold the SAME recorded log from genesis under the REPLAY driver. The loop re-applies
-/// every input EXCEPT the model-call results, and for each tick's Commands it calls
-/// `drive_replay` — which takes NO `ModelCaller` and so cannot call the model by
-/// construction — standing in the already-logged result while the re-emitted request
-/// re-hashes to its `Fingerprint`.
-///
-/// The `ReplayCursor` is built over the model-call results ALONE (not every derived
-/// result): in a tool loop the `ToolReturned` results are re-applied directly by the
-/// loop, so a continuation `CallModel` re-emitted after them must pull the NEXT
-/// `ModelResponded` from the cursor — never a `ToolReturned`. A `Diverged` outcome means
-/// a re-emitted request stopped matching the record, which a faithful replay never does,
-/// so it is reported as an error.
+/// Fold the SAME recorded log from genesis under the REPLAY driver (the promoted
+/// `replay::replay_world`). The `ReplayCursor` stands in for the model-call results
+/// ALONE (`replay::is_model_call_result`): in a tool loop the `ToolReturned` results
+/// are re-applied directly by the loop, so a continuation `CallModel` re-emitted after
+/// them pulls the NEXT `ModelResponded` from the cursor — never a `ToolReturned`. A
+/// `Diverged` outcome is a replay failure.
 fn replay_log(events: &[Event], model: &ModelConfig) -> Result<World, Error> {
-    let mut world = genesis_from_log(events, model)?;
-    let model_results: Vec<Event> = events
-        .iter()
-        .filter(|e| is_model_call_result(&e.input))
-        .cloned()
-        .collect();
-    let mut cursor = ReplayCursor::new(&model_results);
-
-    for ev in events.iter().filter(|e| !is_model_call_result(&e.input)) {
-        let (next, mut commands) = tick(&world, ev);
-        world = next;
-
-        while !commands.is_empty() {
-            let replayed = drive_replay(&commands, &mut cursor)?;
-            commands = Vec::new();
-            for outcome in replayed {
-                match outcome {
-                    Replayed::Reused(event) => {
-                        let (next, mut cmds) = tick(&world, &event);
-                        world = next;
-                        commands.append(&mut cmds);
-                    }
-                    Replayed::Diverged => {
-                        return Err(Error::World(
-                            "replay diverged: a re-emitted request did not match the \
-                             recorded result, but a faithful replay must reuse every result"
-                                .into(),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(world)
+    replay::replay_world(
+        genesis_from_log(events, model)?,
+        events,
+        replay::is_model_call_result,
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -26,11 +26,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value as Json;
 
-use rubberdux::agent::world::effects::{
-    Command, ModelCaller, ReplayCursor, Replayed, drive_replay, fingerprint_call,
-};
+use rubberdux::agent::world::effects::{Command, ModelCaller, fingerprint_call};
 use rubberdux::agent::world::gates::EntityGate;
 use rubberdux::agent::world::history::{Block, History, Role};
+use rubberdux::agent::world::replay;
 use rubberdux::agent::world::inputs::{
     Capabilities, Event, Fingerprint, LogicalInput, ModelMeta, Origin, ReasoningPolicy, StopReason,
     Usage,
@@ -75,14 +74,7 @@ fn genesis(seed: u64, model: &ModelConfig, depth_cap: u8) -> World {
 }
 
 fn genesis_from_log(events: &[Event], model: &ModelConfig, depth_cap: u8) -> Result<World, Error> {
-    let seed = events
-        .iter()
-        .find_map(|e| match &e.input {
-            LogicalInput::SessionStarted { seed, .. } => Some(*seed),
-            _ => None,
-        })
-        .ok_or_else(|| Error::World("recorded log has no SessionStarted header".into()))?;
-    Ok(genesis(seed, model, depth_cap))
+    replay::genesis_from_log(events, |seed| genesis(seed, model, depth_cap))
 }
 
 fn offline_model() -> ModelConfig {
@@ -113,67 +105,24 @@ impl ModelCaller for ExplodingClient {
 // ---------------------------------------------------------------------------
 
 fn fold_log(events: &[Event], model: &ModelConfig, depth_cap: u8) -> Result<World, Error> {
-    let mut world = genesis_from_log(events, model, depth_cap)?;
-    for ev in events {
-        let (next, _commands) = tick(&world, ev);
-        world = next;
-    }
-    Ok(world)
+    Ok(replay::fold_log(
+        genesis_from_log(events, model, depth_cap)?,
+        events,
+    ))
 }
 
-/// Whether an input is a model-call RESULT the replay driver stands in for via the
-/// `ReplayCursor`. A `ChildReturned` is identity-correlated (NOT a model-call result), so
-/// it is re-applied directly by the loop — exactly as crash-resume re-applies a recorded
-/// Input through the reducer.
-fn is_model_call_result(input: &LogicalInput) -> bool {
-    matches!(
-        input,
-        LogicalInput::ModelResponded { .. }
-            | LogicalInput::ModelFailed { .. }
-            | LogicalInput::InferenceCancelled { .. }
-    )
-}
-
-/// Replay under the cursor-driven driver. The `ReplayCursor` is built over the model-call
-/// results ALONE: the parent's and the child's `ModelResponded`s are stood in for each
-/// re-emitted `CallModel` (in log order), while the `ChildReturned` is re-applied directly
-/// by the loop. A `Diverged` outcome is a replay failure.
+/// Replay under the promoted cursor-driven driver (`replay::replay_world`). The
+/// `ReplayCursor` stands in for the model-call results ALONE
+/// (`replay::is_model_call_result`): the parent's and the child's `ModelResponded`s are
+/// stood in for each re-emitted `CallModel` (in log order), while the identity-correlated
+/// `ChildReturned` is re-applied directly by the loop. A `Diverged` outcome is a replay
+/// failure.
 fn replay_log(events: &[Event], model: &ModelConfig, depth_cap: u8) -> Result<World, Error> {
-    let mut world = genesis_from_log(events, model, depth_cap)?;
-    let model_results: Vec<Event> = events
-        .iter()
-        .filter(|e| is_model_call_result(&e.input))
-        .cloned()
-        .collect();
-    let mut cursor = ReplayCursor::new(&model_results);
-
-    for ev in events.iter().filter(|e| !is_model_call_result(&e.input)) {
-        let (next, mut commands) = tick(&world, ev);
-        world = next;
-
-        while !commands.is_empty() {
-            let replayed = drive_replay(&commands, &mut cursor)?;
-            commands = Vec::new();
-            for outcome in replayed {
-                match outcome {
-                    Replayed::Reused(event) => {
-                        let (next, mut cmds) = tick(&world, &event);
-                        world = next;
-                        commands.append(&mut cmds);
-                    }
-                    Replayed::Diverged => {
-                        return Err(Error::World(
-                            "replay diverged: a re-emitted request did not match the \
-                             recorded result, but a faithful replay must reuse every result"
-                                .into(),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(world)
+    replay::replay_world(
+        genesis_from_log(events, model, depth_cap)?,
+        events,
+        replay::is_model_call_result,
+    )
 }
 
 /// Stamp each model-call result's `fingerprint` with the value the LIVE driver would have

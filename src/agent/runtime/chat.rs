@@ -86,6 +86,7 @@ pub async fn run_with_session(
         cancel: CancellationToken::new(),
         compaction: Box::new(EvictOldestTurns),
         context_tx: Some(context_tx),
+        #[cfg(feature = "host")]
         channel_processors: std::collections::HashMap::new(),
         guardrails: crate::guardrail::GuardrailChain::new(),
     };

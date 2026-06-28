@@ -27,13 +27,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde_json::Value as Json;
 
 use rubberdux::agent::world::effects::{
-    Command, ModelCaller, ReplayCursor, Replayed, ResultStamp, SurfaceDriver, ToolSet, drive_live,
-    drive_replay, fingerprint_call,
+    Command, ModelCaller, ResultStamp, SurfaceDriver, ToolSet, drive_live, fingerprint_call,
 };
 use rubberdux::agent::world::surface::SurfaceView;
 use rubberdux::agent::world::event_log::{EventLog, MemoryEventLog};
 use rubberdux::agent::world::gates::EntityGate;
 use rubberdux::agent::world::history::{Block, History, Msg, Role};
+use rubberdux::agent::world::replay;
 use rubberdux::agent::world::inputs::{
     Capabilities, Event, LogicalInput, ModelMeta, Origin, ReasoningPolicy, StopReason, Usage,
 };
@@ -83,25 +83,7 @@ fn genesis(seed: u64, model: &ModelConfig) -> World {
 /// `ModelConfig` is not recorded in P0, so the caller supplies the SAME value the
 /// live run used (documented genesis-parity, not a live re-resolution).
 fn genesis_from_log(events: &[Event], model: &ModelConfig) -> Result<World, Error> {
-    let seed = events
-        .iter()
-        .find_map(|e| match &e.input {
-            LogicalInput::SessionStarted { seed, .. } => Some(*seed),
-            _ => None,
-        })
-        .ok_or_else(|| Error::World("recorded log has no SessionStarted header".into()))?;
-    Ok(genesis(seed, model))
-}
-
-/// Whether an input is EXOGENOUS (a free variable that drives the loop) rather
-/// than a DERIVED effect result (stood in by the replay cursor). The replay loop
-/// iterates only the exogenous events; the recorded results arrive via the
-/// `ReplayCursor`, never by re-folding them off the log directly.
-fn is_exogenous(input: &LogicalInput) -> bool {
-    matches!(
-        input,
-        LogicalInput::SessionStarted { .. } | LogicalInput::UserMessage { .. }
-    )
+    replay::genesis_from_log(events, |seed| genesis(seed, model))
 }
 
 // ---------------------------------------------------------------------------
@@ -203,36 +185,9 @@ async fn run_live<C: ModelCaller>(
 /// result. A `Diverged` outcome means the re-emitted request stopped matching the
 /// record, which a faithful replay never does, so it is reported as an error.
 fn run_replay(events: &[Event], model: &ModelConfig) -> Result<World, Error> {
-    let mut world = genesis_from_log(events, model)?;
-    let mut cursor = ReplayCursor::new(events);
-
-    for ev in events.iter().filter(|e| is_exogenous(&e.input)) {
-        let (next, mut commands) = tick(&world, ev);
-        world = next;
-
-        while !commands.is_empty() {
-            let replayed = drive_replay(&commands, &mut cursor)?;
-            commands = Vec::new();
-            for outcome in replayed {
-                match outcome {
-                    Replayed::Reused(event) => {
-                        let (next, mut cmds) = tick(&world, &event);
-                        world = next;
-                        commands.append(&mut cmds);
-                    }
-                    Replayed::Diverged => {
-                        return Err(Error::World(
-                            "replay diverged: a re-emitted request did not match the \
-                             recorded result, but a faithful replay must reuse every result"
-                                .into(),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(world)
+    replay::replay_world(genesis_from_log(events, model)?, events, |input| {
+        !replay::is_exogenous(input)
+    })
 }
 
 // ---------------------------------------------------------------------------

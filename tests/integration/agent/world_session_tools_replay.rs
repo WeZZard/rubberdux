@@ -30,15 +30,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value as Json;
 
-use rubberdux::agent::world::effects::{
-    ModelCaller, ReplayCursor, Replayed, ToolSet, drive_replay, fingerprint_call,
-};
+use rubberdux::agent::world::effects::{ModelCaller, ToolSet, fingerprint_call};
 use rubberdux::agent::world::gates::EntityGate;
 use rubberdux::agent::world::history::{Block, History, Msg, Role};
 use rubberdux::agent::world::inputs::{
     Capabilities, Event, LogicalInput, ModelMeta, Origin, ReasoningPolicy, StopReason, Usage,
 };
-use rubberdux::agent::world::systems::tick;
+use rubberdux::agent::world::replay;
 use rubberdux::agent::world::world::{
     Activity, Components, Effort, Identity, Lineage, ModelConfig, Resources, World,
 };
@@ -89,14 +87,7 @@ fn genesis(seed: u64, model: &ModelConfig) -> World {
 /// `SessionStarted` header. `surface_tools` is reconstructed by FOLDING that same
 /// header (not read here), so genesis stays empty exactly as the live path's does.
 fn genesis_from_log(events: &[Event], model: &ModelConfig) -> Result<World, Error> {
-    let seed = events
-        .iter()
-        .find_map(|e| match &e.input {
-            LogicalInput::SessionStarted { seed, .. } => Some(*seed),
-            _ => None,
-        })
-        .ok_or_else(|| Error::World("recorded log has no SessionStarted header".into()))?;
-    Ok(genesis(seed, model))
+    replay::genesis_from_log(events, |seed| genesis(seed, model))
 }
 
 /// The world-default `ModelConfig`. Its `model` id rides in the request the
@@ -138,60 +129,19 @@ impl ModelCaller for ExplodingClient {
 /// `ModelResponded` — is present, so emitted Commands are discarded. This is the
 /// canonical ("live") World the replay must reproduce byte-for-byte.
 fn fold_log(events: &[Event], model: &ModelConfig) -> Result<World, Error> {
-    let mut world = genesis_from_log(events, model)?;
-    for ev in events {
-        let (next, _commands) = tick(&world, ev);
-        world = next;
-    }
-    Ok(world)
+    Ok(replay::fold_log(genesis_from_log(events, model)?, events))
 }
 
-/// Whether an input is EXOGENOUS (a free variable that drives the replay loop)
-/// rather than a DERIVED model-call result (stood in by the `ReplayCursor`).
-fn is_exogenous(input: &LogicalInput) -> bool {
-    matches!(
-        input,
-        LogicalInput::SessionStarted { .. } | LogicalInput::UserMessage { .. }
-    )
-}
-
-/// Fold the SAME recorded log from genesis under the REPLAY driver: re-apply the
-/// exogenous events and, for each tick's Commands, call `drive_replay` — which
-/// takes NO `ModelCaller` and so cannot call the model by construction — standing
-/// in the already-logged result while the re-emitted request re-hashes to its
-/// `Fingerprint`. A `Diverged` outcome (what the surface-tools gap produced before
-/// the fix) is reported as an error: a faithful replay must reuse every result.
+/// Fold the SAME recorded log from genesis under the promoted REPLAY driver
+/// (`replay::replay_world`): re-apply the exogenous events (`replay::is_exogenous`)
+/// directly while the `ReplayCursor` stands in for every DERIVED result, gated on the
+/// re-emitted request re-hashing to its `Fingerprint`. A `Diverged` outcome (what the
+/// surface-tools gap produced before the fix — an empty `ToolSet` on replay) is reported
+/// as an error: a faithful replay must reuse every result.
 fn replay_log(events: &[Event], model: &ModelConfig) -> Result<World, Error> {
-    let mut world = genesis_from_log(events, model)?;
-    let mut cursor = ReplayCursor::new(events);
-
-    for ev in events.iter().filter(|e| is_exogenous(&e.input)) {
-        let (next, mut commands) = tick(&world, ev);
-        world = next;
-
-        while !commands.is_empty() {
-            let replayed = drive_replay(&commands, &mut cursor)?;
-            commands = Vec::new();
-            for outcome in replayed {
-                match outcome {
-                    Replayed::Reused(event) => {
-                        let (next, mut cmds) = tick(&world, &event);
-                        world = next;
-                        commands.append(&mut cmds);
-                    }
-                    Replayed::Diverged => {
-                        return Err(Error::World(
-                            "replay diverged: the re-emitted CallModel did not match the \
-                             recorded result — the surface-tools gap (an empty ToolSet on \
-                             replay) is back".into(),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(world)
+    replay::replay_world(genesis_from_log(events, model)?, events, |input| {
+        !replay::is_exogenous(input)
+    })
 }
 
 // ---------------------------------------------------------------------------
