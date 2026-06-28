@@ -19,6 +19,18 @@ use super::state::GatewayState;
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
+    license: &'static str,
+    legal_url: &'static str,
+    source_url: &'static str,
+}
+
+#[derive(Serialize)]
+struct LegalResponse {
+    name: &'static str,
+    version: &'static str,
+    license: &'static str,
+    license_url: &'static str,
+    source_url: &'static str,
 }
 
 #[derive(Serialize)]
@@ -68,6 +80,7 @@ pub struct ListEntriesParams {
 pub fn router() -> axum::Router<Arc<GatewayState>> {
     axum::Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/legal", get(legal))
         .route("/api/v1/entries", get(list_entries))
         .route("/api/v1/entries/{id}", get(get_entry))
         .route("/api/v1/tool-calls", get(list_tool_calls))
@@ -85,7 +98,22 @@ pub fn router() -> axum::Router<Arc<GatewayState>> {
 // ---------------------------------------------------------------------------
 
 async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok" })
+    Json(HealthResponse {
+        status: "ok",
+        license: env!("CARGO_PKG_LICENSE"),
+        legal_url: "/api/v1/legal",
+        source_url: env!("CARGO_PKG_REPOSITORY"),
+    })
+}
+
+async fn legal() -> Json<LegalResponse> {
+    Json(LegalResponse {
+        name: env!("CARGO_PKG_NAME"),
+        version: env!("CARGO_PKG_VERSION"),
+        license: env!("CARGO_PKG_LICENSE"),
+        license_url: "https://www.gnu.org/licenses/agpl-3.0.html",
+        source_url: env!("CARGO_PKG_REPOSITORY"),
+    })
 }
 
 async fn list_entries(
@@ -344,6 +372,23 @@ mod tests {
         let (status, json) = response_json(app().await, "/api/v1/health").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["status"], "ok");
+        assert_eq!(json["license"], "AGPL-3.0-or-later");
+        assert_eq!(json["legal_url"], "/api/v1/legal");
+        assert_eq!(json["source_url"], "https://github.com/WeZZard/rubberdux");
+    }
+
+    #[tokio::test]
+    async fn test_legal_returns_source_metadata() {
+        let (status, json) = response_json(app().await, "/api/v1/legal").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["name"], "rubberdux");
+        assert_eq!(json["version"], "0.1.0");
+        assert_eq!(json["license"], "AGPL-3.0-or-later");
+        assert_eq!(
+            json["license_url"],
+            "https://www.gnu.org/licenses/agpl-3.0.html"
+        );
+        assert_eq!(json["source_url"], "https://github.com/WeZZard/rubberdux");
     }
 
     #[tokio::test]

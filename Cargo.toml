@@ -7,7 +7,7 @@ name = "rubberdux"
 version = "0.1.0"
 edition = "2024"
 description = "A centralized AI agent that manages context, memory, and dispatches tasks to other AI agents"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 repository = "https://github.com/WeZZard/rubberdux"
 default-run = "rubberduxd"
 
