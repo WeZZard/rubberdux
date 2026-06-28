@@ -143,10 +143,16 @@ enum Block {
     ToolUse   { id: String, name: String, input: Json },
     ToolResult{ tool_use_id: String, content: Vec<Block>, is_error: bool },
     Reasoning { text: String, signature: Opaque },  // echo unchanged
-    Image     { source: ImageSource },   // ImageSource is a CONTENT-ADDRESSED blob hash, not inline
-                                         // bytes — large blobs are externalized to bound log/snapshot
-                                         // size (Boundedness); dedup/consistency is single-source by hash (lens 8)
+    Image     { source: ImageSource },   // ImageSource::Inline{mime,bytes} (at/under Caps.blob_inline_cap,
+                                         // or cap==0) or ImageSource::Blob{hash:BlobHash,mime} (over cap —
+                                         // bytes externalized to BlobStore; log/snapshot hold hash only).
+                                         // Bounds log/snapshot size (Boundedness); single-source by hash (lens 8).
 }
+enum ImageSource {
+    Inline { mime: String, bytes: Vec<u8> },       // ≤ Caps.blob_inline_cap (or cap == 0)
+    Blob   { hash: BlobHash, mime: String },        // externalized; bytes live only in BlobStore
+}
+struct BlobHash(String);   // hex(SHA-256(bytes)) — 64-char lowercase hex; the content address
 
 // Per-entity turn state machine:
 enum Activity {
@@ -247,14 +253,20 @@ struct Resources {
 
 // Boundedness caps — every queue, growing structure, and retry loop carries an explicit brake.
 // These are World state (config singletons), so they replay deterministically like everything else.
+type ByteCap = u32;  // byte size threshold; 0 = unbounded (never externalize)
 struct Caps {
-    inbox:       QueueCap,     // per-entity Inbox; OVERFLOW = DropOldest (backpressure on a Paused app)
-    raised:      QueueCap,     // per-entity RaisedInteractions; OVERFLOW = RejectNewest
-    peer_inbox:  QueueCap,     // offline-peer inbox; OVERFLOW = RejectNewest (sender sees `Rejected`)
-    mode_window: u32,          // # recent Events the mode-as-projection fold scans, so mode is
-                               // O(window) not O(history) (bounds the "recent log")
-    snapshot_interval: Tick,   // ticks between World snapshots (restore = nearest snapshot + tail)
-    restart:     RestartPolicy,
+    inbox:           QueueCap,  // per-entity Inbox; OVERFLOW = DropOldest (backpressure on a Paused app)
+    raised:          QueueCap,  // per-entity RaisedInteractions; OVERFLOW = RejectNewest
+    peer_inbox:      QueueCap,  // offline-peer inbox; OVERFLOW = RejectNewest (sender sees `Rejected`)
+    mode_window:     u32,       // # recent Events the mode-as-projection fold scans, so mode is
+                                // O(window) not O(history) (bounds the "recent log")
+    snapshot_interval: Tick,    // ticks between World snapshots (restore = nearest snapshot + tail)
+    restart:         RestartPolicy,
+    blob_inline_cap: ByteCap,   // threshold for blob externalization to BlobStore:
+                                // 0 = unbounded (blobs always stay Inline, default);
+                                // > 0 = payloads OVER this byte count are externalized to BlobStore
+                                // and recorded as ImageSource::Blob{hash} (Boundedness — Large blobs).
+                                // Missing in older logs ⇒ deserializes as 0 (no change in behavior).
 }
 struct QueueCap { limit: u32, overflow: Overflow }
 enum Overflow { DropOldest, RejectNewest }   // behavior chosen PER queue above; no queue is unbounded
@@ -342,8 +354,17 @@ enum PauseReason { User, PolicyHalt(GuardrailTrip) }
 
 - **Per-entity overrides.** `ModelConfig` and `Autonomy` are world *defaults* in
   `Resources` but optional *overrides* in `Components` (`model`, `autonomy`).
-  Resolution is **entity override else world default**, so a sub-agent can run a
-  cheaper/more-restricted model and a tighter autonomy tier than its parent.
+  Resolution is **entity override else world default** (`None ⇒ inherit`), so a
+  sub-agent can run a cheaper/more-restricted model and a tighter autonomy tier
+  than its parent. Two pure resolvers on `World` encapsulate this rule:
+  `model_for(entity) = Components.model ?? Resources.model` and
+  `autonomy_for(entity) = Components.autonomy ?? Resources.autonomy`. Both are
+  side-effect-free lookups over `Components` + `Resources`. `model_for` is
+  consulted at every `CallModel` emit (intake turn start, tool-loop continuation,
+  subagent first-turn, each of the three compaction-path emits). `autonomy_for`
+  is consulted at the autonomy gate in AutonomySystem. An entity with `None`
+  overrides resolves byte-identically to the world defaults, so logs recorded
+  before the fields existed replay unchanged.
 - **`depth_cap` stays a single global scalar.** It bounds *nesting depth* along any
   root→leaf path (checked against per-entity `Lineage.depth`), which is genuinely
   one global invariant — correct cardinality. A per-subtree *fan-out/count* budget
@@ -845,12 +866,17 @@ this schedule; the per-System bullets describe each System's role within its pha
   any LATER terminal input for that same `cmd` is idempotently dropped (exactly one terminal
   input per `cmd` — see *Correlate by identity*). When `awaiting` is empty `→ Idle`, keeping any
   `partial`.
-- **GateSystem** — owns the App-WIDE `WorldGate`. `Pause{User}`/`Pause{PolicyHalt(trip)}`
-  ADD a `PauseHold` (idempotent per source); `Resume` removes every `User` hold;
-  `ClearPolicyHalt{trip, authority}` removes the matching `PolicyHalt(trip)` hold (the input
-  MUST carry an authority token — its verification is a later enforcement concern, but the
-  transition EXISTS here). The gate returns to `Open` ONLY when `holds` is empty, so a
-  policy halt survives a user resume until its authorized clearance arrives. **A closed gate
+- **GateSystem** (`src/agent/world/systems/gate.rs`; Phase 1 Lifecycle) — owns the
+  App-WIDE `WorldGate`. `Pause{User}`/`Pause{PolicyHalt(trip)}` ADD a `PauseHold`
+  (idempotent per source); `Resume` removes every `User` hold; `ClearPolicyHalt{trip,
+  authority}` is the named clearing input (Inv 15), now **authority-enforced as-built**:
+  `authority.authorizes_clear()` checks that the credential is non-blank; a valid
+  authority removes the matching `PolicyHalt(trip)` WorldGate hold AND clears any
+  per-entity `EntityHalt { trip }` across all entities, so the gate reopens once
+  nothing else holds it; coexisting holds (`User` pause, a different trip) survive;
+  an insufficient or empty authority is REJECTED — the World is byte-identical.
+  The gate returns to `Open` ONLY when `holds` is empty, so a policy halt survives a
+  user resume until its authorized clearance arrives. **A closed gate
   blocks NEW WORK, never result-settling.** A Paused `WorldGate` or an `EntityGate::Halted` blocks
   turn INITIATION and CONTINUATION ONLY — no new `CallModel`/`RunTool`/`RequestHumanAction`/
   `SendPeer`, no slot-advance to the next `CallModel` — so Intake and the turn-advance phase are
@@ -865,6 +891,17 @@ this schedule; the per-System bullets describe each System's role within its pha
   with `Pending` slots, those slots get `is_error` `ToolResult`s so it settles instead of
   deadlocking, but any already-landed result is still folded first. (The halt CONDITION —
   spend-budget exhaustion — and EntityGate RE-open are owned by BudgetSystem below.)
+- **GuardrailSystem** (`src/agent/world/systems/guardrail.rs`; Phase 1 Lifecycle) — the
+  TRIP SOURCE for an App-wide `WorldGate` policy halt. It runs in Phase 1 so the trip
+  lands before the new-work phases (Intake phase 2, TurnAdvance phase 5) that the gate
+  suppresses. The P0 predicate: a `ModelResponded` whose `meta.stop_reason ==
+  StopReason::Refusal` is a content-policy violation; on match, GuardrailSystem APPENDS
+  a `PauseReason::PolicyHalt(GuardrailTrip("model-refusal"))` hold to `WorldGate.holds`
+  (idempotent per trip — a second refusal does not duplicate the hold). The hold COEXISTS
+  with any concurrent `User` hold or other trips; the gate returns to `Open` only when ALL
+  holds clear. GuardrailSystem emits NO Commands — it only adds a hold. Its sole named
+  clearing input is `ClearPolicyHalt { trip: GuardrailTrip("model-refusal"), authority }`,
+  folded by GateSystem (Inv 15); a non-matching input leaves the World byte-identical.
 - **BudgetSystem** — owns the per-entity budget brakes (*Boundedness and backpressure*). On every
   `ModelResponded`, fold `meta.usage` into `TokenBudget.used` (SPEND) and refresh `context_used`
   from the call's input+output tokens. Then: if `used ≥ limit` set this entity's
@@ -882,10 +919,12 @@ this schedule; the per-System bullets describe each System's role within its pha
   shrinks, `context_used` drops) and emit the deferred continuation `CallModel` (→ `Thinking`); on
   a compaction `ModelFailed`, proceed UN-compacted as a best-effort continuation (→ `Thinking`) so
   boundedness never introduces a new sink.
-- **AutonomySystem** — before a tiered action, emit `RaiseInteraction(Approval)` per
-  `Autonomy` policy and HOLD the gated `RunTool`. On `InteractionAnswer`: approve → emit the
-  held `RunTool`; reject → resolve that tool's `ToolSlot` with a `ToolResult { is_error: true }`
-  ("action denied by user"), slot `Done` (B6 — a rejected Approval must not deadlock), exactly as
+- **AutonomySystem** (`src/agent/world/systems/autonomy.rs`) — before a tiered action,
+  resolves the effective policy via `autonomy_for(entity)` (entity override else world
+  default, `None ⇒ inherit`), then emits `RaiseInteraction(Approval)` per that policy and
+  HOLDS the gated `RunTool`. On `InteractionAnswer`: approve → emit the held `RunTool`;
+  reject → resolve that tool's `ToolSlot` with a `ToolResult { is_error: true }` ("action
+  denied by user"), slot `Done` (B6 — a rejected Approval must not deadlock), exactly as
   if the tool had returned an error.
 - **SurfaceSystem** — maintains the World's view of the client surfaces from TWO inputs of
   DIFFERENT status. A **human-origin** `SurfaceMutated` Input (the only logged `SurfaceMutated`,
@@ -1317,6 +1356,21 @@ routine in-band operation that lets the run continue within the same spend budge
 Recent, near-context History stays verbatim; only OLDER turns are summarized, so tool-call fidelity
 for the active turn is preserved.
 
+**Compaction-resume (crash recovery, `driver.rs`).** A crash mid-compaction leaves the entity
+reconstructed in `Activity::Compacting { cmd }` after replay + resume. Because `Compact` is an
+effectful model call, `effects::resume` leaves it with no result Input — the `CommandDispatched`
+intent has no matching `Compacted` in the log, so `outstanding_cmds` returns it as an unresolved
+dispatch. `WorldDriver::open` detects this: for each such `cmd` it locates the entity that
+holds `Activity::Compacting { cmd: held } if held == cmd`, then calls
+`rebuild_compact_command(world, entity, cmd)` — a **pure deterministic function** that re-runs
+CompactionSystem's exact deferral heuristic over the unchanged History, so it re-hashes to the
+SAME `Fingerprint` the live run recorded. The reconstructed `Command::Compact` is re-dispatched
+through the live `drive_live` loop under the SAME `cmd` (idempotent: the provider deduplicates via
+the `key`), driving to quiescence. A log with no `Compacting` tail has no outstanding compaction
+dispatch-intent, so `outstanding_cmds` is empty and the re-dispatch loop is never entered — opens
+byte-identically. An outstanding `cmd` with no reconstructable `Compacting` tail (e.g. a `Peer` or
+`Timer` tail, which this driver never dispatches) fails loud rather than silently stranding it.
+
 ### Loop guard — bound the tool/turn loop
 
 A model that keeps calling tools forever is an unbounded loop. `Components.limits.turns` counts
@@ -1412,26 +1466,68 @@ restarts occur within `window` (restart intensity), the supervisor ESCALATES —
 THIS process and surfaces it up (to a parent supervisor / the human) — instead of looping. The same
 backoff governs `ModelFailed` retries.
 
-### Large blobs — externalize to bound log and snapshot size
+### Large blobs — content-addressed blob store (`src/agent/world/blob.rs`)
 
 `Block::Image` and large `Block::ToolResult` payloads (screenshots, file dumps) would bloat the log
-AND every snapshot if stored inline. Two stages:
+AND every snapshot if stored inline. The as-built runtime externalizes them to a **content-addressed
+durable `BlobStore`** (`src/agent/world/blob.rs`).
 
-- **v1 — inline / capped payloads, no separate store.** Blobs ride inline in the log up to a size
-  cap; over the cap they are truncated/rejected. Simplest; no second artifact to keep durable.
-- **v2 — content-addressed durable blob store.** Blobs are externalized to an **append-only,
-  fsync'd blob store** keyed by the HASH of their bytes, and the block carries a small HASH
-  reference, not the bytes. The store is **PRIMARY STORAGE, not a derived cache**: when the log
-  records only a content hash, the blob BYTES are primary data — they are NOT regenerable from the
-  log, so the store must be as durable as the log itself. Garbage collection is by
-  **log-reachability**: a blob whose hash is no longer referenced by any retained log segment or
-  snapshot may be reclaimed; one still reachable must never be. Content addressing still gives
-  automatic dedup (one entry per hash) and tamper detection (a hash that resolves to different
-  bytes is corruption, detected on read) — but this is single-source *of the bytes by hash*, NOT a
-  cache the log can rebuild (see the corrected claim in *Single source of truth*, lens 8).
+**Types (as-built).**
 
-This stage bounds the SIZE carried by the log/snapshot; the durability and GC of the bytes are the
-blob store's own responsibility, not the log's.
+```rust
+struct BlobHash(String);   // hex(SHA-256(bytes)) — 64-char lowercase hex, no algorithm prefix
+enum ImageSource {
+    Inline { mime: String, bytes: Vec<u8> },  // ≤ blob_inline_cap (or cap == 0)
+    Blob   { hash: BlobHash, mime: String },  // externalized; bytes live in BlobStore
+}
+// Block::Image { source: ImageSource } carries either variant
+```
+
+`Caps.blob_inline_cap: ByteCap` is the threshold (`0` ⇒ unbounded: blobs are never externalized
+regardless of size). Payloads at or under the cap stay `Inline`; those exceeding it are externalized
+via `BlobStore.put` and recorded as `Blob { hash }` — the log and snapshot hold only the hash, never
+the bytes. Existing logs without `blob_inline_cap` deserialize with `0` (no change in behavior).
+
+**Inline-vs-externalize decision.** `over_inline_cap(len, cap) -> bool` is a **pure** function:
+externalize iff `cap != 0 && len > cap`. No IO — the decision lives in the functional core.
+
+**`BlobStore` (`src/agent/world/blob.rs`).**
+
+- **On-disk layout:** `<root>/<hash[0..2]>/<hash>` — the two-char prefix fans entries across 256
+  shard directories so no shard becomes a hot-spot.
+- **`put(bytes) -> BlobHash`**: idempotent (identical bytes hash identically → same path → no-op if
+  already stored). On a first write: temp `<hash>.tmp` in the SAME shard → `sync_all()` → rename
+  into place → `sync_all()` on the shard directory — the blob is durable before `put` returns.
+- **`get(hash) -> bytes`**: re-hashes the stored bytes and rejects any mismatch as corruption
+  (tamper detection by content addressing — a hash that no longer matches its bytes is not a
+  competing version, it is data loss).
+- `stored_hashes()` enumerates every content address in the store (a `BTreeSet`, deterministic
+  order) — the seam the reachability GC builds on.
+
+**Byte-identity crux (Inv 7).** The `CallModel` fingerprint is computed over the MESSAGES as they
+appear in the log — `Blob { hash }` form, not the resolved `Inline` bytes. The live driver
+resolves a `Blob` back to bytes for the model request body but computes the fingerprint BEFORE
+resolving. Replay re-emits the same fingerprint from the same un-resolved Blob-form history, so live
+and replay hash identically: a `Blob`-form history fingerprint matches on the first re-emit, and the
+stored result is reused without re-resolving to bytes (Inv 7).
+
+**Reachability GC (pure-policy / thin-IO-shell split, mirroring `reclaim.rs`).**
+
+- `reachable_blobs(segments: &[Event], snapshots: &[World]) -> BTreeSet<BlobHash>` — **pure**: no
+  IO; walks every retained log event's blocks and every retained snapshot World's History/Inbox/slot
+  blocks (recursing into `ToolResult` content), collecting every `Block::Image { Blob { hash } }`
+  reference. Reachability tracks RETAINED data (the hot + cold log segments the segmented log still
+  holds and the retained snapshots), NOT all history ever written.
+- `reclaimable_blobs(stored, reachable) -> Vec<BlobHash>` — **pure**: `stored − reachable`.
+- `sweep_blobs(store, reclaimable, reachable) -> Result<Vec<BlobHash>>` — the thin IO shell: deletes
+  each reclaimable blob from the store; NEVER a reachable one (the guard is redundant by
+  construction but enforced defensively, because losing a still-referenced blob is irrecoverable —
+  the bytes live ONLY in the store, not regenerable from the log). `reclaim_blobs` wires
+  `reachable_blobs` → `reclaimable_blobs` → `sweep_blobs` beside the dead-branch GC.
+
+The store is **PRIMARY STORAGE, not a derived cache**: the log holds only hashes; the bytes
+are NOT reproducible by replay. The store must be as durable as the log. (See
+*Single source of truth* — content-addressed blobs are single-source by hash.)
 
 ### Bounded mode window
 
@@ -1495,6 +1591,26 @@ reconstructable from those two logs. If any residual runtime cache must still li
 MUST be written **atomically (temp + fsync + rename)** and is explicitly a **cache, not truth** — the
 log wins on conflict.
 
+### APPEND FSYNC — durable-before-ack append contract
+
+`append_jsonl` (`event_log.rs`) calls `sync_data()` on the open file **before returning `Ok(())`**,
+closing the power-loss gap: a caller that receives `Ok` from `append` is guaranteed the event is on
+durable storage. `sync_data` is preferred over `sync_all` because it omits non-essential metadata
+(e.g. `mtime`) while still guaranteeing readers see every byte written — one fsync per append,
+correctness-first.
+
+**Sync-observation seam** (testability). `append_jsonl_observing_sync(path, value, on_sync)` fuses
+the `on_sync` callback INSIDE the `sync_data` call via `.map(|()| on_sync())`: the observation fires
+IFF AND ONLY IF `sync_data` itself succeeds, BEFORE `append` returns `Ok`. The fusion means that
+deleting or reordering the fsync also removes the observation — a test spy that expects the sync call
+will fail if the fsync is removed. Production (`append_jsonl`) passes a no-op `&|| {}` so behavior
+and on-disk bytes are unchanged. `FilesystemEventLog::with_sync_observer` is the injected test seam;
+`FilesystemEventLog::new` is the production path.
+
+The same durability contract applies to `BlobStore::put` (temp → `sync_all` → rename → `sync_all`
+shard dir) and to `SnapshotStore::write` (temp → `sync_all` → rename → `sync_all` parent dir) —
+every artifact that is the sole home of durable data fsyncs before it signals success.
+
 ### Snapshots are a derived cache — prunable and regenerable
 
 A snapshot is a **pure function of the log up to its tick**: `snapshot(t) = replay(log[..t])`. It
@@ -1538,17 +1654,17 @@ trajectory. On conflict, the recorded `meta` wins.
 
 ### Content-addressed blobs are single-source by hash — but PRIMARY storage, not a derived cache
 
-Large `Block::Image` / `Block::ToolResult` payloads (in the v2 store — *Boundedness*) live in a
-**content-addressed blob store** keyed by the HASH of their bytes. Content addressing makes the store
-single-source BY CONSTRUCTION at the level of IDENTITY: there is exactly ONE entry per content hash,
-the log references a blob only by that hash, de-duplication is automatic (two identical blobs collapse
-to one entry), and a hash that resolves to different bytes is corruption (detected on read), not a
-competing version. **Correction (Codex-r2):** the blob BYTES are nevertheless **PRIMARY DATA, not a
+`Block::Image { source: ImageSource::Blob { hash: BlobHash, mime } }` payloads live in the
+**`BlobStore`** (`src/agent/world/blob.rs`) keyed by `BlobHash = hex(SHA-256(bytes))`. Content
+addressing makes the store single-source BY CONSTRUCTION at the level of identity: there is exactly
+ONE entry per content hash, the log references a blob only by that hash, de-duplication is automatic
+(two identical blobs collapse to one entry), and a hash that resolves to different bytes is
+corruption (detected on `get`), not a competing version. The blob BYTES are **PRIMARY DATA, not a
 derived/regenerable cache** — when the log stores only the hash, the bytes are NOT reproducible by
-replaying the log, so the store is a SECOND primary durable artifact and must be as durable as the log
-(append-only + fsync), with log-reachability GC. The log is single-source for *which* blobs exist (the
-hash references); the store is single-source for the *bytes* of each hash. Neither can drift from the
-other (the hash binds them), but neither regenerates the other: losing the store loses the bytes.
+replaying the log, so the store is a SECOND primary durable artifact (as durable as the log: every
+`put` fsyncs before returning) with log-reachability GC (`reachable_blobs` / `sweep_blobs`). The log
+is single-source for *which* blobs exist (the hash references); the store is single-source for the
+*bytes* of each hash. Neither regenerates the other: losing the store loses the bytes.
 
 ### The agent UI-write echo is one fact, recorded once
 
@@ -1577,7 +1693,7 @@ already holds:
 | `Components.raised`, `Activity`, `Inbox`, `TokenBudget`, gates, `edges`, `IdAlloc`, `mode` | projections (pure fold of the log) | logical log |
 | Snapshots | derived cache (prunable, regenerable) | logical log |
 | `resume.json` | ELIMINATED | logical log |
-| Blob store (v2) | PRIMARY storage of the bytes (durable; single-source by hash; NOT a derived cache) | the bytes ARE the source; the log is canonical only for *which* hashes are referenced |
+| `BlobStore` (`blob.rs`) | PRIMARY storage of the bytes (`BlobHash`-keyed; fsync'd; GC by `reachable_blobs`/`sweep_blobs`; NOT a derived cache) | the bytes ARE the source; the log is canonical only for *which* hashes are referenced |
 | Model/capability record | per-call record, authoritative on replay | `ModelResponded.meta` (table is live-only) |
 | Agent surface change | projection of the `set_value` `RunTool` (NO separate log record) | the `RunTool`/`ToolReturned` effect |
 | Broker peer-queue | reconstructable from `PeerSendOutcome` + `PeerDelivered` | the two Apps' logs |
@@ -1626,26 +1742,33 @@ complement of `effects::is_derived_result`: derived effect-results — `ModelRes
 is accepted. To alter a derived result, fork before it and let the branch go live at the divergence
 tick — the replay driver handles the transition automatically (`replay_branch` in `replay.rs`).
 
-### Storage: full materialized branch log
+### Tail-only on-disk storage
 
-`fork` (`branch.rs`) materializes the branch as a **full clone**: it takes the verbatim prefix
-`[0..fork_tick)` **by clone** (every event byte-for-byte, including the derived results), applies
-the edit, re-stamps the tail monotonically, and returns the complete `Vec<Event>` (prefix clone ++
-edited tail). `persist_branch` then writes that **full materialized log** to
-`branches/<branch_id>/world-events.jsonl` — not just the divergent tail. On disk, every event
-from tick 0 through the end of the branch is present in the branch file; no pointer to the parent
-log is needed to read or replay the branch.
+`fork` (`branch.rs`) materializes the branch **in memory** as the full ordered `Vec<Event>`
+(verbatim prefix clone `[0..fork_tick)` ++ edited, re-stamped tail `[fork_tick..)` — this in-memory
+representation is what `replay_branch` folds). `persist_branch` then writes **only the divergent
+tail** to `branches/<branch_id>/world-events.jsonl` — events where `e.at >= fork_tick`. The shared
+prefix `[0..fork_tick)` is NOT cloned to disk; it is shared by reference via the `BranchDescriptor`
+`parent` + `fork_tick` pointer, resolved at load time by `BranchStore::load_events`.
 
-**Replay sense (distinct from storage).** During branch replay the verbatim prefix is reused **by
-reference to the recorded results** — the replay driver re-fingerprints each prefix event
-identically and reuses its stored result with zero model or tool calls; only the portion past the
-first fingerprint mismatch (the edit's first affected `CallModel`) runs live (Inv 7). This
-replay-cost sense of "by reference" is accurate and orthogonal to the storage question: the bytes
-ARE stored in full; it is the model/tool *calls* that are avoided by fingerprint matching.
+**`BranchStore::load_events` reconstruction.** Resolves the full ordered log for a branch:
+1. Recursively loads the parent's full log (so a branch-of-a-branch resolves through its entire
+   ancestor chain up to `BranchId::MAIN`). A cycle guard (`visited: BTreeSet<BranchId>`) bounds
+   the recursion and rejects a malformed looping parent chain.
+2. Takes the prefix `parent_full[0..fork_tick)`.
+3. **Validates** it against `BranchDescriptor.prefix_digest` (the `Fingerprint` of the verbatim
+   prefix bytes, computed by `digest_events`). A missing or mismatched parent fails loud rather than
+   silently reconstructing a corrupt branch log.
+4. Appends the branch's own tail from disk.
 
-> **Future optimization.** Tail-only on-disk storage — writing only events ≥ fork_tick and
-> resolving the prefix by a pointer to the parent branch — is a natural space optimization (planned
-> for the Endurance milestone). The current as-built implementation materializes the full log.
+The result is **byte-identical** to the prior full-clone layout: prefix events (`at < fork_tick`)
+precede tail events (`at >= fork_tick`) in tick order, exactly as a materialized full clone stored
+them. Disk use per branch is the tail size, not a full prefix copy per branch.
+
+**Replay sense (distinct from storage).** During branch replay the verbatim prefix is reused by
+fingerprint-matching against the recorded results — the replay driver re-fingerprints each prefix
+event identically and reuses its stored result with zero model or tool calls; only the portion past
+the first fingerprint mismatch (the edit's first affected `CallModel`) runs live (Inv 7).
 
 ### On-disk layout
 
@@ -1654,17 +1777,21 @@ Branch artifacts live under the session directory alongside the main log:
 ```
 <session_dir>/
   world-events.jsonl                      # MAIN (recorded) log — Stratum 1
+  blobs/
+    <hash[0..2]>/
+      <hash>                              # content-addressed blob bytes (BlobStore)
   branches/
     index.jsonl                           # one BranchDescriptor JSON record per line
     <branch_id>/
-      world-events.jsonl                  # full materialized branch log (prefix clone ++ edited tail)
+      world-events.jsonl                  # TAIL ONLY: events >= fork_tick
+                                          # prefix resolved via BranchDescriptor.parent + fork_tick
 ```
 
 `BranchDescriptor` (`branch.rs`) is the metadata record appended to `branches/index.jsonl` when
 a fork is materialized. It carries `{ id, parent, fork_tick, edit_summary, created_wall,
 prefix_digest, pin, tombstone }`. `prefix_digest` is the `Fingerprint` of the shared prefix
-`[0..fork_tick)`, so downstream tooling can assert the prefix is intact without re-folding the
-log. `pin: true` marks the branch as a reachability root (never reclaimed by GC);
+`[0..fork_tick)`, so `load_events` can assert the prefix is intact without re-folding the full log.
+`pin: true` marks the branch as a reachability root (never reclaimed by GC);
 `tombstone: true` marks it as dropped and eligible for the next prune pass.
 
 ---
@@ -1866,9 +1993,10 @@ is total and PER-SOURCE — a `User` resume cannot clear a `PolicyHalt` and vice
 | Paused | ClearPolicyHalt{trip, authority} | remove the matching `PolicyHalt(trip)` hold (authority required); `Open` iff `holds` now empty, else Paused |
 | Open | Resume / ClearPolicyHalt | Open (no-op) |
 
-The gate reopens ONLY when `holds` is empty. (Authority VERIFICATION — who may issue a
-`ClearPolicyHalt` — is an enforcement concern for a later pass; the totality requirement is
-that the clearing transition EXISTS and is gated by an authority token.)
+The gate reopens ONLY when `holds` is empty. Authority enforcement is AS-BUILT:
+GateSystem calls `authority.authorizes_clear()` — a non-blank credential passes; an
+empty one is rejected and the World is byte-identical (the targeted hold stays, no
+entity is cleared, the gate is unchanged).
 
 **EntityGate (per-entity run-gate)** — `Open ↔ Halted { reason }`, the per-entity analog of the
 WorldGate's PolicyHalt axis. A budget halt (`Halted { BudgetExhausted }`) is set by BudgetSystem; its
@@ -2068,10 +2196,19 @@ linter (or reviewer) could enforce. Each is mechanical enough to flag a violatio
     deletes only snapshots that are REGENERABLE by replay from an earlier snapshot/genesis plus the
     log tail. Dead-branch GC (`reclaim.rs`) deletes only the UNREACHABLE divergent tail and
     branch-local snapshots of a dead branch — never a reachable branch, never the shared parent
-    prefix, never the MAIN log. Log tiering (`segment.rs`) MOVES fully-covered sealed segments to
-    `cold/` and never deletes them; `load` returns the full ordered log byte-identically before and
-    after tiering. *(CR-reclaim, CR-segment; Dead-branch pruning and reachability GC; Segmented log
-    and cold-storage tiering.)*
+    prefix, never the MAIN log. Blob GC (`blob.rs`: `reachable_blobs` / `reclaimable_blobs` /
+    `sweep_blobs`) deletes only blobs NOT referenced by any RETAINED log segment or snapshot —
+    never a still-referenced hash; losing a referenced blob is irrecoverable (bytes live only in
+    the store). Log tiering (`segment.rs`) MOVES fully-covered sealed segments to `cold/` and never
+    deletes them; `load` returns the full ordered log byte-identically before and after tiering.
+    *(CR-reclaim, CR-segment; Dead-branch pruning and reachability GC; Segmented log and
+    cold-storage tiering; Large blobs — content-addressed blob store.)*
+21. **Every append to the log is durable before `Ok` is returned** (`append_jsonl` in
+    `event_log.rs`). `sync_data()` is called on the open file inside the fused
+    `append_jsonl_observing_sync` path before `Ok(())` is signaled, so a caller that receives `Ok`
+    is guaranteed the event is on durable storage. `BlobStore::put` and `SnapshotStore::write`
+    observe the same durable-before-ack contract via `sync_all()` + shard/parent directory fsync.
+    *(APPEND FSYNC; intent-before-commitment; log-before-apply.)*
 
 ---
 

@@ -15,6 +15,7 @@ pub mod mode;
 pub mod systems;
 pub mod replay;
 pub mod snapshot;
+pub mod blob;
 pub mod branch;
 pub mod retention;
 pub mod segment;

@@ -108,7 +108,6 @@ fn spawn_or_deny(world: &World, parent: &EntityId) -> (World, Vec<Command>) {
 
     let mut world = world.clone();
     let mut commands = Vec::new();
-    let default_model = world.resources.model.clone();
     let depth_cap = world.resources.depth_cap;
     // Fan-out cap (Boundedness, Inv 11): `depth_cap` bounds NESTING along a path;
     // `fanout_cap` bounds the BREADTH a single entity spawns — independent brakes.
@@ -191,6 +190,7 @@ fn spawn_or_deny(world: &World, parent: &EntityId) -> (World, Vec<Command>) {
                 turns: 0,
                 spawned: 0,
                 model: None,
+                autonomy: None,
             },
         );
         // Bump the parent's CUMULATIVE spawn counter (never decremented — cumulative
@@ -205,7 +205,11 @@ fn spawn_or_deny(world: &World, parent: &EntityId) -> (World, Vec<Command>) {
             entity: child,
             messages: child_history,
             tools: ToolSet::default(),
-            params: default_model.clone(),
+            // Resolve the child's first-turn model at its `CallModel` emit: the
+            // child's override (`Components.model`) else the world default. A
+            // freshly spawned child is `model: None`, so this is byte-identical to
+            // the world default today. See docs/agent/world/ecs-runtime.md §343-348.
+            params: world.model_for(child),
             key: CommandKey,
         });
     }
@@ -444,6 +448,7 @@ mod tests {
                 turns: 0,
                 spawned: 0,
                 model: None,
+                autonomy: None,
             },
         );
         world

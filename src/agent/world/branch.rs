@@ -30,6 +30,7 @@
 //! See docs/agent/world/ecs-runtime.md — Branch identity and storage layout;
 //! FORK/EDIT algorithm (edit-scope, content-addressed replay).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -353,23 +354,30 @@ fn origin_for_input(input: &LogicalInput) -> Origin {
 // persist_branch — the IO seam (write branch log + append descriptor)
 // ---------------------------------------------------------------------------
 
-/// Persist a forked branch under a session directory.
+/// Persist a forked branch under a session directory, TAIL-ONLY.
 ///
-/// This is the IO counterpart to the pure [`fork`]: it writes the full
-/// materialized branch log to
+/// This is the IO counterpart to the pure [`fork`]: it writes ONLY the branch's
+/// divergent tail — the events at/after the fork tick (`e.at >= fork_tick`) — to
 /// `<session_dir>/branches/<branch_id>/world-events.jsonl` via the same
 /// [`FilesystemEventLog`] append discipline the live runtime uses, then appends
-/// one [`BranchDescriptor`] line to `<session_dir>/branches/index.jsonl`.
+/// one [`BranchDescriptor`] line to `<session_dir>/branches/index.jsonl`. The
+/// shared prefix `[0..fork_tick)` is NOT cloned to disk: it is resolved by
+/// reference to the parent at load time ([`BranchStore::load_events`]). The
+/// `BranchDescriptor`'s `parent` + `fork_tick` are the pointer to that prefix,
+/// and `prefix_digest` validates it on load — so branch disk use is the tail
+/// size, not a full prefix clone per branch.
 ///
 /// The branch id is recomputed as `BranchId::compute(parent, fork_tick, edit)`,
 /// so the on-disk directory name and the descriptor identity always agree with
 /// what [`fork`] returned for the same inputs. `prefix_digest` is the digest of
-/// the verbatim prefix `[0..fork_tick)`, so a reader can assert the shared
-/// prefix is byte-identical to the original without re-folding the log.
-/// `created_wall` is supplied by the IO caller — there is no `now()` in the pure
-/// core. The written [`BranchDescriptor`] is returned for the caller to display.
+/// the verbatim prefix `[0..fork_tick)` (taken here from the passed
+/// `branch_events` head, byte-identical to the parent's prefix), so a reader can
+/// assert the shared prefix is intact without re-folding the log. `created_wall`
+/// is supplied by the IO caller — there is no `now()` in the pure core. The
+/// written [`BranchDescriptor`] is returned for the caller to display.
 ///
-/// See docs/agent/world/ecs-runtime.md — Branch identity and storage layout.
+/// See docs/agent/world/ecs-runtime.md — Tail-only on-disk storage (writing only
+/// events >= fork_tick and resolving the prefix by a pointer to the parent).
 pub fn persist_branch(
     session_dir: &Path,
     parent: &BranchId,
@@ -403,7 +411,10 @@ pub fn persist_branch(
     let branches_dir = session_dir.join("branches");
     let mut log =
         FilesystemEventLog::new(branches_dir.join(&id.0).join("world-events.jsonl"));
-    for ev in branch_events {
+    // Tail-only: write only the events at/after the fork tick. The prefix
+    // `[0..fork_tick)` is shared by reference to the parent (resolved on load),
+    // so it is never cloned to disk.
+    for ev in branch_events.iter().filter(|e| e.at >= fork_tick) {
         log.append(ev)?;
     }
     append_descriptor(&branches_dir.join("index.jsonl"), &descriptor)?;
@@ -613,11 +624,15 @@ impl BranchStore {
 
     /// Open a [`FilesystemEventLog`] for the branch identified by `branch_id`.
     ///
-    /// The log path is `branches/<branch_id>/world-events.jsonl`. The returned
-    /// log is lazy (no I/O until `load` or `append` is called) so this call is
-    /// always cheap.
+    /// The log path is `branches/<branch_id>/world-events.jsonl`, which under the
+    /// tail-only layout holds ONLY the branch's divergent tail (events
+    /// `>= fork_tick`). This is the APPEND target the live branch driver writes
+    /// fresh results to; callers wanting the FULL ordered branch log (prefix
+    /// resolved from the parent ++ tail) MUST use [`BranchStore::load_events`].
+    /// The returned log is lazy (no I/O until `load` or `append` is called) so
+    /// this call is always cheap.
     ///
-    /// See docs/agent/world/ecs-runtime.md — Branch identity and storage layout.
+    /// See docs/agent/world/ecs-runtime.md — Tail-only on-disk storage.
     pub fn open(&self, branch_id: &BranchId) -> FilesystemEventLog {
         let log_path = self
             .session_dir
@@ -627,15 +642,108 @@ impl BranchStore {
         FilesystemEventLog::new(log_path)
     }
 
-    /// Load all stratum-1 events from the branch with `branch_id`.
+    /// Load the FULL ordered stratum-1 event log for `branch_id`, reconstructing
+    /// the shared prefix from the parent chain.
     ///
-    /// Convenience wrapper over `self.open(branch_id).load()`. Returns an empty
-    /// `Vec` when the branch log does not exist yet, or propagates I/O and
-    /// parse errors on a malformed log.
+    /// Under tail-only storage a non-root branch persists only its tail (events
+    /// `>= fork_tick`); the prefix `[0..fork_tick)` is shared by reference to the
+    /// parent recorded in the [`BranchDescriptor`]. This method resolves that
+    /// reference: it loads the parent's FULL log (recursively, so a branch of a
+    /// branch resolves through its entire ancestor chain up to
+    /// [`BranchId::MAIN`]), takes the prefix `[0..fork_tick)`, validates it
+    /// against the descriptor's `prefix_digest` — a missing/mismatched parent
+    /// fails loud rather than silently corrupting — then appends the branch's own
+    /// tail. The result is BYTE-IDENTICAL to the prior full-clone load: prefix
+    /// events (`at < fork_tick`) precede tail events (`at >= fork_tick`) in tick
+    /// order, exactly as the materialized full clone stored them.
     ///
-    /// See docs/agent/world/ecs-runtime.md — Branch identity and storage layout.
+    /// [`BranchId::MAIN`] is the root recorded log stored in full at
+    /// `<session_dir>/world-events.jsonl`; it has no prefix to resolve and is
+    /// returned directly. A non-root branch with no descriptor, a cyclic parent
+    /// chain, or a prefix-digest mismatch is an error (the branch log cannot be
+    /// faithfully reconstructed).
+    ///
+    /// See docs/agent/world/ecs-runtime.md — Tail-only on-disk storage.
     pub fn load_events(&self, branch_id: &BranchId) -> Result<Vec<Event>, Error> {
-        self.open(branch_id).load()
+        let index = self.descriptor_index()?;
+        let mut visited = BTreeSet::new();
+        self.load_full(branch_id, &index, &mut visited)
+    }
+
+    /// Build a `BranchId -> BranchDescriptor` map (latest-line-wins, matching the
+    /// append-only `branches/index.jsonl` discipline) so prefix reconstruction
+    /// can resolve a branch's parent + fork tick without re-scanning the index
+    /// per ancestor. A `BTreeMap` (never a `HashMap`) keeps the lookup free of a
+    /// hidden ordering input.
+    fn descriptor_index(&self) -> Result<BTreeMap<BranchId, BranchDescriptor>, Error> {
+        let mut map = BTreeMap::new();
+        for descriptor in self.list()? {
+            map.insert(descriptor.id.clone(), descriptor);
+        }
+        Ok(map)
+    }
+
+    /// Reconstruct the full ordered log for `branch_id` by resolving its prefix
+    /// from the parent chain and appending its own tail.
+    ///
+    /// `visited` bounds the recursion: a malformed parent chain that cycles is
+    /// rejected rather than looping forever.
+    fn load_full(
+        &self,
+        branch_id: &BranchId,
+        index: &BTreeMap<BranchId, BranchDescriptor>,
+        visited: &mut BTreeSet<BranchId>,
+    ) -> Result<Vec<Event>, Error> {
+        // The root recorded log is stored in full at the session root and has no
+        // prefix to resolve — read it directly.
+        if *branch_id == BranchId::MAIN {
+            return FilesystemEventLog::new(self.session_dir.join("world-events.jsonl")).load();
+        }
+
+        // Cycle guard: re-entering a branch already on the resolution path means
+        // the parent chain loops — a corrupt index — so fail loud.
+        if !visited.insert(branch_id.clone()) {
+            return Err(Error::World(format!(
+                "branch {} parent chain cycles; cannot reconstruct its prefix",
+                branch_id.0
+            )));
+        }
+
+        let descriptor = index.get(branch_id).ok_or_else(|| {
+            Error::World(format!(
+                "branch {} has no descriptor in branches/index.jsonl; cannot \
+                 resolve its shared prefix",
+                branch_id.0
+            ))
+        })?;
+
+        // Resolve the prefix `[0..fork_tick)` by reference to the parent's FULL
+        // log. The parent's prefix below `fork_tick` is immutable (append-only),
+        // so this is stable even if the parent log later grows past `fork_tick`.
+        let parent_full = self.load_full(&descriptor.parent, index, visited)?;
+        let prefix: Vec<Event> = parent_full
+            .into_iter()
+            .filter(|e| e.at < descriptor.fork_tick)
+            .collect();
+
+        // Validate the resolved prefix against the recorded digest so a
+        // mismatched/missing parent fails loud rather than silently corrupting.
+        let resolved = digest_events(&prefix)?;
+        if resolved != descriptor.prefix_digest {
+            return Err(Error::World(format!(
+                "branch {} prefix digest mismatch: the parent prefix [0..{}) does \
+                 not match the recorded prefix_digest — refusing to reconstruct a \
+                 corrupt branch log",
+                branch_id.0, descriptor.fork_tick
+            )));
+        }
+
+        // Append the branch's own tail (events `>= fork_tick` on disk). A missing
+        // tail file loads as empty, leaving the resolved prefix intact.
+        let tail = self.open(branch_id).load()?;
+        let mut full = prefix;
+        full.extend(tail);
+        Ok(full)
     }
 }
 
@@ -1038,8 +1146,22 @@ mod tests {
     // Task-local: persist + reload round-trip (tempdir)
     // -----------------------------------------------------------------------
 
+    /// Write `events` as the session's MAIN recorded log at
+    /// `<session_dir>/world-events.jsonl`, the shared prefix source a first-level
+    /// branch resolves against on load.
+    fn write_main_log(session_dir: &Path, events: &[Event]) {
+        let mut main = FilesystemEventLog::new(session_dir.join("world-events.jsonl"));
+        for ev in events {
+            main.append(ev).expect("append to MAIN log");
+        }
+    }
+
+    /// VC-6.1: `persist_branch` writes the branch TAIL-ONLY (events `>= fork_tick`),
+    /// and `BranchStore::load_events` reconstructs the full branch byte-identically
+    /// by resolving the prefix from the parent (MAIN). The on-disk branch file
+    /// therefore contains ONLY the tail; the prefix is shared by reference.
     #[test]
-    fn persist_branch_round_trips_events_and_descriptor() {
+    fn persist_branch_writes_tail_only_and_load_reconstructs_full() {
         let log = sample_log();
         let edit = Edit {
             at_tick: 1,
@@ -1050,6 +1172,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let session_dir = dir.path();
+        // The parent MAIN log holds the shared prefix the branch resolves against.
+        write_main_log(session_dir, &log);
         let descriptor = persist_branch(
             session_dir,
             &BranchId::MAIN,
@@ -1070,15 +1194,34 @@ mod tests {
             "prefix_digest must be the digest of the verbatim prefix"
         );
 
-        // The branch log round-trips byte-for-byte from disk.
+        // The on-disk branch file holds ONLY the tail (events `>= fork_tick`); the
+        // prefix is NOT cloned to disk.
         let events_path = session_dir
             .join("branches")
             .join(&id.0)
             .join("world-events.jsonl");
-        let reloaded = FilesystemEventLog::new(&events_path)
+        let on_disk = FilesystemEventLog::new(&events_path)
             .load()
-            .expect("reload branch events");
-        assert_eq!(reloaded, branch, "persisted branch log must round-trip");
+            .expect("reload branch tail");
+        let expected_tail: Vec<Event> = branch.iter().filter(|e| e.at >= 1).cloned().collect();
+        assert_eq!(
+            on_disk, expected_tail,
+            "the on-disk branch file must hold ONLY events `>= fork_tick` (the tail)"
+        );
+        assert!(
+            on_disk.iter().all(|e| e.at >= 1),
+            "no prefix event (`at < fork_tick`) may be cloned to the branch file"
+        );
+
+        // `load_events` reconstructs the FULL branch — byte-identical to the
+        // materialized full-clone log (prefix resolved from the parent ++ tail).
+        let store = BranchStore::new(session_dir);
+        let reconstructed = store.load_events(&id).expect("load_events");
+        assert_eq!(
+            reconstructed, branch,
+            "load_events must reconstruct the full branch byte-identically to the \
+             prior full-clone load"
+        );
 
         // The descriptor round-trips from the index.
         let index_path = session_dir.join("branches").join("index.jsonl");
@@ -1184,6 +1327,9 @@ mod tests {
         let log = sample_log();
         let dir = tempfile::tempdir().expect("tempdir");
         let session_dir = dir.path();
+        // The shared prefix lives in the parent MAIN log; tail-only `load_events`
+        // resolves the prefix from it.
+        write_main_log(session_dir, &log);
 
         let edit = Edit {
             at_tick: 1,
@@ -1198,7 +1344,102 @@ mod tests {
         let reloaded = store.load_events(&id).expect("load_events");
         assert_eq!(
             reloaded, branch,
-            "load_events must return the events that were persisted"
+            "load_events must reconstruct the full branch the fork materialized"
+        );
+    }
+
+    /// VC-6.1 (branch-of-branch): a nested fork's `load_events` resolves its
+    /// prefix through the WHOLE parent chain (MAIN <- A <- B) and reconstructs B's
+    /// full log byte-identically to B's materialized full clone. The on-disk file
+    /// for each level holds only that level's tail.
+    #[test]
+    fn branch_store_load_events_reconstructs_branch_of_branch() {
+        let log = sample_log();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_dir = dir.path();
+        write_main_log(session_dir, &log);
+
+        // A: fork MAIN at tick 1 (replace the user turn). `branch_a` is A's full
+        // materialized log; persist_branch stores only its tail.
+        let edit_a = Edit {
+            at_tick: 1,
+            input: user_message_input("A edit"),
+            kind: EditKind::Replace,
+        };
+        let (id_a, branch_a) = fork(&log, 1, edit_a.clone()).expect("fork A");
+        persist_branch(session_dir, &BranchId::MAIN, 1, &edit_a, &branch_a, 0)
+            .expect("persist A");
+
+        // B: fork A's full log at tick 3 (the carried "again" user turn is
+        // exogenous), parented on A — its prefix [0..3) is shared up through A.
+        let edit_b = Edit {
+            at_tick: 3,
+            input: user_message_input("B edit"),
+            kind: EditKind::Replace,
+        };
+        let (_id_off_main, branch_b) = fork(&branch_a, 3, edit_b.clone()).expect("fork B");
+        let desc_b = persist_branch(session_dir, &id_a, 3, &edit_b, &branch_b, 0)
+            .expect("persist B");
+
+        // B's reconstructed log resolves the prefix through A (and MAIN) and is
+        // byte-identical to B's materialized full clone.
+        let store = BranchStore::new(session_dir);
+        let reconstructed = store.load_events(&desc_b.id).expect("load_events B");
+        assert_eq!(
+            reconstructed, branch_b,
+            "a branch-of-branch must reconstruct its full log through the parent chain"
+        );
+
+        // Each on-disk file holds only its own tail.
+        let tail_b = store.open(&desc_b.id).load().expect("load B tail");
+        assert!(
+            tail_b.iter().all(|e| e.at >= 3),
+            "B's on-disk file must hold only events `>= fork_tick` (3)"
+        );
+    }
+
+    /// On-load validation: when the resolved parent prefix does not match the
+    /// recorded `prefix_digest` (a corrupt/wrong parent log), `load_events` fails
+    /// loud rather than silently reconstructing a corrupt branch.
+    #[test]
+    fn branch_store_load_events_rejects_a_prefix_digest_mismatch() {
+        let log = sample_log();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_dir = dir.path();
+        write_main_log(session_dir, &log);
+
+        let edit = Edit {
+            at_tick: 1,
+            input: user_message_input("mismatch-test"),
+            kind: EditKind::Replace,
+        };
+        let (id, branch) = fork(&log, 1, edit.clone()).expect("fork");
+        persist_branch(session_dir, &BranchId::MAIN, 1, &edit, &branch, 0)
+            .expect("persist");
+
+        // Corrupt the MAIN prefix: rewrite the parent log with a DIFFERENT genesis
+        // header so the resolved prefix `[0..1)` no longer digests to the recorded
+        // `prefix_digest`.
+        let mut corrupted = log.clone();
+        corrupted[0] = ev(
+            0,
+            Origin::System,
+            0,
+            LogicalInput::SessionStarted {
+                seed: 0x9999,
+                surface_tools: Vec::new(),
+            },
+        );
+        std::fs::remove_file(session_dir.join("world-events.jsonl")).expect("remove MAIN log");
+        write_main_log(session_dir, &corrupted);
+
+        let store = BranchStore::new(session_dir);
+        let err = store
+            .load_events(&id)
+            .expect_err("a prefix digest mismatch must fail loud");
+        assert!(
+            matches!(err, Error::World(ref m) if m.contains("prefix digest mismatch")),
+            "the error must name the prefix digest mismatch, got: {err:?}"
         );
     }
 

@@ -43,11 +43,42 @@ pub enum Role {
     Assistant,
 }
 
+/// Content address of an externalized blob. The hash string is opaque at this
+/// level — computing it is `BlobStore`'s responsibility (BL-store). `Ord` and
+/// `PartialOrd` are derived so a `BlobHash` can be used as a `BTreeMap`/`BTreeSet`
+/// key without breaking determinism (no hash-map randomness). See
+/// docs/agent/world/ecs-runtime.md §146-147 + §1415-1434.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BlobHash(pub String);
+
+/// Source of a `Block::Image` history entry. Small payloads (at or under
+/// `Caps.blob_inline_cap`, or when the cap is 0) are carried `Inline`; larger
+/// ones are externalized and the log/snapshot stores only the `Blob` hash.
+///
+/// `Inline.bytes` uses `Vec<u8>`. serde_json emits a JSON integer array for
+/// `Vec<u8>` — deterministic, no extra codec dependency, and round-trips exactly.
+/// Base64 encoding was considered but rejected: it requires an additional crate
+/// and the compactness gain is irrelevant because inline blobs are, by definition,
+/// small (under the cap).
+///
+/// See docs/agent/world/ecs-runtime.md §1415-1434 (two-stage blob design).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ImageSource {
+    /// Bytes are carried inline (≤ `Caps.blob_inline_cap`, or cap is 0).
+    Inline { mime: String, bytes: Vec<u8> },
+    /// Bytes exceeded the cap; only the content-address hash is stored here.
+    /// The bytes live in the blob store (BL-store), keyed by this hash.
+    Blob { hash: BlobHash, mime: String },
+}
+
 /// A single content block, shaped to the Anthropic Messages content schema. The
 /// `type` discriminator and field order are fixed so serialisation is canonical
 /// (the reproducible-`Fingerprint` requirement). `Reasoning` carries its opaque
 /// `signature` and serialises as a `thinking` block, echoed back unchanged.
-/// See docs/agent/world/ecs-runtime.md (Block + Anthropic model-call mapping).
+/// `Image` carries an `ImageSource` (inline bytes or a content-addressed blob
+/// hash) so the log/snapshot never carry large raw bytes past the inline cap.
+/// See docs/agent/world/ecs-runtime.md §141-148 (Block + Anthropic model-call mapping).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Block {
@@ -73,6 +104,12 @@ pub enum Block {
         text: String,
         signature: String,
     },
+    /// An image block. `source` is either inline bytes (≤ `Caps.blob_inline_cap`)
+    /// or a content-addressed blob hash (externalized, BL-store). Additive variant:
+    /// logs written before this variant still deserialise (unknown variants are
+    /// rejected by serde, so logs with `Image` blocks require this version or later).
+    /// See docs/agent/world/ecs-runtime.md §146-147 + §1415-1434.
+    Image { source: ImageSource },
 }
 
 /// A `Block::ToolResult` specifically — the shape a resolved tool slot carries.
@@ -187,6 +224,68 @@ struct OutputConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Block::Image round-trip tests (BL-types VC-1.2)
+    // -----------------------------------------------------------------------
+
+    /// An `Inline` image carries its bytes in the log. serde_json emits a JSON
+    /// integer array for `Vec<u8>` — deterministic and round-trips exactly.
+    #[test]
+    fn block_image_inline_round_trips() {
+        let block = Block::Image {
+            source: ImageSource::Inline {
+                mime: "image/png".into(),
+                bytes: vec![137, 80, 78, 71], // PNG magic bytes
+            },
+        };
+        let json = serde_json::to_string(&block).expect("serialise");
+        let back: Block = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(block, back);
+
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(v["type"], "image", "Block::Image serialises as type=image");
+        assert_eq!(v["source"]["type"], "inline");
+        assert_eq!(v["source"]["mime"], "image/png");
+        assert!(
+            v["source"]["bytes"].is_array(),
+            "Vec<u8> serialises as a JSON integer array (deterministic)"
+        );
+    }
+
+    /// A `Blob` image carries only the content-address hash; bytes live in the
+    /// blob store (BL-store). The log/snapshot never carry the raw bytes.
+    #[test]
+    fn block_image_blob_round_trips() {
+        let block = Block::Image {
+            source: ImageSource::Blob {
+                hash: BlobHash("sha256:abc123def456".into()),
+                mime: "image/jpeg".into(),
+            },
+        };
+        let json = serde_json::to_string(&block).expect("serialise");
+        let back: Block = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(block, back);
+
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(v["type"], "image");
+        assert_eq!(v["source"]["type"], "blob");
+        assert_eq!(v["source"]["hash"], "sha256:abc123def456");
+        assert_eq!(v["source"]["mime"], "image/jpeg");
+    }
+
+    /// `BlobHash` is `Ord` so it can be a key in a `BTreeMap`/`BTreeSet`.
+    #[test]
+    fn blob_hash_is_ord() {
+        let mut hashes = vec![
+            BlobHash("sha256:zzz".into()),
+            BlobHash("sha256:aaa".into()),
+            BlobHash("sha256:mmm".into()),
+        ];
+        hashes.sort();
+        assert_eq!(hashes[0], BlobHash("sha256:aaa".into()));
+        assert_eq!(hashes[2], BlobHash("sha256:zzz".into()));
+    }
 
     fn fixed_history() -> History {
         History(vec![

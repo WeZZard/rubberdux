@@ -48,8 +48,11 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
+use crate::agent::world::blob::{reachable_blobs, reclaimable_blobs, sweep_blobs, BlobStore};
 use crate::agent::world::branch::{BranchDescriptor, BranchId, BranchStore};
-use crate::agent::world::world::{Tick, Timestamp};
+use crate::agent::world::history::BlobHash;
+use crate::agent::world::inputs::Event;
+use crate::agent::world::world::{Tick, Timestamp, World};
 use crate::error::Error;
 
 // ---------------------------------------------------------------------------
@@ -276,6 +279,39 @@ pub fn reclaim_branches(
     let branches = load_latest_descriptors(session_dir)?;
     let dead = reclaimable(&branches, roots, now);
     sweep(session_dir, &dead)
+}
+
+// ---------------------------------------------------------------------------
+// reclaim_blobs — the blob reachability roots, wired alongside dead-branch GC
+// ---------------------------------------------------------------------------
+
+/// The composed blob-reclaim pass: scan the RETAINED log segments + snapshots for
+/// reachable blob hashes, subtract them from the store's stored set, and sweep the
+/// remainder — the blob-store counterpart of [`reclaim_branches`].
+///
+/// `segments` are the retained log events (the live hot + cold segments the
+/// segmented log still holds — `SegmentedEventLog::load`); `snapshots` are the
+/// retained snapshot Worlds. A blob referenced by ANY of them is reachable and is
+/// NEVER swept; the rest (`stored − reachable`) are reclaimed. Because the inputs
+/// are the RETAINED data, a blob referenced only by a pruned/cold-dropped segment
+/// is correctly reclaimable — reachability tracks live data, not history.
+///
+/// This is the seam a blob-prune caller (BL-sink) wraps — the pure predicate
+/// ([`reachable_blobs`]/[`reclaimable_blobs`], in `blob.rs`) then the per-blob
+/// delete ([`sweep_blobs`]). Returns the hashes actually removed. The only IO is
+/// the store enumeration + the sweep; the reachability scan is pure.
+///
+/// See docs/agent/world/ecs-runtime.md §1426-1428 (GC by log-reachability) and
+/// [`reclaim_branches`] (the dead-branch reachability GC this mirrors).
+pub fn reclaim_blobs(
+    store: &BlobStore,
+    segments: &[Event],
+    snapshots: &[World],
+) -> Result<Vec<BlobHash>, Error> {
+    let reachable = reachable_blobs(segments, snapshots);
+    let stored = store.stored_hashes()?;
+    let reclaimable = reclaimable_blobs(&stored, &reachable);
+    sweep_blobs(store, &reclaimable, &reachable)
 }
 
 // ---------------------------------------------------------------------------
@@ -684,5 +720,52 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let result = pin(dir.path(), &BranchId("does-not-exist".into()), true);
         assert!(result.is_err(), "pinning an unknown branch must error");
+    }
+
+    // -----------------------------------------------------------------------
+    // reclaim_blobs — composed scan + sweep over retained segments/snapshots
+    // -----------------------------------------------------------------------
+
+    /// The composed blob pass keeps a blob referenced by a retained segment and
+    /// sweeps one referenced by nothing — the blob-store mirror of the dead-branch
+    /// sweep, wired here alongside it (the predicate's own keep/reclaim/non-vacuity
+    /// proofs live in `blob.rs`).
+    #[test]
+    fn reclaim_blobs_keeps_referenced_sweeps_orphan() {
+        use crate::agent::world::history::{Block, ImageSource};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path().join("blobs"));
+
+        let referenced = store.put(b"referenced blob").expect("put referenced");
+        let orphan = store.put(b"orphan blob").expect("put orphan");
+
+        // A retained log event references only `referenced`.
+        let segment = Event {
+            origin: Origin::Agent,
+            edge: 0,
+            at: 1,
+            wall: None,
+            input: LogicalInput::ToolReturned {
+                cmd: 1,
+                entity: 0,
+                fingerprint: Fingerprint("fp".into()),
+                result: vec![Block::Image {
+                    source: ImageSource::Blob {
+                        hash: referenced.clone(),
+                        mime: "image/png".into(),
+                    },
+                }],
+            },
+        };
+
+        let swept = reclaim_blobs(&store, &[segment], &[]).expect("reclaim_blobs");
+        assert_eq!(swept, vec![orphan.clone()], "only the unreferenced blob is swept");
+        assert!(store.get(&orphan).is_err(), "the orphan blob is deleted");
+        assert_eq!(
+            store.get(&referenced).expect("get referenced"),
+            b"referenced blob",
+            "the referenced blob survives the composed pass"
+        );
     }
 }

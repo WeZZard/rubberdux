@@ -77,6 +77,7 @@ fn make_genesis(seed: u64) -> World {
             turns: 0,
             spawned: 0,
             model: None,
+            autonomy: None,
         },
     );
     world

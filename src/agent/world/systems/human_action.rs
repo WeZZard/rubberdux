@@ -233,6 +233,7 @@ mod tests {
                 turns: 0,
                 spawned: 0,
                 model: None,
+                autonomy: None,
             },
         );
         world

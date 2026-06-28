@@ -71,10 +71,14 @@ fn requires_approval(policy: &Autonomy) -> bool {
 }
 
 /// On `ModelResponded`, gate every `Local Pending { cmd: None }` slot of `entity`
-/// under the world-default policy: mark `Pending { cmd: Some(HELD_CMD) }`, emit
-/// `RaiseInteraction`, and record the pending request in `Resources.raised`.
+/// under the entity's RESOLVED policy (`autonomy_for` = `Components.autonomy`
+/// override else `Resources.autonomy` world default): mark
+/// `Pending { cmd: Some(HELD_CMD) }`, emit `RaiseInteraction`, and record the
+/// pending request in `Resources.raised`. An entity without an override resolves
+/// byte-identically to the world default. See docs/agent/world/ecs-runtime.md
+/// §343-348 (per-entity overrides).
 fn gate_new_slots(world: &World, entity: EntityId) -> (World, Vec<Command>) {
-    if !requires_approval(&world.resources.autonomy) {
+    if !requires_approval(&world.autonomy_for(entity)) {
         return (world.clone(), Vec::new());
     }
 
@@ -230,6 +234,7 @@ mod tests {
                 turns: 0,
                 spawned: 0,
                 model: None,
+                autonomy: None,
             },
         );
         world

@@ -156,7 +156,10 @@ pub(super) fn advance(world: &World, entity: &EntityId) -> (World, Vec<Command>)
         // below; replay mints identically — Inv 8), as IntakeSystem does.
         let (cmd, ids) = world.resources.ids.mint_cmd();
         world.resources.ids = ids;
-        let default_model = world.resources.model.clone();
+        // Resolve the continuation's model at the `CallModel` emit: the entity's
+        // override (`Components.model`) else the world default — computed BEFORE the
+        // mutable entity borrow below. See docs/agent/world/ecs-runtime.md §343-348.
+        let params = world.model_for(*entity);
         // Offer the App's ROOT (surface-capable) entity its surface tools on this
         // tool-loop continuation, so the model can request `set_value` again mid-turn
         // (GAP A). A non-root entity (a sub-agent) is offered none. See
@@ -183,7 +186,6 @@ pub(super) fn advance(world: &World, entity: &EntityId) -> (World, Vec<Command>)
                 content,
             });
             e.activity = Activity::Thinking { cmd };
-            let params = e.model.clone().unwrap_or(default_model);
             let messages = e.history.clone();
             commands.push(Command::CallModel {
                 cmd,
@@ -280,6 +282,7 @@ mod tests {
                 turns: 0,
                 spawned: 0,
                 model: None,
+                autonomy: None,
             },
         );
         world

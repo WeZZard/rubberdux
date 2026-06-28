@@ -11,10 +11,11 @@
 //! - `Resume` — drain every `User` hold from the WorldGate; a `PolicyHalt` survives
 //!   a user resume (per-source clearing).
 //! - `ClearPolicyHalt { trip, authority }` — the NAMED clearing input (Invariant
-//!   15): remove the matching `PolicyHalt(trip)` WorldGate hold AND clear any
-//!   per-entity `EntityHalt { trip }`, reopening the gate once nothing else holds it.
-//!   The `authority` token's VERIFICATION is a later enforcement concern; the
-//!   clearing transition exists here.
+//!   15), AUTHORITY-ENFORCED: when `authority.authorizes_clear()` holds, remove the
+//!   matching `PolicyHalt(trip)` WorldGate hold AND clear any per-entity
+//!   `EntityHalt { trip }`, reopening the gate once nothing else holds it. An
+//!   insufficient authority is REJECTED — the targeted hold stays and the World is
+//!   byte-unchanged (the P0 shape-level predicate lives on `Authority`).
 
 use super::{Input, System};
 use crate::agent::world::effects::Command;
@@ -47,10 +48,19 @@ impl System for GateSystem {
                     .retain(|reason| !matches!(reason, PauseReason::User));
                 (world, Vec::new())
             }
-            // The named clearing input (Inv 15): clear the matching policy halt at
-            // BOTH levels — the WorldGate `PolicyHalt(trip)` hold and any entity's
-            // `EntityHalt { trip }`.
-            LogicalInput::ClearPolicyHalt { trip, .. } => {
+            // The named clearing input (Inv 15), now AUTHORITY-ENFORCED (design
+            // §1869-1871): the clear takes effect ONLY when its `authority`
+            // authorizes it. A valid authority removes EXACTLY the one matching
+            // policy halt at BOTH levels — the WorldGate `PolicyHalt(trip)` hold
+            // and any entity's `EntityHalt { trip }` — so the gate reopens only
+            // once nothing else holds it; coexisting holds (a `User` pause, a
+            // different trip) survive. An insufficient authority is REJECTED with
+            // no mutation: the targeted hold STAYS and the World is byte-identical.
+            LogicalInput::ClearPolicyHalt { trip, authority } => {
+                if !authority.authorizes_clear() {
+                    // Reject: return the original World untouched (byte-unchanged).
+                    return (world.clone(), Vec::new());
+                }
                 let mut world = world.clone();
                 world.resources.gate.holds.retain(
                     |reason| !matches!(reason, PauseReason::PolicyHalt(t) if t == trip),
@@ -70,6 +80,7 @@ impl System for GateSystem {
 
 #[cfg(test)]
 mod tests {
+    use super::{GateSystem, System};
     use crate::agent::world::effects::Command;
     use crate::agent::world::gates::{Authority, EntityGate, EntityHalt, GuardrailTrip, PauseReason};
     use crate::agent::world::history::{History, Msg, Role};
@@ -106,6 +117,7 @@ mod tests {
                 turns: 0,
                 spawned: 0,
                 model: None,
+                autonomy: None,
             },
         );
         world
@@ -145,6 +157,13 @@ mod tests {
     }
 
     fn clear_policy_halt(trip: &str, at: Tick) -> Event {
+        clear_policy_halt_with_authority(trip, "admin", at)
+    }
+
+    /// A `ClearPolicyHalt` carrying an explicit authority token, so a test can
+    /// drive both the authorized clear (a non-blank token) and the rejected clear
+    /// (an empty/blank token) through the same fold.
+    fn clear_policy_halt_with_authority(trip: &str, authority: &str, at: Tick) -> Event {
         Event {
             origin: Origin::Human,
             edge: 0,
@@ -152,7 +171,7 @@ mod tests {
             wall: None,
             input: LogicalInput::ClearPolicyHalt {
                 trip: GuardrailTrip(trip.into()),
-                authority: Authority("admin".into()),
+                authority: Authority(authority.into()),
             },
         }
     }
@@ -367,6 +386,106 @@ mod tests {
                 trip: GuardrailTrip("trip-a".into())
             }),
             "a non-matching trip does not clear the halt"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Authority enforcement on the clear path (VC-4.2) — the clear is no longer
+    // shape-only: a valid authority clears exactly the one targeted hold; an
+    // insufficient authority is rejected and the World stays byte-identical.
+    // -----------------------------------------------------------------------
+
+    /// (a) A VALID (non-blank) authority clears EXACTLY the one matching
+    /// `PolicyHalt(trip)` hold; being the last hold, the gate reopens.
+    #[test]
+    fn valid_authority_clears_the_one_policy_halt_and_reopens_the_gate() {
+        let world = idle_world();
+        let (world, _) = tick(
+            &world,
+            &pause(PauseReason::PolicyHalt(GuardrailTrip("g".into())), 1),
+        );
+        assert!(!world.resources.gate.is_open(), "the policy halt closed the gate");
+
+        let (world, commands) = tick(&world, &clear_policy_halt_with_authority("g", "admin", 2));
+        assert!(commands.is_empty(), "GateSystem emits no Commands");
+        assert!(
+            world.resources.gate.holds.is_empty(),
+            "the matching hold was removed by a valid authority"
+        );
+        assert!(
+            world.resources.gate.is_open(),
+            "the gate reopened — that was the last hold"
+        );
+    }
+
+    /// (b) An INVALID/empty authority is REJECTED: the targeted holds STAY and the
+    /// World is byte-identical (no partial mutation at EITHER gate level).
+    #[test]
+    fn empty_authority_is_rejected_and_the_world_is_byte_identical() {
+        let mut world = idle_world();
+        // A standing per-entity halt on the same trip — proves the entity level is
+        // also left byte-unchanged on a rejected clear.
+        world.entities.get_mut(&0).expect("entity").gate.halt = Some(EntityHalt {
+            trip: GuardrailTrip("g".into()),
+        });
+        let (world, _) = tick(
+            &world,
+            &pause(PauseReason::PolicyHalt(GuardrailTrip("g".into())), 1),
+        );
+
+        let before = world.clone();
+        let before_json = serde_json::to_string(&before).expect("serialise World");
+
+        // Step the GateSystem fold DIRECTLY (not via `tick`, which would fold the
+        // Event's tick into `world.clock`): the fold itself must leave the World
+        // byte-identical when the authority is insufficient. An empty token is
+        // insufficient → the clear is rejected.
+        let (after, commands) = GateSystem.step(
+            &world,
+            &clear_policy_halt_with_authority("g", "", 2).input,
+        );
+        assert!(commands.is_empty(), "a rejected clear emits no Commands");
+        assert_eq!(after, before, "an insufficient authority leaves the World unchanged");
+        assert_eq!(
+            serde_json::to_string(&after).expect("serialise World"),
+            before_json,
+            "the World is byte-identical after a rejected clear"
+        );
+        assert!(
+            !after.resources.gate.is_open(),
+            "the WorldGate hold stays — the gate is still closed"
+        );
+        assert_eq!(
+            after.entities.get(&0).expect("entity").gate.halt,
+            Some(EntityHalt {
+                trip: GuardrailTrip("g".into())
+            }),
+            "the EntityHalt stays too — no partial mutation"
+        );
+    }
+
+    /// (c) A VALID clear of ONE of TWO coexisting holds removes only the targeted
+    /// one; the other survives, so the gate stays Paused.
+    #[test]
+    fn authorized_clear_removes_only_the_targeted_hold_and_the_gate_stays_paused() {
+        let world = idle_world();
+        let (world, _) = tick(&world, &pause(PauseReason::User, 1));
+        let (world, _) = tick(
+            &world,
+            &pause(PauseReason::PolicyHalt(GuardrailTrip("g".into())), 2),
+        );
+        assert_eq!(world.resources.gate.holds.len(), 2, "two holds coexist");
+
+        // Authorized clear of the PolicyHalt leaves the User hold standing.
+        let (world, _) = tick(&world, &clear_policy_halt_with_authority("g", "admin", 3));
+        assert_eq!(
+            world.resources.gate.holds,
+            vec![PauseReason::User],
+            "only the targeted PolicyHalt was removed; the User hold survives"
+        );
+        assert!(
+            !world.resources.gate.is_open(),
+            "the surviving User hold keeps the gate Paused"
         );
     }
 }

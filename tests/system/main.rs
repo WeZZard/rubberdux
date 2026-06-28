@@ -28,6 +28,12 @@ mod live_gate;
 mod app {
     #[path = "counterfactual_branch_live.rs"]
     pub mod counterfactual_branch_live;
+    #[path = "endurance_blob_loopback.rs"]
+    pub mod endurance_blob_loopback;
+    #[path = "endurance_compaction_loopback.rs"]
+    pub mod endurance_compaction_loopback;
+    #[path = "endurance_overrides_loopback.rs"]
+    pub mod endurance_overrides_loopback;
     #[path = "peer_drive_loopback.rs"]
     pub mod peer_drive_loopback;
     #[path = "session_resume.rs"]
@@ -96,9 +102,37 @@ fn main() {
     // filter. Two local Worlds over the real broker — no surface/macOS harness, no VM.
     let want_peer_drive_loopback = case == "peer_drive_loopback"
         || args.iter().any(|a| a.contains("peer_drive_loopback"));
+    // The VC-3.2 per-entity model-override LIVE loopback
+    // (`app::endurance_overrides_loopback`): selected by
+    // `RUBBERDUX_SYSTEM_E2E_CASE=endurance_overrides_loopback` or a matching test
+    // filter. A sub-agent with a model override makes a real CallModel against the
+    // override — no surface/macOS harness, no VM.
+    let want_endurance_overrides = case == "endurance_overrides_loopback"
+        || args.iter().any(|a| a.contains("endurance_overrides_loopback"));
+    // The VC-1.4 blob externalize+retrieve LIVE loopback
+    // (`app::endurance_blob_loopback`): selected by
+    // `RUBBERDUX_SYSTEM_E2E_CASE=endurance_blob_loopback` or a matching test filter.
+    // A turn carrying a real over-cap payload externalizes it to the BlobStore and
+    // retrieves it by hash against a real model — no surface/macOS harness, no VM.
+    let want_endurance_blob = case == "endurance_blob_loopback"
+        || args.iter().any(|a| a.contains("endurance_blob_loopback"));
+    // The VC-2.2 compaction-resume LIVE loopback
+    // (`app::endurance_compaction_loopback`): selected by
+    // `RUBBERDUX_SYSTEM_E2E_CASE=endurance_compaction_loopback` or a matching test
+    // filter. A real low-`context_limit` turn triggers a real compaction, a simulated
+    // crash mid-Compacting strands the session, and `open()` resumes and completes the
+    // compaction with a real model call — no surface/macOS harness, no VM.
+    let want_endurance_compaction = case == "endurance_compaction_loopback"
+        || args.iter().any(|a| a.contains("endurance_compaction_loopback"));
 
     if want_counterfactual {
         runtime.block_on(app::counterfactual_branch_live::run());
+    } else if want_endurance_compaction {
+        runtime.block_on(app::endurance_compaction_loopback::run());
+    } else if want_endurance_blob {
+        runtime.block_on(app::endurance_blob_loopback::run());
+    } else if want_endurance_overrides {
+        runtime.block_on(app::endurance_overrides_loopback::run());
     } else if want_peer_drive_loopback {
         runtime.block_on(app::peer_drive_loopback::run());
     } else if want_session_resume {

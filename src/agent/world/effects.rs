@@ -22,8 +22,9 @@ use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
 
 use super::autonomy::{AgentInteraction, HumanAction, Notify};
+use super::blob::BlobStore;
 use super::event_log::EventLog;
-use super::history::{Block, History, MessageBuilder, ToolSchema};
+use super::history::{BlobHash, Block, History, ImageSource, MessageBuilder, Msg, ToolSchema};
 use super::inputs::{
     CancelReason, DeliveryOutcome, Event, Fingerprint, LogicalInput, ModelError, ModelMeta, Origin,
     PeerPayload,
@@ -35,8 +36,8 @@ use super::surface::{
     surface_tool_result,
 };
 use super::world::{
-    Activity, CmdId, EdgeId, EntityId, ModelConfig, PeerId, ReqId, SlotKind, SlotState, Tick,
-    Timestamp, World,
+    Activity, ByteCap, CmdId, EdgeId, EntityId, ModelConfig, PeerId, ReqId, SlotKind, SlotState,
+    Tick, Timestamp, World,
 };
 use crate::error::Error;
 
@@ -377,6 +378,173 @@ impl PeerSender for UnattachedPeerSender {
 }
 
 // ---------------------------------------------------------------------------
+// BlobSink — the externalize/resolve seam the LIVE driver needs (shell IO)
+// ---------------------------------------------------------------------------
+
+/// The content-addressed blob capability the LIVE driver depends on, abstracted
+/// behind a trait so the externalize/resolve IO stays in the imperative SHELL and
+/// out of the pure tick — exactly as `ModelCaller`/`SurfaceDriver`/`PeerSender`
+/// abstract their effects. `BlobStore` (blob.rs) is the production implementation.
+/// The externalize DECISION ([`over_inline_cap`]) is a pure function of
+/// `(bytes.len(), cap)`; only `put`/`get` are this seam's shell effects, so a pure
+/// System never touches blob IO. See docs/agent/world/ecs-runtime.md §1415-1434
+/// (content-addressed durable blob store = PRIMARY STORAGE, not a derived cache).
+pub trait BlobSink {
+    /// Store `bytes` durably and return their content address — the shell side of
+    /// externalize. Idempotent by content hash (identical bytes store once).
+    fn put(&self, bytes: &[u8]) -> Result<BlobHash, Error>;
+    /// Read the bytes stored at content address `hash` — the shell side of
+    /// resolve, used to rebuild a request body from a `Blob{hash}` History entry.
+    fn get(&self, hash: &BlobHash) -> Result<Vec<u8>, Error>;
+}
+
+/// The production `BlobSink`: the durable, content-addressed `BlobStore`. The
+/// trait is the seam a test (or the inert default) stands in for; this impl is
+/// what the worker threads once a session's blob store is attached (BL-sink).
+impl BlobSink for BlobStore {
+    fn put(&self, bytes: &[u8]) -> Result<BlobHash, Error> {
+        BlobStore::put(self, bytes)
+    }
+    fn get(&self, hash: &BlobHash) -> Result<Vec<u8>, Error> {
+        BlobStore::get(self, hash)
+    }
+}
+
+/// The inert `BlobSink` the default [`drive_live`] threads until a real
+/// `BlobStore` seam is attached: it externalizes/resolves NOTHING. It is never
+/// reached while `Caps.blob_inline_cap == 0` (the default — no payload is ever
+/// over an unbounded cap, and a cap-0 session records no `Blob{hash}` to resolve),
+/// so the M3 driver path stays byte-identical. Engaging the externalize policy (a
+/// positive cap) requires threading a real `BlobStore` (BL-sink); until then this
+/// reports a clear error rather than silently dropping bytes. Mirrors
+/// `UnattachedPeerSender`. See docs/agent/world/ecs-runtime.md §1415-1434.
+pub struct UnattachedBlobSink;
+
+impl BlobSink for UnattachedBlobSink {
+    fn put(&self, _bytes: &[u8]) -> Result<BlobHash, Error> {
+        Err(Error::World(
+            "no blob store attached: externalizing an over-cap payload requires a \
+             BlobStore seam (keep Caps.blob_inline_cap = 0 to leave payloads inline)"
+                .into(),
+        ))
+    }
+    fn get(&self, _hash: &BlobHash) -> Result<Vec<u8>, Error> {
+        Err(Error::World(
+            "no blob store attached: resolving a Blob{hash} requires a BlobStore seam".into(),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Blob externalize / resolve — the pure decision + the shell put/get
+// ---------------------------------------------------------------------------
+
+/// The PURE inline-vs-externalize decision: a payload of `len` bytes is
+/// externalized to the blob store when it EXCEEDS `cap`, and stays inline at or
+/// under the cap. `cap == 0` means **unbounded** — never externalize. A pure
+/// function of `(len, cap)`, so the policy is unit-testable without any IO; the
+/// actual `put`/`get` are the shell's job. See docs/agent/world/ecs-runtime.md
+/// §1415-1434 (two-stage blob design).
+fn over_inline_cap(len: usize, cap: ByteCap) -> bool {
+    cap != 0 && len > cap as usize
+}
+
+/// Externalize every over-cap inline image in `blocks` to `sink`, recording only
+/// its content-address `Blob{hash}` — the log/snapshot then carry the hash, never
+/// the bytes. A payload at/under the cap (or `cap == 0`) is left `Inline`
+/// untouched, so a no-image (or all-small) response externalizes to ITSELF and the
+/// recorded Input is byte-identical. Recurses into `ToolResult` content so a
+/// nested image is externalized too. The decision is the pure [`over_inline_cap`];
+/// the `put` is the shell effect. See docs/agent/world/ecs-runtime.md §1415-1434.
+fn externalize_blocks<B: BlobSink>(
+    blocks: Vec<Block>,
+    cap: ByteCap,
+    sink: &B,
+) -> Result<Vec<Block>, Error> {
+    blocks
+        .into_iter()
+        .map(|block| externalize_block(block, cap, sink))
+        .collect()
+}
+
+/// Externalize one block per [`externalize_blocks`].
+fn externalize_block<B: BlobSink>(block: Block, cap: ByteCap, sink: &B) -> Result<Block, Error> {
+    match block {
+        Block::Image {
+            source: ImageSource::Inline { mime, bytes },
+        } if over_inline_cap(bytes.len(), cap) => {
+            let hash = sink.put(&bytes)?;
+            Ok(Block::Image {
+                source: ImageSource::Blob { hash, mime },
+            })
+        }
+        Block::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => Ok(Block::ToolResult {
+            tool_use_id,
+            content: externalize_blocks(content, cap, sink)?,
+            is_error,
+        }),
+        other => Ok(other),
+    }
+}
+
+/// Resolve every externalized `Blob{hash}` image in `history` back to its `Inline`
+/// bytes via `sink`, so a request body built from History carries the real bytes
+/// the model needs. The request FINGERPRINT is computed over the UN-resolved
+/// (Blob-form) History by the caller, so live and replay hash identically (Inv 7);
+/// only the BODY is resolved. A History with no externalized image resolves to
+/// itself, so a no-image request body is byte-identical to the pre-blob path.
+/// Recurses into `ToolResult` content. See docs/agent/world/ecs-runtime.md §1415-1434.
+fn resolve_history<B: BlobSink>(history: &History, sink: &B) -> Result<History, Error> {
+    let messages = history
+        .0
+        .iter()
+        .map(|msg| {
+            Ok(Msg {
+                role: msg.role,
+                content: msg
+                    .content
+                    .iter()
+                    .cloned()
+                    .map(|block| resolve_block(block, sink))
+                    .collect::<Result<Vec<_>, Error>>()?,
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    Ok(History(messages))
+}
+
+/// Resolve one block per [`resolve_history`].
+fn resolve_block<B: BlobSink>(block: Block, sink: &B) -> Result<Block, Error> {
+    match block {
+        Block::Image {
+            source: ImageSource::Blob { hash, mime },
+        } => Ok(Block::Image {
+            source: ImageSource::Inline {
+                mime,
+                bytes: sink.get(&hash)?,
+            },
+        }),
+        Block::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => Ok(Block::ToolResult {
+            tool_use_id,
+            content: content
+                .into_iter()
+                .map(|b| resolve_block(b, sink))
+                .collect::<Result<Vec<_>, Error>>()?,
+            is_error,
+        }),
+        other => Ok(other),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ResultStamp — the envelope facts the Command does not carry
 // ---------------------------------------------------------------------------
 
@@ -408,6 +576,41 @@ pub struct ResultStamp {
 // ---------------------------------------------------------------------------
 // LIVE driver — dispatch the effect, log-before-apply, feed the result back
 // ---------------------------------------------------------------------------
+
+/// The LIVE driver with the DEFAULT inert blob seam — the exact signature the M3
+/// callers (the `WorldDriver`) drive unchanged. It delegates to
+/// [`drive_live_with_blob_sink`] threading an [`UnattachedBlobSink`], so no payload
+/// is externalized on this path (the externalize policy engages only once a real
+/// [`BlobStore`] seam is wired, BL-sink). With `Caps.blob_inline_cap == 0` (the
+/// default) the seam is never touched, so this is byte-identical to the pre-blob
+/// driver. See docs/agent/world/ecs-runtime.md §1415-1434.
+pub async fn drive_live<C, S, P, L>(
+    commands: &[Command],
+    stamp: ResultStamp,
+    world: &World,
+    client: &C,
+    surface_driver: &S,
+    peer_sender: &P,
+    log: &mut L,
+) -> Result<Vec<Event>, Error>
+where
+    C: ModelCaller,
+    S: SurfaceDriver,
+    P: PeerSender,
+    L: EventLog,
+{
+    drive_live_with_blob_sink(
+        commands,
+        stamp,
+        world,
+        client,
+        surface_driver,
+        peer_sender,
+        &UnattachedBlobSink,
+        log,
+    )
+    .await
+}
 
 /// The LIVE driver: dispatch each emitted `CallModel`, performing the real model
 /// call, and feed its recorded result back as the next Input.
@@ -452,19 +655,28 @@ pub struct ResultStamp {
 /// `Pending { cmd: Some(cmd) }`, so the recorded outcome routes back to settle that
 /// slot. `world` is also the source of the perceived `SurfaceView` the set_value
 /// fingerprint reads. See docs/agent/world/ecs-runtime.md (§645; Theme 4b).
-pub async fn drive_live<C, S, P, L>(
+// Each argument is a DISTINCT injected capability the live tick must not own
+// (the World/commands to drive, the result stamp/log envelope, and the four IO
+// seams `client`/`surface_driver`/`peer_sender`/`blob_sink`). They are threaded
+// rather than bundled so each seam stays independently stubbable in a test, the
+// same reason `drive_live` already sits at the limit; the `blob_sink` is the one
+// added here. See docs/agent/world/ecs-runtime.md §1415-1434.
+#[allow(clippy::too_many_arguments)]
+pub async fn drive_live_with_blob_sink<C, S, P, B, L>(
     commands: &[Command],
     stamp: ResultStamp,
     world: &World,
     client: &C,
     surface_driver: &S,
     peer_sender: &P,
+    blob_sink: &B,
     log: &mut L,
 ) -> Result<Vec<Event>, Error>
 where
     C: ModelCaller,
     S: SurfaceDriver,
     P: PeerSender,
+    B: BlobSink,
     L: EventLog,
 {
     // The World's perceived surface view the UI-request fingerprint reads (Inv 18).
@@ -514,19 +726,38 @@ where
                 // resolves to none → the body omits `tools`, byte-identical to a
                 // tool-less call).
                 let tool_schemas = resolve_tools(tools);
-                let body = MessageBuilder::new("", params, messages)
+                // Resolve any externalized `Blob{hash}` image back to its bytes for
+                // the request body the model receives. The request `fingerprint`
+                // above is computed over the UN-resolved (Blob-form) `messages`, so
+                // live and replay hash identically (Inv 7) — only the BODY carries
+                // resolved bytes. A History with no externalized image resolves to
+                // itself, so a no-image body is byte-identical to before. See
+                // docs/agent/world/ecs-runtime.md §1415-1434.
+                let resolved = resolve_history(messages, blob_sink)?;
+                let body = MessageBuilder::new("", params, &resolved)
                     .with_tools(&tool_schemas)
                     .build()?;
                 // The result INHERITS its `entity` from the dispatch-intent's `ctx`
                 // (Inv 17), not from a positional scan.
                 let input = match client.call(body).await {
-                    Ok((blocks, meta)) => LogicalInput::ModelResponded {
-                        cmd: *cmd,
-                        entity: ctx.entity,
-                        fingerprint,
-                        blocks,
-                        meta,
-                    },
+                    Ok((blocks, meta)) => {
+                        // Externalize any over-cap image the model returned to the
+                        // blob store, recording only its `Blob{hash}` — the
+                        // log/snapshot then carry the hash, never the bytes (the
+                        // externalize is the SHELL's `put`, not a pure System). A
+                        // no-image (or all-small) response externalizes to itself, so
+                        // `ModelResponded` stays byte-identical for a no-image log.
+                        // See docs/agent/world/ecs-runtime.md §1415-1434.
+                        let blocks =
+                            externalize_blocks(blocks, world.resources.caps.blob_inline_cap, blob_sink)?;
+                        LogicalInput::ModelResponded {
+                            cmd: *cmd,
+                            entity: ctx.entity,
+                            fingerprint,
+                            blocks,
+                            meta,
+                        }
+                    }
                     Err(error) => LogicalInput::ModelFailed {
                         cmd: *cmd,
                         entity: ctx.entity,
@@ -752,23 +983,33 @@ where
                 effect_id += 1;
 
                 // Build the summarization request: system prompt + the history
-                // slice to condense. The model returns the summary blocks.
+                // slice to condense. Resolve any externalized `Blob{hash}` image to
+                // its bytes for the body (the `fingerprint` above stays over the
+                // Blob-form `messages`, so live and replay hash identically, Inv 7).
+                // The model returns the summary blocks.
+                let resolved = resolve_history(messages, blob_sink)?;
                 let body = MessageBuilder::new(
                     "Summarize the following conversation into a single concise \
                      message that preserves all key information and context \
                      needed to continue the conversation coherently.",
                     params,
-                    messages,
+                    &resolved,
                 )
                 .build()?;
                 let input = match client.call(body).await {
-                    Ok((blocks, _meta)) => LogicalInput::Compacted {
-                        cmd: *cmd,
-                        entity: ctx.entity,
-                        fingerprint,
-                        summary: blocks,
-                        replaced: messages.0.len() as u32,
-                    },
+                    Ok((blocks, _meta)) => {
+                        // Externalize any over-cap image in the summary the same way
+                        // as a `CallModel` response; a no-image summary is byte-identical.
+                        let summary =
+                            externalize_blocks(blocks, world.resources.caps.blob_inline_cap, blob_sink)?;
+                        LogicalInput::Compacted {
+                            cmd: *cmd,
+                            entity: ctx.entity,
+                            fingerprint,
+                            summary,
+                            replaced: messages.0.len() as u32,
+                        }
+                    }
                     Err(error) => LogicalInput::ModelFailed {
                         cmd: *cmd,
                         entity: ctx.entity,
@@ -1768,6 +2009,7 @@ mod tests {
                 turns: 0,
                 spawned: 0,
                 model: None,
+                autonomy: None,
             },
         );
 
@@ -1910,6 +2152,7 @@ mod tests {
                 turns: 0,
                 spawned: 0,
                 model: None,
+                autonomy: None,
             },
         );
 
@@ -2454,6 +2697,7 @@ mod tests {
                 turns: 0,
                 spawned: 0,
                 model: None,
+                autonomy: None,
             },
         );
         let (settled_world, commands) = TurnSystem.step(&world, &settled.input);
@@ -2564,6 +2808,317 @@ mod tests {
         assert!(
             reconciled.is_empty(),
             "a dispatch with a logged result is settled — nothing to reconcile"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BL-cap: inline-vs-externalize policy + shell put/get (VC-1.1 / VC-1.2)
+    // -----------------------------------------------------------------------
+
+    /// The PURE externalize decision is a function of `(len, cap)` only — no IO:
+    /// at/under the cap stays inline, strictly over externalizes, and `cap == 0`
+    /// (unbounded) never externalizes however large the payload.
+    #[test]
+    fn over_inline_cap_is_a_pure_decision_of_len_and_cap() {
+        // cap == 0 ⇒ unbounded: never externalize, regardless of size.
+        assert!(!over_inline_cap(0, 0));
+        assert!(!over_inline_cap(1_000_000, 0));
+        // At/under the cap ⇒ inline.
+        assert!(!over_inline_cap(8, 8), "exactly at the cap stays inline");
+        assert!(!over_inline_cap(7, 8), "under the cap stays inline");
+        // Strictly over the cap ⇒ externalize.
+        assert!(over_inline_cap(9, 8), "over the cap externalizes");
+    }
+
+    /// A model client returning a SCRIPTED set of blocks and capturing the request
+    /// body it was handed — so a test asserts both the externalize of the RESPONSE
+    /// and the resolve of the REQUEST against a real `BlobStore`.
+    struct ScriptedBlocksClient {
+        blocks: Vec<Block>,
+        body: std::sync::Mutex<Option<Json>>,
+    }
+
+    impl ModelCaller for ScriptedBlocksClient {
+        async fn call(&self, request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+            *self.body.lock().expect("lock body") = Some(request_body);
+            Ok((
+                self.blocks.clone(),
+                ModelMeta {
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                    model_id: "claude-x-2026".into(),
+                    stop_reason: StopReason::EndTurn,
+                    capabilities: Capabilities(serde_json::json!({})),
+                    reasoning: ReasoningPolicy::Drop,
+                },
+            ))
+        }
+    }
+
+    fn world_with_cap(cap: ByteCap) -> World {
+        let mut world = empty_world();
+        world.resources.caps.blob_inline_cap = cap;
+        world
+    }
+
+    fn call_with_history(cmd: CmdId, messages: History) -> Command {
+        Command::CallModel {
+            cmd,
+            entity: 0,
+            messages,
+            tools: ToolSet::default(),
+            params: sample_params(),
+            key: CommandKey,
+        }
+    }
+
+    fn no_blob_stamp() -> ResultStamp {
+        ResultStamp {
+            edge: 0,
+            app_edge: 1,
+            at: 1,
+            wall: None,
+        }
+    }
+
+    /// VC-1.1 (shell round-trip): a model response carrying an over-cap image is
+    /// externalized via `BlobStore.put` and recorded as `ImageSource::Blob{hash}` —
+    /// the recorded `ModelResponded` holds the HASH, never the bytes — and the blob
+    /// round-trips by hash through the store (`get(hash) == original bytes`).
+    #[tokio::test]
+    async fn over_cap_image_is_externalized_to_blob_and_round_trips_by_hash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path().join("blobs"));
+
+        let big = vec![0xABu8; 64]; // 64 bytes — over a cap of 8.
+        let client = ScriptedBlocksClient {
+            blocks: vec![
+                Block::Text {
+                    text: "see image".into(),
+                },
+                Block::Image {
+                    source: ImageSource::Inline {
+                        mime: "image/png".into(),
+                        bytes: big.clone(),
+                    },
+                },
+            ],
+            body: std::sync::Mutex::new(None),
+        };
+        let mut log = MemoryEventLog::new();
+
+        let results = drive_live_with_blob_sink(
+            &[call_with_history(1, History::default())],
+            no_blob_stamp(),
+            &world_with_cap(8),
+            &client,
+            &CapturingSurfaceDriver::default(),
+            &ExplodingPeerSender,
+            &store,
+            &mut log,
+        )
+        .await
+        .expect("drive externalizes the over-cap image");
+
+        let LogicalInput::ModelResponded { blocks, .. } = &results[0].input else {
+            panic!("expected ModelResponded");
+        };
+        // The image block now carries only the content-address hash, not the bytes.
+        let hash = match &blocks[1] {
+            Block::Image {
+                source: ImageSource::Blob { hash, mime },
+            } => {
+                assert_eq!(mime, "image/png", "the mime is preserved across externalize");
+                hash.clone()
+            }
+            other => panic!("expected an externalized Blob image, got {other:?}"),
+        };
+        // The recorded Event holds the hash as a blob reference — no inline bytes.
+        let recorded = serde_json::to_string(&results[0]).expect("serialize event");
+        assert!(recorded.contains(&hash.0), "the log carries the blob hash");
+        assert!(
+            recorded.contains("\"type\":\"blob\""),
+            "the image is recorded as a blob reference"
+        );
+        assert!(
+            !recorded.contains("\"type\":\"inline\""),
+            "no inline bytes are recorded in the log (only the hash)"
+        );
+
+        // The blob round-trips by hash through the store.
+        assert_eq!(
+            store.get(&hash).expect("get blob"),
+            big,
+            "put → Blob{{hash}} → get returns the original bytes"
+        );
+    }
+
+    /// VC-1.2: a payload at/under the cap stays `ImageSource::Inline`, and `cap == 0`
+    /// (unbounded) never externalizes however large the payload — the store stays
+    /// empty in both cases (no `put`).
+    #[tokio::test]
+    async fn under_cap_and_zero_cap_keep_image_inline() {
+        for (cap, bytes) in [(64u32, vec![1u8; 8]), (0u32, vec![1u8; 4096])] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store = BlobStore::new(dir.path().join("blobs"));
+            let client = ScriptedBlocksClient {
+                blocks: vec![Block::Image {
+                    source: ImageSource::Inline {
+                        mime: "image/png".into(),
+                        bytes: bytes.clone(),
+                    },
+                }],
+                body: std::sync::Mutex::new(None),
+            };
+            let mut log = MemoryEventLog::new();
+            let results = drive_live_with_blob_sink(
+                &[call_with_history(1, History::default())],
+                no_blob_stamp(),
+                &world_with_cap(cap),
+                &client,
+                &CapturingSurfaceDriver::default(),
+                &ExplodingPeerSender,
+                &store,
+                &mut log,
+            )
+            .await
+            .expect("drive keeps the image inline");
+
+            let LogicalInput::ModelResponded { blocks, .. } = &results[0].input else {
+                panic!("expected ModelResponded");
+            };
+            assert!(
+                matches!(
+                    &blocks[0],
+                    Block::Image { source: ImageSource::Inline { bytes: b, .. } } if *b == bytes
+                ),
+                "an at/under-cap (or cap==0) image stays Inline with its bytes (cap={cap})"
+            );
+            assert!(
+                store.stored_hashes().expect("stored").is_empty(),
+                "no put for an inline image (cap={cap})"
+            );
+        }
+    }
+
+    /// VC-1.1 (read path): a request built from a History carrying a `Blob{hash}`
+    /// resolves the bytes through `BlobStore.get`, so the model receives the real
+    /// bytes — while the request FINGERPRINT stays over the Blob-form History, so a
+    /// replay (which fingerprints over the recorded Blob-form History) hashes
+    /// identically (Inv 7).
+    #[tokio::test]
+    async fn request_body_resolves_a_blob_hash_back_to_inline_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path().join("blobs"));
+        let bytes = vec![9u8, 8, 7, 6, 5];
+        let hash = store.put(&bytes).expect("seed blob");
+
+        // A prior turn externalized this image; History now carries the Blob ref.
+        let messages = History(vec![Msg {
+            role: Role::User,
+            content: vec![Block::Image {
+                source: ImageSource::Blob {
+                    hash: hash.clone(),
+                    mime: "image/png".into(),
+                },
+            }],
+        }]);
+
+        // The fingerprint the replay driver recomputes is over the Blob-form messages.
+        let blob_form_fp = fingerprint_call(&messages, &ToolSet::default(), &sample_params())
+            .expect("fingerprint over blob-form messages");
+
+        let client = ScriptedBlocksClient {
+            blocks: vec![Block::Text { text: "ok".into() }],
+            body: std::sync::Mutex::new(None),
+        };
+        let mut log = MemoryEventLog::new();
+        let results = drive_live_with_blob_sink(
+            &[call_with_history(1, messages.clone())],
+            no_blob_stamp(),
+            &world_with_cap(4),
+            &client,
+            &CapturingSurfaceDriver::default(),
+            &ExplodingPeerSender,
+            &store,
+            &mut log,
+        )
+        .await
+        .expect("drive resolves the blob for the body");
+
+        // The body the model received carries the RESOLVED inline bytes, not the hash.
+        let body = client.body.lock().expect("lock").clone().expect("body");
+        let image = &body["messages"][0]["content"][0];
+        assert_eq!(image["type"], "image");
+        assert_eq!(
+            image["source"]["type"], "inline",
+            "the Blob{{hash}} was resolved to inline bytes for the model"
+        );
+        assert_eq!(
+            image["source"]["bytes"].as_array().expect("byte array").len(),
+            bytes.len(),
+            "the resolved body carries the original bytes"
+        );
+
+        // The recorded result's fingerprint binds to the Blob-form request, so a
+        // replay (fingerprinting over the recorded Blob-form History) matches.
+        let LogicalInput::ModelResponded { fingerprint, .. } = &results[0].input else {
+            panic!("expected ModelResponded");
+        };
+        assert_eq!(
+            fingerprint, &blob_form_fp,
+            "the request fingerprint stays over the Blob-form History (replay-stable)"
+        );
+    }
+
+    /// Task-local byte-identity: a no-image response with a cap set externalizes
+    /// NOTHING (no Image block), so the recorded `ModelResponded` carries exactly the
+    /// model's blocks and the store stays empty — the no-image path is untouched.
+    #[tokio::test]
+    async fn no_image_response_is_byte_identical_and_touches_no_blob() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path().join("blobs"));
+        let client = ScriptedBlocksClient {
+            blocks: vec![Block::Text {
+                text: "plain reply".into(),
+            }],
+            body: std::sync::Mutex::new(None),
+        };
+        let mut log = MemoryEventLog::new();
+        let results = drive_live_with_blob_sink(
+            &[call_with_history(
+                1,
+                History(vec![Msg {
+                    role: Role::User,
+                    content: vec![Block::Text { text: "hi".into() }],
+                }]),
+            )],
+            no_blob_stamp(),
+            &world_with_cap(8),
+            &client,
+            &CapturingSurfaceDriver::default(),
+            &ExplodingPeerSender,
+            &store,
+            &mut log,
+        )
+        .await
+        .expect("drive a no-image turn");
+
+        let LogicalInput::ModelResponded { blocks, .. } = &results[0].input else {
+            panic!("expected ModelResponded");
+        };
+        assert_eq!(
+            blocks.as_slice(),
+            [Block::Text {
+                text: "plain reply".into()
+            }],
+            "no-image blocks are recorded verbatim (byte-identity)"
+        );
+        assert!(
+            store.stored_hashes().expect("stored").is_empty(),
+            "a no-image turn writes no blob"
         );
     }
 }

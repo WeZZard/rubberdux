@@ -92,6 +92,7 @@ fn genesis(seed: u64, model: &ModelConfig, depth_cap: u8, fanout_cap: u32) -> Wo
             turns: 0,
             spawned: 0,
             model: None,
+            autonomy: None,
         },
     );
     world

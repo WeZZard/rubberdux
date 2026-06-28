@@ -33,6 +33,20 @@ pub struct GuardrailTrip(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Authority(pub String);
 
+impl Authority {
+    /// The P0 shape-level predicate that gates a halt clear (design §567-570,
+    /// §1869-1871: "Authority/authorization are SHAPE ONLY here"). A clear is
+    /// AUTHORIZED iff a non-blank credential is presented: the totality
+    /// requirement is that the clearing transition EXISTS and is GATED by a
+    /// token, so a blank/whitespace authority is REJECTED rather than silently
+    /// clearing the hold. WHO may issue the token and richer verification are a
+    /// later enforcement pass. Mirrors the `PeerDriveSystem` P0 authorization
+    /// (a non-empty token), keeping the gated-but-existent shape consistent.
+    pub fn authorizes_clear(&self) -> bool {
+        !self.0.trim().is_empty()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WorldGate — App-wide run-state (User pause / PolicyHalt)
 // ---------------------------------------------------------------------------
@@ -121,6 +135,24 @@ mod tests {
     #[test]
     fn authority_round_trips() {
         round_trip(&Authority("admin-token-xyz".into()));
+    }
+
+    /// The P0 authority predicate is a CONCRETE, PURE check: a non-blank token
+    /// authorizes a halt clear; an empty or whitespace-only token does not.
+    #[test]
+    fn authority_authorizes_clear_iff_token_is_non_blank() {
+        assert!(
+            Authority("admin".into()).authorizes_clear(),
+            "a non-blank credential authorizes a clear"
+        );
+        assert!(
+            !Authority(String::new()).authorizes_clear(),
+            "an empty credential is rejected"
+        );
+        assert!(
+            !Authority("   ".into()).authorizes_clear(),
+            "a whitespace-only credential is insufficient"
+        );
     }
 
     // -----------------------------------------------------------------------
