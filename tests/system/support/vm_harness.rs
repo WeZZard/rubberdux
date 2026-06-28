@@ -87,6 +87,9 @@ impl VmSystemTestHarness {
             vm_image: "rubberdux-base-ubuntu24-release".into(),
             share_root: share_root.clone(),
             rpc_port: 0,
+            // 0 ⇒ bind any free port; this harness constructs HostConfig only to
+            // exercise the type and never starts the surface-client listener.
+            surface_port: 0,
             host_ip: "192.168.64.1".into(),
             agent_binary_path: Some("/mnt/shared/share/rubberdux".into()),
             agent_env: [

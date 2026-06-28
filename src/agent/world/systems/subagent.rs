@@ -110,22 +110,26 @@ fn spawn_or_deny(world: &World, parent: &EntityId) -> (World, Vec<Command>) {
     let mut commands = Vec::new();
     let default_model = world.resources.model.clone();
     let depth_cap = world.resources.depth_cap;
-    // Fan-out cap (Boundedness, Inv 11): the parent's LIVE direct children vs its
-    // `fanout_cap`. `depth_cap` bounds NESTING along a path; `fanout_cap` bounds the
-    // BREADTH a single entity spawns — independent brakes. The live count is read from
-    // `world.entities` (deterministic BTreeMap iteration, Inv 8), NOT a stored counter,
-    // and is advanced as each child is spawned in this batch so a single turn's spawns
-    // count against the cap. `0` ⇒ unbounded.
+    // Fan-out cap (Boundedness, Inv 11): `depth_cap` bounds NESTING along a path;
+    // `fanout_cap` bounds the BREADTH a single entity spawns — independent brakes.
+    // The breadth is tracked by the CUMULATIVE `Components.spawned` counter (bumped
+    // on each spawn, NEVER decremented on child completion), so a finished child does
+    // NOT refund budget. `0` ⇒ unbounded.
     let fanout_cap = world
         .entities
         .get(parent)
         .map(|e| e.budget.limits.fanout_cap)
         .unwrap_or(0);
-    let mut live_children = world
+    // Fan-out cap (Boundedness, Inv 11): the parent's CUMULATIVE `spawned` counter vs
+    // its `fanout_cap`. Unlike a live-count, `spawned` is bumped on each spawn and
+    // NEVER decremented when a child completes or is removed — a finished child does NOT
+    // refund the budget (design §1274–1278). `0` ⇒ unbounded. See
+    // docs/agent/world/ecs-runtime.md (Fan-out budget — bound sub-agent spawning).
+    let mut cumulative_spawned = world
         .entities
-        .values()
-        .filter(|e| e.lineage.parent == Some(*parent))
-        .count() as u32;
+        .get(parent)
+        .map(|e| e.spawned)
+        .unwrap_or(0);
 
     for (tool_use_id, child) in pending {
         let child_depth = parent_depth.saturating_add(1);
@@ -141,10 +145,10 @@ fn spawn_or_deny(world: &World, parent: &EntityId) -> (World, Vec<Command>) {
             );
             continue;
         }
-        // Fan-out DENY (Inv 10/11): a spawn past the live-child cap resolves the slot
+        // Fan-out DENY (Inv 10/11): a spawn past the cumulative cap resolves the slot
         // `is_error` WITHOUT spawning — MIRRORING the depth-cap deny — so the parent
         // never waits on a child that will never exist (B6 no-deadlock rule).
-        if fanout_cap != 0 && live_children >= fanout_cap {
+        if fanout_cap != 0 && cumulative_spawned >= fanout_cap {
             resolve_slot(
                 &mut world,
                 parent,
@@ -185,12 +189,17 @@ fn spawn_or_deny(world: &World, parent: &EntityId) -> (World, Vec<Command>) {
                 budget: Budget::default(),
                 inbox: Inbox::default(),
                 turns: 0,
+                spawned: 0,
                 model: None,
             },
         );
-        // A child now exists under this parent — count it toward the fan-out cap so a
-        // later slot in the SAME batch sees the updated breadth.
-        live_children = live_children.saturating_add(1);
+        // Bump the parent's CUMULATIVE spawn counter (never decremented — cumulative
+        // semantics; design §1274). Also advance the local variable so a later slot in
+        // the SAME batch sees the updated total against the cap.
+        if let Some(parent_components) = world.entities.get_mut(parent) {
+            parent_components.spawned = parent_components.spawned.saturating_add(1);
+        }
+        cumulative_spawned = cumulative_spawned.saturating_add(1);
         commands.push(Command::CallModel {
             cmd: child_cmd,
             entity: child,
@@ -239,6 +248,83 @@ fn settle_child_returned(
         resolved = true;
     }
     (world, resolved)
+}
+
+/// Regenerate the `ChildReturned` inputs OWED by every child entity that has SETTLED
+/// to `Idle` after its terminal `EndTurn` turn while its parent's owning `Child` slot
+/// is still `Pending` — the COMPLETION half of in-process fan-out (the gap that, until
+/// now, left a live parent waiting forever because nothing constructed `ChildReturned`).
+///
+/// This is the named, deliberately NON-fingerprinted exception to Inv 7
+/// (docs/agent/world/ecs-runtime.md — `ChildReturned` regeneration; Correlation-pair
+/// audit): the value is a PURE FUNCTION of `World` state at this tick — no model call,
+/// no wall-clock, no RNG — so a faithful replay reproduces byte-identical inputs and a
+/// counterfactual branch re-derives them WITHOUT a recorded/fingerprinted dispatch
+/// boundary. The imperative shell-driver merely folds each through the existing
+/// `settle_child_returned` path (correlated by `(child, tool_use_id)` identity, Inv 16),
+/// so the parent resumes.
+///
+/// A child TERMINAL FAILURE is settled `is_error` by SupervisionSystem on the child's
+/// `ModelFailed` in the SAME tick, so a failed/cancelled child's slot is already `Done`
+/// here and is skipped; ONLY an `EndTurn`-settled child leaves its parent's slot
+/// `Pending`, which is precisely the gap this fills. The `result` carries the child's
+/// final answer (its last assistant message's blocks) as a `ToolResult`; `is_error:
+/// false`.
+///
+/// Iterating the deterministically-ordered `entities` `BTreeMap` (never a `HashMap` —
+/// Inv 8) keeps the owed-returns list free of a hidden ordering input.
+pub(crate) fn regenerate_child_returns(world: &World) -> Vec<LogicalInput> {
+    let mut returns = Vec::new();
+    for (child_id, child) in &world.entities {
+        // A child is owed a return only once it has SETTLED (`Idle`) and still has a
+        // parent whose `Child` slot is awaiting it.
+        if !matches!(child.activity, Activity::Idle) {
+            continue;
+        }
+        let Some(parent_id) = child.lineage.parent else {
+            continue;
+        };
+        let Some(parent) = world.entities.get(&parent_id) else {
+            continue;
+        };
+        let Activity::ResolvingToolUses { slots } = &parent.activity else {
+            continue;
+        };
+        for slot in slots {
+            if matches!(slot.kind, SlotKind::Child(c) if c == *child_id)
+                && matches!(slot.state, SlotState::Pending { .. })
+            {
+                returns.push(LogicalInput::ChildReturned {
+                    parent: parent_id,
+                    child: *child_id,
+                    tool_use_id: slot.tool_use_id.clone(),
+                    result: child_final_answer(&slot.tool_use_id, &child.history),
+                });
+            }
+        }
+    }
+    returns
+}
+
+/// The child's final answer as the `ToolResult` its regenerated `ChildReturned` carries:
+/// the content blocks of the child's LAST assistant message (the `EndTurn` turn TurnSystem
+/// appended), stamped to the parent slot's `tool_use_id` so the assembled `tool_result`
+/// pairs with its `tool_use`. Absent any assistant message the content is empty (Totality
+/// — the parent still resumes). `is_error: false`: a failed child is owned by
+/// SupervisionSystem, so this only ever runs for a child that produced an answer.
+fn child_final_answer(tool_use_id: &str, history: &History) -> ToolResult {
+    let content = history
+        .0
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::Assistant))
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    Block::ToolResult {
+        tool_use_id: tool_use_id.to_string(),
+        content,
+        is_error: false,
+    }
 }
 
 /// Resolve the `Child` slot of `entity` whose `tool_use_id` matches: carry `result`
@@ -356,6 +442,7 @@ mod tests {
                 budget: crate::agent::world::budget::Budget::default(),
                 inbox: crate::agent::world::world::Inbox::default(),
                 turns: 0,
+                spawned: 0,
                 model: None,
             },
         );

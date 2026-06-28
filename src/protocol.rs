@@ -53,6 +53,15 @@ pub enum AgentToHost {
     /// A native app worker requests the set of peers it may address. The host
     /// answers with [`HostToAgent::PeerListResult`].
     PeerList,
+    /// The receiver's durable-fold confirmation for an inbound peer delivery: the
+    /// worker emits this AFTER its World driver appends the folded
+    /// `DriveRequested`/`PeerDelivered` to its stratum-1 World log (durable). The
+    /// host's broker consumes it (`PeerBroker::confirm_fold`) to report the sender
+    /// `Delivered` only after a DURABLE fold (INV-3) and to advance the durable
+    /// inbox past the envelope (INV-4). `envelope` is the sender-assigned
+    /// `PeerEnvelopeId` carried on the delivered envelope. See
+    /// docs/agent/world/ecs-runtime.md §"Durable peer delivery".
+    PeerDeliverAck { envelope: String },
     /// Agent response to a user message.
     Response {
         text: String,

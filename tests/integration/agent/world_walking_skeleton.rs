@@ -27,9 +27,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde_json::Value as Json;
 
 use rubberdux::agent::world::effects::{
-    Command, ModelCaller, ResultStamp, SurfaceDriver, ToolSet, drive_live, fingerprint_call,
+    Command, ModelCaller, ResultStamp, SurfaceDriver, ToolSet, UnattachedPeerSender, drive_live,
+    fingerprint_call,
 };
-use rubberdux::agent::world::surface::SurfaceView;
 use rubberdux::agent::world::event_log::{EventLog, MemoryEventLog};
 use rubberdux::agent::world::gates::EntityGate;
 use rubberdux::agent::world::history::{Block, History, Msg, Role};
@@ -71,6 +71,7 @@ fn genesis(seed: u64, model: &ModelConfig) -> World {
             budget: rubberdux::agent::world::budget::Budget::default(),
             inbox: rubberdux::agent::world::world::Inbox::default(),
             turns: 0,
+            spawned: 0,
             model: None,
         },
     );
@@ -156,9 +157,10 @@ async fn run_live<C: ModelCaller>(
             let results = drive_live(
                 &commands,
                 stamp,
-                &SurfaceView::new(),
+                &world,
                 client,
                 &NoSurfaceDrive,
+                &UnattachedPeerSender,
                 &mut log,
             )
             .await?;

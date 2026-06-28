@@ -75,6 +75,7 @@ fn make_genesis(seed: u64) -> World {
             budget: Budget::default(),
             inbox: Inbox::default(),
             turns: 0,
+            spawned: 0,
             model: None,
         },
     );

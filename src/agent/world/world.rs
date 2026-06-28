@@ -1,6 +1,6 @@
 //! world — see docs/agent/world/ecs-runtime.md
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +9,7 @@ use super::budget::Budget;
 use super::effects::ToolSet;
 use super::gates::{EntityGate, WorldGate};
 use super::history::{Block, History, ToolResult};
-use super::surface::SurfaceView;
+use super::surface::{PeerEnvelopeId, SurfaceView};
 
 /// Default value for `Resources.autonomy` when absent from a serialised log
 /// (old sessions pre-date the field). `RunFree` is the conservative default:
@@ -118,6 +118,15 @@ pub struct Components {
     /// (Loop guard — bound the tool/turn loop).
     #[serde(default)]
     pub turns: u32,
+    /// Per-entity CUMULATIVE fan-out counter: the number of child sub-agents this
+    /// entity has EVER spawned across its whole lifetime (Boundedness — Inv 11).
+    /// Bumped by SubagentSystem on each successful spawn; NEVER decremented when a
+    /// child completes or is removed (cumulative, not live-count). Bounded by
+    /// `budget.limits.fanout_cap`; `0` for a fresh entity. `#[serde(default)]` so
+    /// M1/M2 logs and snapshots deserialise byte-identically. See
+    /// docs/agent/world/ecs-runtime.md (Fan-out budget — bound sub-agent spawning).
+    #[serde(default)]
+    pub spawned: u32,
     /// Per-entity override of the world-default `ModelConfig` (`None` ⇒ inherit).
     pub model: Option<ModelConfig>,
 }
@@ -249,6 +258,12 @@ pub const HELD_CMD: CmdId = u32::MAX;
 // Caps — bounded-resource knobs (World-state, replayable). P0 subset.
 // ---------------------------------------------------------------------------
 
+/// The capacity of a bounded queue. `0` means **unbounded** — the brake is
+/// intentionally disabled. Used for every queue-depth cap in [`Caps`].
+///
+/// See docs/agent/world/ecs-runtime.md §"Boundedness"/Caps.
+pub type QueueCap = u32;
+
 /// Bounded-resource knobs for the World: every queue, growing structure, and
 /// retry loop carries an explicit brake here so the runtime cannot grow without
 /// bound. `Caps` is World state (a `Resources` singleton) and therefore replays
@@ -268,6 +283,12 @@ pub struct Caps {
     /// Grace window (in ticks) after a branch goes dead before it is eligible
     /// for reclaim. `0` = unbounded (dead branches never auto-expire).
     pub branch_grace: Tick,
+    /// Maximum number of peer messages that may sit in the durable peer inbox
+    /// of any one App. When the inbox is at this depth, a new send is rejected
+    /// (RejectNewest): nothing is enqueued and the sender receives
+    /// `DeliveryOutcome::Rejected`. `0` = unbounded (no backpressure). See
+    /// docs/agent/world/ecs-runtime.md §"Durable peer delivery" (§1335–1338).
+    pub peer_inbox: QueueCap,
 }
 
 impl Default for Caps {
@@ -279,6 +300,9 @@ impl Default for Caps {
             // branch-reclaim logic (a later milestone) reads this and skips
             // eviction when the value is 0.
             branch_grace: 0,
+            // 0 = unbounded: no inbox backpressure by default; an operator
+            // sets a positive value to bound the per-App peer inbox.
+            peer_inbox: 0,
         }
     }
 }
@@ -349,6 +373,24 @@ pub struct Resources {
     /// See docs/agent/world/ecs-runtime.md §"Boundedness"/Caps.
     #[serde(default)]
     pub caps: Caps,
+    /// The inbound peer envelope ids this World has ALREADY durably folded — the
+    /// receiver's STRATUM-1 dedup authority that makes peer delivery
+    /// effectively-once. PeerDriveSystem records each `DriveRequested`/
+    /// `PeerDelivered` envelope here AS PART OF folding it (the record is created
+    /// BY the fold, atomic with the World-log append), and treats a redelivery
+    /// whose envelope is already present as a NO-OP trace — never re-folded. The
+    /// authority lives HERE, not in a broker-side ledger written before the
+    /// receiver applies: because the dedup record is created only by the fold, a
+    /// crash BEFORE the fold leaves NO dedup, so the redelivery re-folds
+    /// (at-least-once transport + this idempotency = effectively-once, with no
+    /// crash window that both dedups and drops a message). A replay reconstructs
+    /// the set by re-folding the same EXOGENOUS peer inputs, so it is not recorded
+    /// separately. A deterministic `BTreeSet` (never a `HashMap`) keeps membership
+    /// free of a hidden ordering input (Inv 8). `#[serde(default)]` so M1/M2
+    /// logs/snapshots (which carry no peer envelopes) deserialise byte-identically.
+    /// See docs/agent/world/ecs-runtime.md §"Durable peer delivery".
+    #[serde(default)]
+    pub applied_envelopes: BTreeSet<PeerEnvelopeId>,
 }
 
 impl Resources {
@@ -373,6 +415,10 @@ impl Resources {
             // pre-tools request). The live tick-driver opts the surface entity in.
             surface_tools: ToolSet::default(),
             caps: Caps::default(),
+            // No peer envelope folded yet: the receiver's stratum-1 dedup set is
+            // empty at genesis and grows only as PeerDriveSystem folds inbound
+            // peer inputs.
+            applied_envelopes: BTreeSet::new(),
         }
     }
 }
@@ -522,6 +568,21 @@ pub struct WallClock {
 // Edges — first-class counterpart relationships (mode folds per edge)
 // ---------------------------------------------------------------------------
 
+/// World-side peer address. Mirrors `app::peer::PeerId` (which is
+/// `{ app_id: AppId(String), node_id: NodeId(String) }`) so a shell `PeerId`
+/// serialises into the World log byte-identically — the two newtypes `AppId`
+/// and `NodeId` are transparent to serde, leaving a `{"app_id":"…","node_id":"…"}`
+/// wire shape that this struct replicates with plain `String` fields. Defined
+/// separately to keep the World functional core free of the shell layer.
+/// See docs/agent/world/ecs-runtime.md §301–309.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct PeerId {
+    pub app_id: String,
+    pub node_id: String,
+}
+
 /// A first-class relationship between this World and a counterpart. Mode is a
 /// pure fold over the origins of recent Events on a given edge (see the
 /// Mode-as-projection pass). P0 only models the human edge.
@@ -531,11 +592,23 @@ pub struct Edge {
     pub counterpart: Counterpart,
 }
 
-/// The counterpart on the far side of an `Edge`. P0 models only the human edge;
-/// `Peer` arrives with the federation milestone.
+/// The counterpart on the far side of an `Edge`.
+///
+/// - `Human` — the human-facing surface (the native client UI).
+/// - `App`   — this App's own surface (the macOS accessibility layer the agent
+///             writes to via `RunTool`/`set_value`).
+/// - `Peer`  — a peer App process on the network, introduced by the federation
+///             milestone. `edge_for(Peer(id))` binds one stable edge per peer
+///             so inbound `DriveRequested`/`PeerDelivered` inputs are always
+///             recorded on a replayable, identity-keyed edge.
+///
+/// See docs/agent/world/ecs-runtime.md §298–309.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Counterpart {
     Human,
+    App,
+    Peer(PeerId),
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +669,7 @@ mod tests {
                 budget: Budget::default(),
                 inbox: Inbox::default(),
                 turns: 4,
+                spawned: 2,
                 model: None,
             },
         );
@@ -613,6 +687,7 @@ mod tests {
                 budget: Budget::default(),
                 inbox: Inbox::default(),
                 turns: 0,
+                spawned: 0,
                 model: Some(sample_model()),
             },
         );

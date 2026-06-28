@@ -67,6 +67,7 @@ fn genesis(seed: u64, model: &ModelConfig, depth_cap: u8) -> World {
             budget: rubberdux::agent::world::budget::Budget::default(),
             inbox: rubberdux::agent::world::world::Inbox::default(),
             turns: 0,
+            spawned: 0,
             model: None,
         },
     );

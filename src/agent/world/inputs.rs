@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use super::autonomy::{Autonomy, InteractionResponse};
 use super::gates::{Authority, GuardrailTrip, PauseReason};
 use super::history::{Block, Json, ToolResult};
-use super::surface::{ElementId, Hash, Point, Selection, SurfaceId, SurfaceOp, SurfaceVersion, Viewport, WindowState};
-use super::world::{CmdId, EdgeId, EntityId, ReqId, Tick, Timestamp, ToolUseId};
+use super::surface::{ElementId, Hash, PeerEnvelopeId, Point, Selection, SurfaceId, SurfaceOp, SurfaceVersion, Viewport, WindowState};
+use super::world::{CmdId, Counterpart, EdgeId, EntityId, PeerId, ReqId, Tick, Timestamp, ToolUseId};
 
 // ---------------------------------------------------------------------------
 // Event envelope — every Logical Input enters the log inside an Event
@@ -150,6 +150,43 @@ pub enum LogicalInput {
         cursor: Option<Point>,
     },
 
+    /// Binding of a `Counterpart` to a stable local `EdgeId`, logged once the
+    /// FIRST time `edge_for(counterpart)` mints a new edge so replay reproduces
+    /// the identical binding (Inv 6 — deterministic replay). Subsequent calls to
+    /// `edge_for` return the already-bound `EdgeId` from `Resources.edges`
+    /// without logging a second `EdgeBound`. Inbound peer inputs
+    /// (`DriveRequested`, `PeerDelivered`) bind via `edge_for(Peer(from))`.
+    /// EXOGENOUS (receiver-derived from the inbound `Counterpart`; never
+    /// fingerprinted). See docs/agent/world/ecs-runtime.md §409–415.
+    EdgeBound {
+        edge: EdgeId,
+        counterpart: Counterpart,
+    },
+
+    /// Inbound cross-World drive request (B10): another App's lead drives THIS
+    /// App's client. Origin `Peer`. The shell executes the `drive` ops against
+    /// this client, records it here (so A acting inside B is auditable in B's
+    /// own log), and binds to `edge_for(Counterpart::Peer(from))` (Theme 4a).
+    /// De-duped by the sender's stable `envelope` (the per-`cmd` fingerprint
+    /// does not cross the process boundary — see docs/agent/world/ecs-runtime.md
+    /// §419–426). EXOGENOUS.
+    DriveRequested {
+        from: PeerId,
+        envelope: PeerEnvelopeId,
+        drive: DriveCommand,
+        auth: Authorization,
+    },
+
+    /// Inbound generic peer message (non-drive). Origin `Peer`. Correlated to
+    /// the sender's `SendPeer` by the stable `envelope`; bound to
+    /// `edge_for(Counterpart::Peer(from))` (Theme 4a). EXOGENOUS.
+    /// See docs/agent/world/ecs-runtime.md §419.
+    PeerDelivered {
+        from: PeerId,
+        envelope: PeerEnvelopeId,
+        payload: Json,
+    },
+
     // === DERIVED — effect-result cache; each fingerprinted result carries the
     //     request `fingerprint` AND the routing `entity`; reused on replay only
     //     on fingerprint match. Named non-fingerprinted exceptions: see the
@@ -239,6 +276,22 @@ pub enum LogicalInput {
         fingerprint: Fingerprint,
         summary: Vec<Block>,
         replaced: u32,
+    },
+
+    /// The sender's local delivery ack of its own `SendPeer` (Theme 4b).
+    /// Records the delivery `outcome` so the sender's replay is stable
+    /// regardless of how the peer fared. Correlated by `cmd` (the originating
+    /// `SendPeer`) and carries `fingerprint` for content-addressed replay.
+    /// The ONLY dual of `SendPeer`; the receiver-side `DriveRequested`/
+    /// `PeerDelivered` are EXOGENOUS inputs on the OTHER World, not duals of
+    /// this Command. DERIVED (carries `fingerprint`).
+    /// See docs/agent/world/ecs-runtime.md §483.
+    PeerSendOutcome {
+        cmd: CmdId,
+        entity: EntityId,
+        fingerprint: Fingerprint,
+        to: PeerId,
+        outcome: DeliveryOutcome,
     },
 }
 
@@ -345,6 +398,89 @@ pub enum ModelError {
     Timeout,
     Overloaded,
     Transport(String),
+}
+
+// ---------------------------------------------------------------------------
+// Peer driving support types — DriveCommand / PeerPayload / Authorization /
+// DeliveryOutcome (PA-types)
+// ---------------------------------------------------------------------------
+
+/// Cross-World drive payload (B10): payload-bearing surface ops (Theme 2a) the
+/// target's shell applies to its own client, plus an optional prompt routed to
+/// the target agent's Inbox. Carried in `PeerPayload::Drive` over `SendPeer`
+/// and recorded in `DriveRequested` on the receiving side.
+/// See docs/agent/world/ecs-runtime.md §533.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DriveCommand {
+    /// Surface ops the target shell applies to its client.
+    pub surface_ops: Vec<SurfaceOp>,
+    /// Optional prompt routed to the target agent's Inbox.
+    pub prompt: Option<String>,
+}
+
+/// What a `SendPeer` carries (Theme 4b): a cross-World drive or a generic peer
+/// message. `Drive` records on the receiving side as `DriveRequested`;
+/// `Message` records as `PeerDelivered`.
+/// See docs/agent/world/ecs-runtime.md §650.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PeerPayload {
+    /// A cross-World drive: the receiver's shell executes the ops against its
+    /// own client and records a `DriveRequested`.
+    Drive(DriveCommand),
+    /// A generic peer message, delivered as `PeerDelivered`.
+    Message(Json),
+}
+
+/// Authorization token asserting that `from` may drive inside THIS World (B10).
+/// The authority/verification semantics are enforced by a later pass; this
+/// struct carries the shape only.
+/// See docs/agent/world/ecs-runtime.md §539.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Authorization {
+    /// The peer that asserts permission to drive.
+    pub from: PeerId,
+    /// Opaque authorization token.
+    pub token: String,
+}
+
+/// Sender-side result of a `SendPeer` dispatch, recorded in `PeerSendOutcome`.
+/// `Delivered` = the peer acknowledged receipt; `Queued` = accepted into the
+/// peer's offline inbox; `Rejected` = the peer's inbox was full (cap overflow,
+/// sender sees rejection).
+/// See docs/agent/world/ecs-runtime.md §534.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryOutcome {
+    Delivered,
+    Queued,
+    Rejected,
+}
+
+/// The envelope the broker durably records (via `fsync`) before attempting
+/// delivery — the atomic unit of peer delivery (see
+/// docs/agent/world/ecs-runtime.md §"Durable peer delivery").
+///
+/// - `id` is the sender-assigned [`PeerEnvelopeId`] — the cross-process
+///   idempotency handle the receiver deduplicates by.  A crashed broker
+///   reconstructs the undelivered set from `PeerSendOutcome{Queued}` records
+///   in the sender log reconciled against receiver acks.
+/// - `payload` carries the surface ops / prompt drive or generic message.
+/// - `auth` asserts the sender's permission to drive the target World.
+///
+/// The broker fsyncs this record BEFORE attempting delivery so a crash cannot
+/// lose an accepted send.  The receiver appends the corresponding
+/// `DriveRequested`/`PeerDelivered` idempotently keyed by `id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DurableEnvelope {
+    /// Sender-assigned delivery key. Stable across retries of the same
+    /// logical send; the receiver deduplicates by this id to achieve
+    /// effectively-once delivery despite at-least-once transport.
+    pub id: PeerEnvelopeId,
+    /// The drive or message being delivered.
+    pub payload: PeerPayload,
+    /// Authorization asserting the sender may drive the target World.
+    pub auth: Authorization,
 }
 
 #[cfg(test)]
@@ -748,6 +884,285 @@ mod tests {
             window: WindowState("".into()),
             cursor: None,
         }));
+    }
+
+    // --- EdgeBound (federation milestone — EXOGENOUS binding input) ----------
+
+    /// `EdgeBound` round-trips for all three `Counterpart` variants and is
+    /// classified as EXOGENOUS by `replay::is_exogenous` (it is not in the
+    /// derived set). This guards the backward-compatibility invariant: old logs
+    /// that never emitted `EdgeBound` deserialise unchanged because the variant
+    /// is purely additive.
+    #[test]
+    fn edge_bound_round_trips_for_all_counterpart_variants() {
+        use crate::agent::world::world::{Counterpart, PeerId};
+        use crate::agent::world::replay::is_exogenous;
+
+        let cases = vec![
+            LogicalInput::EdgeBound {
+                edge: 0,
+                counterpart: Counterpart::Human,
+            },
+            LogicalInput::EdgeBound {
+                edge: 1,
+                counterpart: Counterpart::App,
+            },
+            LogicalInput::EdgeBound {
+                edge: 2,
+                counterpart: Counterpart::Peer(PeerId {
+                    app_id: "2026-06-10-00-00-00-000000-000000-UTC".into(),
+                    node_id: "local".into(),
+                }),
+            },
+        ];
+        for input in &cases {
+            round_trip(&wrap(input.clone()));
+            assert!(
+                is_exogenous(input),
+                "EdgeBound must be EXOGENOUS (not in the derived-result set)"
+            );
+        }
+    }
+
+    // --- PA-types: peer-drive inputs (EXOGENOUS) and PeerSendOutcome (DERIVED) --
+
+    /// `DriveRequested` round-trips and is classified as EXOGENOUS (it is a free
+    /// inbound peer input, never fingerprinted). The exhaustive destructure below
+    /// proves the exact field set at compile time.
+    #[test]
+    fn drive_requested_round_trips_and_is_exogenous() {
+        use crate::agent::world::replay::is_exogenous;
+        use crate::agent::world::world::PeerId;
+
+        let peer = PeerId {
+            app_id: "2026-01-01-00-00-00-000000-000000-UTC".into(),
+            node_id: "remote-node".into(),
+        };
+        let input = LogicalInput::DriveRequested {
+            from: peer.clone(),
+            envelope: PeerEnvelopeId("env-drive-1".into()),
+            drive: DriveCommand {
+                surface_ops: vec![SurfaceOp::Click {
+                    surface: 1,
+                    element: 5,
+                    point: Some((10, 20)),
+                    base_version: None,
+                }],
+                prompt: Some("please confirm".into()),
+            },
+            auth: Authorization {
+                from: peer.clone(),
+                token: "tok-abc".into(),
+            },
+        };
+        // Exhaustive destructure proves exact field set at compile time.
+        let LogicalInput::DriveRequested { from, envelope, drive, auth } = &input else {
+            panic!("expected DriveRequested");
+        };
+        assert_eq!(from, &peer);
+        assert_eq!(envelope.0, "env-drive-1");
+        assert!(drive.prompt.is_some());
+        assert_eq!(auth.token, "tok-abc");
+
+        let event = Event {
+            origin: Origin::Peer,
+            edge: 2,
+            at: 10,
+            wall: None,
+            input: input.clone(),
+        };
+        round_trip(&event);
+        assert!(
+            is_exogenous(&input),
+            "DriveRequested must be EXOGENOUS (free inbound peer input, never fingerprinted)"
+        );
+    }
+
+    /// `DriveRequested` round-trips with an empty `surface_ops` and no `prompt`
+    /// (the minimal drive — a prompt-only drive is also valid).
+    #[test]
+    fn drive_requested_minimal_round_trips() {
+        use crate::agent::world::world::PeerId;
+
+        let peer = PeerId {
+            app_id: "2026-06-28-00-00-00-000000-000000-UTC".into(),
+            node_id: "node-b".into(),
+        };
+        round_trip(&Event {
+            origin: Origin::Peer,
+            edge: 3,
+            at: 11,
+            wall: None,
+            input: LogicalInput::DriveRequested {
+                from: peer.clone(),
+                envelope: PeerEnvelopeId("env-min-1".into()),
+                drive: DriveCommand {
+                    surface_ops: Vec::new(),
+                    prompt: None,
+                },
+                auth: Authorization {
+                    from: peer,
+                    token: "tok-min".into(),
+                },
+            },
+        });
+    }
+
+    /// `PeerDelivered` round-trips and is classified as EXOGENOUS (free inbound
+    /// peer message, no originating Command here).
+    #[test]
+    fn peer_delivered_round_trips_and_is_exogenous() {
+        use crate::agent::world::replay::is_exogenous;
+        use crate::agent::world::world::PeerId;
+
+        let peer = PeerId {
+            app_id: "2026-01-01-00-00-00-000000-000000-UTC".into(),
+            node_id: "node-c".into(),
+        };
+        let input = LogicalInput::PeerDelivered {
+            from: peer.clone(),
+            envelope: PeerEnvelopeId("env-msg-1".into()),
+            payload: serde_json::json!({ "text": "hello from peer" }),
+        };
+        // Exhaustive destructure proves exact field set at compile time.
+        let LogicalInput::PeerDelivered { from, envelope, payload } = &input else {
+            panic!("expected PeerDelivered");
+        };
+        assert_eq!(from, &peer);
+        assert_eq!(envelope.0, "env-msg-1");
+        let _ = payload;
+
+        let event = Event {
+            origin: Origin::Peer,
+            edge: 4,
+            at: 12,
+            wall: None,
+            input: input.clone(),
+        };
+        round_trip(&event);
+        assert!(
+            is_exogenous(&input),
+            "PeerDelivered must be EXOGENOUS (free inbound peer input, never fingerprinted)"
+        );
+    }
+
+    /// `PeerSendOutcome` round-trips, is classified as DERIVED (it is the
+    /// sender-local ack of `SendPeer`, fingerprinted for content-addressed
+    /// replay), and carries `cmd`/`entity`/`fingerprint`/`to`/`outcome`. The
+    /// exhaustive destructure below proves the exact field set at compile time.
+    #[test]
+    fn peer_send_outcome_round_trips_and_is_derived() {
+        use crate::agent::world::replay::is_exogenous;
+        use crate::agent::world::world::PeerId;
+
+        let peer = PeerId {
+            app_id: "2026-01-01-00-00-00-000000-000000-UTC".into(),
+            node_id: "node-d".into(),
+        };
+        let input = LogicalInput::PeerSendOutcome {
+            cmd: 99,
+            entity: 1,
+            fingerprint: Fingerprint("fp-peer-send-99".into()),
+            to: peer.clone(),
+            outcome: DeliveryOutcome::Delivered,
+        };
+        // Exhaustive destructure — proves the exact fields: cmd, entity,
+        // fingerprint, to, outcome (no extras).
+        let LogicalInput::PeerSendOutcome {
+            cmd,
+            entity,
+            fingerprint,
+            to,
+            outcome,
+        } = &input
+        else {
+            panic!("expected PeerSendOutcome");
+        };
+        assert_eq!(*cmd, 99);
+        assert_eq!(*entity, 1);
+        assert_eq!(fingerprint.0, "fp-peer-send-99");
+        assert_eq!(to, &peer);
+        assert_eq!(*outcome, DeliveryOutcome::Delivered);
+
+        round_trip(&wrap(input.clone()));
+        // DERIVED: not exogenous.
+        assert!(
+            !is_exogenous(&input),
+            "PeerSendOutcome must be DERIVED (the sender's SendPeer ack, fingerprinted)"
+        );
+
+        // All three DeliveryOutcome variants round-trip.
+        for outcome in [DeliveryOutcome::Delivered, DeliveryOutcome::Queued, DeliveryOutcome::Rejected] {
+            round_trip(&wrap(LogicalInput::PeerSendOutcome {
+                cmd: 100,
+                entity: 1,
+                fingerprint: Fingerprint("fp-100".into()),
+                to: PeerId {
+                    app_id: "app-x".into(),
+                    node_id: "node-x".into(),
+                },
+                outcome,
+            }));
+        }
+    }
+
+    // --- DurableEnvelope — broker's fsync record (id + payload + auth) ----
+
+    /// `DurableEnvelope` round-trips through canonical JSON for both payload
+    /// variants (`Drive` and `Message`) and proves the type carries exactly
+    /// the id+payload+auth shape the broker fsync-records before delivery
+    /// (docs/agent/world/ecs-runtime.md §"Durable peer delivery").
+    #[test]
+    fn durable_envelope_round_trips_for_drive_and_message_payloads() {
+        use crate::agent::world::world::PeerId;
+
+        let sender = PeerId {
+            app_id: "2026-01-01-00-00-00-000000-000000-UTC".into(),
+            node_id: "node-send".into(),
+        };
+        let receiver = PeerId {
+            app_id: "2026-06-28-00-00-00-000000-000000-UTC".into(),
+            node_id: "node-recv".into(),
+        };
+
+        // Drive variant — surface ops + optional prompt.
+        let drive_env = DurableEnvelope {
+            id: PeerEnvelopeId::new(&sender.app_id, &sender.node_id, 1),
+            payload: PeerPayload::Drive(DriveCommand {
+                surface_ops: vec![SurfaceOp::Click {
+                    surface: 1,
+                    element: 3,
+                    point: None,
+                    base_version: None,
+                }],
+                prompt: Some("please confirm".into()),
+            }),
+            auth: Authorization {
+                from: sender.clone(),
+                token: "tok-drive".into(),
+            },
+        };
+        let json = serde_json::to_string(&drive_env).expect("serialise drive envelope");
+        let back: DurableEnvelope = serde_json::from_str(&json).expect("deserialise drive envelope");
+        assert_eq!(drive_env, back);
+
+        // Message variant — generic JSON payload.
+        let msg_env = DurableEnvelope {
+            id: PeerEnvelopeId::new(&sender.app_id, &sender.node_id, 2),
+            payload: PeerPayload::Message(serde_json::json!({ "text": "hello" })),
+            auth: Authorization {
+                from: receiver.clone(),
+                token: "tok-msg".into(),
+            },
+        };
+        let json2 = serde_json::to_string(&msg_env).expect("serialise message envelope");
+        let back2: DurableEnvelope = serde_json::from_str(&json2).expect("deserialise message envelope");
+        assert_eq!(msg_env, back2);
+
+        // Stability: re-constructing the same id for the same seq is identical.
+        let id_a = PeerEnvelopeId::new(&sender.app_id, &sender.node_id, 1);
+        let id_b = PeerEnvelopeId::new(&sender.app_id, &sender.node_id, 1);
+        assert_eq!(id_a, id_b, "PeerEnvelopeId is stable across reconstructions");
     }
 
     // Suppress unused-import warnings for types that appear in doc-tests but

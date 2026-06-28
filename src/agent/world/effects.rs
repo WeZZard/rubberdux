@@ -24,14 +24,20 @@ use sha2::{Digest, Sha256};
 use super::autonomy::{AgentInteraction, HumanAction, Notify};
 use super::event_log::EventLog;
 use super::history::{Block, History, MessageBuilder, ToolSchema};
-use super::inputs::{CancelReason, Event, Fingerprint, LogicalInput, ModelError, ModelMeta, Origin};
+use super::inputs::{
+    CancelReason, DeliveryOutcome, Event, Fingerprint, LogicalInput, ModelError, ModelMeta, Origin,
+    PeerPayload,
+};
 use super::lifecycle::{ActorCtx, AppId, EffectId, EffectKind, IdempotencyKey, LifecycleEvent};
 use super::model_client::MessagesClient;
 use super::surface::{
-    SurfaceOp, SurfaceView, fingerprint_ui_request, perceived_for_ops, set_value_tool_schema,
+    PeerEnvelopeId, SurfaceOp, fingerprint_ui_request, perceived_for_ops, set_value_tool_schema,
     surface_tool_result,
 };
-use super::world::{CmdId, EdgeId, EntityId, ModelConfig, ReqId, Tick, Timestamp};
+use super::world::{
+    Activity, CmdId, EdgeId, EntityId, ModelConfig, PeerId, ReqId, SlotKind, SlotState, Tick,
+    Timestamp, World,
+};
 use crate::error::Error;
 
 /// A tool name, matching the `name` field of a `Block::ToolUse` block.
@@ -103,6 +109,22 @@ pub enum Command {
     /// Abort a pending `RequestHumanAction`. No `key` — idempotent.
     /// Dual: `HumanActionAborted`.
     AbortHumanAction { cmd: CmdId },
+
+    /// Send a message or drive command to a peer App process. The sender's
+    /// local delivery ack is recorded as `PeerSendOutcome` — the ONLY dual of
+    /// this Command. The receiver-side `DriveRequested`/`PeerDelivered` are
+    /// EXOGENOUS inputs on the OTHER World, not duals of this Command (the
+    /// per-`cmd` fingerprint does not cross the process boundary — see Theme 4b).
+    /// `key` enables crash-resume dedup; the downstream dedupes by key on
+    /// re-dispatch (effectively-once = at-least-once + idempotency).
+    /// Dual: `PeerSendOutcome`.
+    /// See docs/agent/world/ecs-runtime.md §645.
+    SendPeer {
+        cmd: CmdId,
+        to: PeerId,
+        payload: PeerPayload,
+        key: CommandKey,
+    },
 
     /// Raise an agent-facing interaction (e.g. an approval dialog). Deduped by
     /// the stable `request_id` so no separate `key` is needed.
@@ -214,6 +236,28 @@ pub fn fingerprint_compact(
     Ok(Fingerprint(hex::encode(digest)))
 }
 
+/// Compute the canonical request `Fingerprint` for a `SendPeer`: a SHA-256 over the
+/// deterministically-serialized `(to, payload)` of the outbound drive — the peer
+/// address and the cross-World payload. The same content-addressed discipline as
+/// `fingerprint_call`/`fingerprint_compact`: an identical send hashes identically
+/// across processes and runs, so the recorded `PeerSendOutcome` is reused on replay
+/// ONLY while the re-emitted send re-hashes to it (Inv 7), and the value doubles as
+/// the sender-assigned, retry-stable delivery envelope id (effectively-once =
+/// at-least-once + idempotency-by-envelope-id). See docs/agent/world/ecs-runtime.md
+/// (Content-addressed replay; SendPeer↔PeerSendOutcome; Theme 4b).
+pub fn fingerprint_peer(to: &PeerId, payload: &PeerPayload) -> Result<Fingerprint, Error> {
+    /// The exact, fixed-order payload that is hashed.
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        to: &'a PeerId,
+        payload: &'a PeerPayload,
+    }
+
+    let bytes = serde_json::to_vec(&Payload { to, payload })?;
+    let digest = Sha256::digest(&bytes);
+    Ok(Fingerprint(hex::encode(digest)))
+}
+
 // ---------------------------------------------------------------------------
 // Tool resolution — a CallModel's ToolSet names → their Anthropic declarations
 // ---------------------------------------------------------------------------
@@ -282,6 +326,57 @@ pub trait SurfaceDriver {
 }
 
 // ---------------------------------------------------------------------------
+// PeerSender — the peer-drive sink the LIVE driver needs (stratum-2/live)
+// ---------------------------------------------------------------------------
+
+/// The peer-send capability the LIVE driver depends on, abstracted behind a trait
+/// so a test can inject a stand-in without the shell `PeerBroker`, exactly as
+/// `ModelCaller` abstracts the model call and `SurfaceDriver` the surface drive.
+/// When the live driver dispatches a `Command::SendPeer` it hands the destination
+/// `to`, the `payload`, the idempotency `key`, and the sender-assigned `envelope`
+/// to `send`, whose production impl wraps the shell `PeerBroker::relay`, mapping its
+/// `PeerRouteOutcome::{Delivered,Queued,Rejected}` to the `DeliveryOutcome` recorded
+/// in `PeerSendOutcome`. The send is a stratum-2/LIVE-only effect — the REPLAY
+/// driver takes NO `PeerSender` and never re-sends it (the recorded `PeerSendOutcome`
+/// already carries the outcome the fold reproduces). The real broker-backed impl is
+/// wired by the worker; here the trait is the seam. See
+/// docs/agent/world/ecs-runtime.md (§645; Theme 4b; the World↔broker boundary).
+pub trait PeerSender {
+    /// Route one outbound peer drive/message to the broker and return its delivery
+    /// `outcome`. Mirrors `SurfaceDriver::drive`: the live driver awaits it as the
+    /// real effect; a genuine routing failure propagates so the driver can record it.
+    fn send(
+        &self,
+        to: &PeerId,
+        payload: &PeerPayload,
+        key: &CommandKey,
+        envelope: &PeerEnvelopeId,
+    ) -> impl Future<Output = Result<DeliveryOutcome, Error>> + Send;
+}
+
+/// The placeholder `PeerSender` the production live driver routes `SendPeer` through
+/// until the worker wires the real `PeerBroker`-backed sender. It performs no
+/// delivery and reports every send `Queued` — parked for a peer not yet routable —
+/// so a `SendPeer` settles its `Peer` slot without error rather than stalling the
+/// tick. It is inert in practice: no production model is yet told the `drive_peer`
+/// tool exists, so no `SendPeer` is emitted to reach it. The worker replaces this
+/// with the broker wrapper that performs real, durable delivery. See
+/// docs/agent/world/ecs-runtime.md (the World↔broker boundary).
+pub struct UnattachedPeerSender;
+
+impl PeerSender for UnattachedPeerSender {
+    async fn send(
+        &self,
+        _to: &PeerId,
+        _payload: &PeerPayload,
+        _key: &CommandKey,
+        _envelope: &PeerEnvelopeId,
+    ) -> Result<DeliveryOutcome, Error> {
+        Ok(DeliveryOutcome::Queued)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ResultStamp — the envelope facts the Command does not carry
 // ---------------------------------------------------------------------------
 
@@ -343,23 +438,37 @@ pub struct ResultStamp {
 /// surface drive out the injected `surface_driver` sink (the LIVE-only effect) and
 /// appends a `ToolReturned` carrying the `{"surface_ops":[...]}` projection
 /// envelope and a UI-request `Fingerprint` that folds the perceived surface state
-/// (Inv 18). `surfaces` is the World's perceived `SurfaceView` (`Resources.surfaces`)
-/// the fingerprint reads so a re-emit diverges exactly when the manipulated surface
-/// changed (Theme 2b). The agent UI write's SOLE record is that one `ToolReturned`;
-/// the drive is never re-sent on replay (the REPLAY driver takes no `surface_driver`).
-pub async fn drive_live<C, S, L>(
+/// (Inv 18). The fingerprint reads the World's perceived `SurfaceView`
+/// (`world.resources.surfaces`) so a re-emit diverges exactly when the manipulated
+/// surface changed (Theme 2b). The agent UI write's SOLE record is that one
+/// `ToolReturned`; the drive is never re-sent on replay (the REPLAY driver takes no
+/// `surface_driver`).
+///
+/// A `Command::SendPeer` is routed here too: the live driver dispatches the drive
+/// through the injected `peer_sender` seam (the LIVE-only effect) and appends a
+/// `PeerSendOutcome` carrying the returned `DeliveryOutcome`. Its `entity` is read
+/// back from `world` — the SendPeer Command does NOT carry it (a send is addressed
+/// by `cmd`/`to`/`payload`/`key`) — by the `Peer` slot the emitting tick opened
+/// `Pending { cmd: Some(cmd) }`, so the recorded outcome routes back to settle that
+/// slot. `world` is also the source of the perceived `SurfaceView` the set_value
+/// fingerprint reads. See docs/agent/world/ecs-runtime.md (§645; Theme 4b).
+pub async fn drive_live<C, S, P, L>(
     commands: &[Command],
     stamp: ResultStamp,
-    surfaces: &SurfaceView,
+    world: &World,
     client: &C,
     surface_driver: &S,
+    peer_sender: &P,
     log: &mut L,
 ) -> Result<Vec<Event>, Error>
 where
     C: ModelCaller,
     S: SurfaceDriver,
+    P: PeerSender,
     L: EventLog,
 {
+    // The World's perceived surface view the UI-request fingerprint reads (Inv 18).
+    let surfaces = &world.resources.surfaces;
     let mut results = Vec::with_capacity(commands.len());
     // The intra-tick effect ordinal: the n-th EFFECTFUL Command this tick. Reset
     // per `drive_live` call (one call drives one tick's Commands).
@@ -524,6 +633,83 @@ where
                 log.append(&event)?;
                 results.push(event);
             }
+            // A `Command::SendPeer` routes one outbound peer drive/message to the
+            // shell broker via the injected `peer_sender` seam and records its
+            // delivery `outcome` as a `PeerSendOutcome` — the SOLE dual of `SendPeer`
+            // (Theme 4b). It uses the same write-ahead / log-before-apply / content-
+            // addressed-fingerprint discipline as `CallModel`; the receiver-side
+            // `DriveRequested`/`PeerDelivered` are EXOGENOUS inputs on the OTHER World,
+            // not produced here. See docs/agent/world/ecs-runtime.md (§645; Theme 4b).
+            Command::SendPeer {
+                cmd,
+                to,
+                payload,
+                key,
+            } => {
+                // Content-addressed over (to, payload): a re-emit re-hashes
+                // identically so replay reuses the recorded `PeerSendOutcome` (Inv 7).
+                let fingerprint = fingerprint_peer(to, payload)?;
+                // The SendPeer Command does not carry its `entity` (a send is
+                // addressed by cmd/to/payload/key); recover it from the `Peer` slot
+                // the emitting tick opened `Pending { cmd: Some(cmd) }` so the recorded
+                // outcome routes back to settle that slot (Inv 16).
+                let entity = entity_owning_peer_cmd(world, *cmd);
+                // The durable cmd → ctx index: a peer send serves the agent's turn
+                // (`origin = Agent`) on the relationship the turn serves (`edge`).
+                let ctx = ActorCtx {
+                    entity,
+                    origin: Origin::Agent,
+                    edge: stamp.edge,
+                };
+                let key_id = IdempotencyKey {
+                    app_id: AppId::default(),
+                    tick: stamp.at,
+                    effect_id,
+                };
+                // Write-ahead the dispatch-intent BEFORE acting (Inv 5). Neutral on
+                // replay; read only by resume, which re-dispatches `SendPeer` under
+                // the SAME key (the downstream dedupes — effectively-once).
+                let dispatched = LifecycleEvent::CommandDispatched {
+                    at: stamp.at,
+                    cmd: *cmd,
+                    kind: EffectKind::SendPeer,
+                    ctx,
+                    key: key_id,
+                    fingerprint: fingerprint.clone(),
+                };
+                log.append_lifecycle(&dispatched)?;
+                effect_id += 1;
+
+                // The sender-assigned, retry-stable delivery envelope id: a crash-
+                // resume re-dispatch of the SAME send carries the SAME id, so the
+                // receiver dedupes a redelivery (idempotency-by-envelope-id). Content-
+                // addressed over the send, like the fingerprint.
+                let envelope = PeerEnvelopeId(fingerprint.0.clone());
+
+                // The LIVE effect (stratum-2/live-only): route the drive to the broker.
+                // Replay NEVER re-sends it — the recorded `PeerSendOutcome` already
+                // carries the outcome the fold reproduces.
+                let outcome = peer_sender.send(to, payload, key, &envelope).await?;
+
+                let input = LogicalInput::PeerSendOutcome {
+                    cmd: *cmd,
+                    entity: ctx.entity,
+                    fingerprint,
+                    to: to.clone(),
+                    outcome,
+                };
+                // The wrapping Event inherits `origin`/`edge` from the same `ctx`.
+                let event = Event {
+                    origin: ctx.origin,
+                    edge: ctx.edge,
+                    at: stamp.at,
+                    wall: stamp.wall,
+                    input,
+                };
+                // Log-before-apply (Inv 4): durable BEFORE it is fed back.
+                log.append(&event)?;
+                results.push(event);
+            }
             // Other EFFECTFUL Commands (live dispatch arrives in later milestones)
             // still CONSUME an `effect_id` ordinal, so a `CallModel` emitted after
             // them keeps a stable intra-tick ordinal once their drivers land.
@@ -632,6 +818,29 @@ fn classify(error: &Error) -> ModelError {
     }
 }
 
+/// Recover the entity that owns an outbound `SendPeer` `cmd`: the entity whose
+/// `ResolvingToolUses` turn holds a `Peer` slot `Pending { cmd: Some(cmd) }`. The
+/// `SendPeer` Command does not carry its `entity` (a send is addressed by
+/// `cmd`/`to`/`payload`/`key`), so the live driver reads it back from the World the
+/// emitting tick left — where PeerDriveSystem recorded `cmd` in the slot (Inv 16) —
+/// to route the resulting `PeerSendOutcome` to settle that exact slot. Falls back to
+/// the World `root` if no slot matches, keeping the lookup total; in practice a
+/// `SendPeer` is only ever emitted for an open `Peer` slot, so the scan finds it.
+fn entity_owning_peer_cmd(world: &World, cmd: CmdId) -> EntityId {
+    world
+        .entities
+        .iter()
+        .find(|(_, components)| match &components.activity {
+            Activity::ResolvingToolUses { slots } => slots.iter().any(|slot| {
+                matches!(slot.kind, SlotKind::Peer)
+                    && matches!(slot.state, SlotState::Pending { cmd: Some(c) } if c == cmd)
+            }),
+            _ => false,
+        })
+        .map(|(id, _)| *id)
+        .unwrap_or(world.root)
+}
+
 // ---------------------------------------------------------------------------
 // REPLAY driver — discard the Command, stand in the logged result
 // ---------------------------------------------------------------------------
@@ -737,6 +946,25 @@ pub fn drive_replay(commands: &[Command], cursor: &mut ReplayCursor) -> Result<V
                     }
                 }
             }
+            // `SendPeer` is fingerprinted like `CallModel`: the replay driver reuses
+            // the logged `PeerSendOutcome` (the SOLE dual, Theme 4b) ONLY while the
+            // re-emitted send hashes identically to the recorded outcome's fingerprint
+            // (content-addressed replay, Inv 7) — so a recorded peer-drive branch
+            // settles its `Peer` slot on replay with ZERO live sends.
+            Command::SendPeer { to, payload, .. } => {
+                let emitted = fingerprint_peer(to, payload)?;
+                match cursor.next_result() {
+                    Some(event)
+                        if recorded_fingerprint(&event.input) == Some(&emitted) =>
+                    {
+                        out.push(Replayed::Reused(event));
+                    }
+                    _ => {
+                        out.push(Replayed::Diverged);
+                        break;
+                    }
+                }
+            }
             // `EmitLifecycle` is a stratum-2 observability record, neutral on
             // replay: DISCARD it so the replay fold stays byte-identical (the
             // World change it reports is already reproduced by the stratum-1 fold).
@@ -759,6 +987,8 @@ pub fn drive_replay(commands: &[Command], cursor: &mut ReplayCursor) -> Result<V
 /// in for. Only fingerprinted DERIVED variants qualify — the named non-
 /// fingerprinted exceptions (`ChildReturned`, `ToolAborted`, `HumanActionAborted`)
 /// are in-World identity-correlated results, not shell-dispatched effect results.
+/// `PeerSendOutcome` is DERIVED: it is the sender-local ack of `SendPeer`,
+/// fingerprinted for content-addressed replay (Theme 4b).
 fn is_derived_result(input: &LogicalInput) -> bool {
     matches!(
         input,
@@ -768,6 +998,7 @@ fn is_derived_result(input: &LogicalInput) -> bool {
             | LogicalInput::ToolReturned { .. }
             | LogicalInput::HumanActionDone { .. }
             | LogicalInput::Compacted { .. }
+            | LogicalInput::PeerSendOutcome { .. }
     )
 }
 
@@ -782,7 +1013,8 @@ fn recorded_fingerprint(input: &LogicalInput) -> Option<&Fingerprint> {
         | LogicalInput::InferenceCancelled { fingerprint, .. }
         | LogicalInput::ToolReturned { fingerprint, .. }
         | LogicalInput::HumanActionDone { fingerprint, .. }
-        | LogicalInput::Compacted { fingerprint, .. } => Some(fingerprint),
+        | LogicalInput::Compacted { fingerprint, .. }
+        | LogicalInput::PeerSendOutcome { fingerprint, .. } => Some(fingerprint),
         _ => None,
     }
 }
@@ -984,7 +1216,8 @@ fn result_cmd(input: &LogicalInput) -> Option<CmdId> {
         | LogicalInput::ToolAborted { cmd, .. }
         | LogicalInput::HumanActionDone { cmd, .. }
         | LogicalInput::HumanActionAborted { cmd, .. }
-        | LogicalInput::Compacted { cmd, .. } => Some(*cmd),
+        | LogicalInput::Compacted { cmd, .. }
+        | LogicalInput::PeerSendOutcome { cmd, .. } => Some(*cmd),
         _ => None,
     }
 }
@@ -997,7 +1230,7 @@ mod tests {
     use crate::agent::world::inputs::{
         Capabilities, Event, LogicalInput, ModelMeta, Origin, ReasoningPolicy, StopReason, Usage,
     };
-    use crate::agent::world::world::{Effort, ModelConfig};
+    use crate::agent::world::world::{Effort, ModelConfig, Resources};
 
     /// A model client that fails loudly if invoked. The replay driver takes NO
     /// client (it cannot make a call by construction, Inv 6); this stand-in makes
@@ -1009,6 +1242,52 @@ mod tests {
         async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
             panic!("the replay driver must never invoke the model client");
         }
+    }
+
+    /// A `PeerSender` that fails loudly if invoked — the peer-seam analogue of
+    /// `ExplodingClient`. The model-path and surface-path tests carry NO `SendPeer`,
+    /// so the seam must never be reached; were a drive to route here, this panics.
+    struct ExplodingPeerSender;
+
+    impl PeerSender for ExplodingPeerSender {
+        async fn send(
+            &self,
+            _to: &PeerId,
+            _payload: &PeerPayload,
+            _key: &CommandKey,
+            _envelope: &PeerEnvelopeId,
+        ) -> Result<DeliveryOutcome, Error> {
+            panic!("no SendPeer in this drive; the peer seam must not be reached");
+        }
+    }
+
+    /// A `PeerSender` returning a SCRIPTED `DeliveryOutcome`, so the SendPeer-arm test
+    /// asserts the recorded `PeerSendOutcome` carries exactly what the broker reported.
+    /// It also CAPTURES the `(to, envelope)` it was handed so the test can assert the
+    /// drive was addressed and the content-addressed envelope minted.
+    struct ScriptedPeerSender {
+        outcome: DeliveryOutcome,
+        seen: std::sync::Mutex<Option<(PeerId, PeerEnvelopeId)>>,
+    }
+
+    impl PeerSender for ScriptedPeerSender {
+        async fn send(
+            &self,
+            to: &PeerId,
+            _payload: &PeerPayload,
+            _key: &CommandKey,
+            envelope: &PeerEnvelopeId,
+        ) -> Result<DeliveryOutcome, Error> {
+            *self.seen.lock().expect("lock seen") = Some((to.clone(), envelope.clone()));
+            Ok(self.outcome)
+        }
+    }
+
+    /// A trivial World whose perceived surface view is empty — the `&World` the
+    /// model-path and empty-surface `drive_live` tests pass where they previously
+    /// passed `&SurfaceView::new()` (the only thing those drives read from it).
+    fn empty_world() -> World {
+        World::new(0, Resources::new(7, sample_params()))
     }
 
     fn sample_params() -> ModelConfig {
@@ -1265,9 +1544,10 @@ mod tests {
         let results = drive_live(
             &[command],
             stamp,
-            &SurfaceView::new(),
+            &empty_world(),
             &StubClient,
             &CapturingSurfaceDriver::default(),
+            &ExplodingPeerSender,
             &mut log,
         )
         .await
@@ -1373,9 +1653,10 @@ mod tests {
         let results = drive_live(
             &[command],
             stamp,
-            &SurfaceView::new(),
+            &empty_world(),
             &ExplodingClient,
             &sink,
+            &ExplodingPeerSender,
             &mut log,
         )
         .await
@@ -1485,6 +1766,7 @@ mod tests {
                 budget: Budget::default(),
                 inbox: Inbox::default(),
                 turns: 0,
+                spawned: 0,
                 model: None,
             },
         );
@@ -1565,9 +1847,10 @@ mod tests {
         let results = drive_live(
             std::slice::from_ref(&run_tool),
             stamp,
-            &SurfaceView::new(),
+            &empty_world(),
             &ExplodingClient,
             &sink,
+            &ExplodingPeerSender,
             &mut log,
         )
         .await
@@ -1585,6 +1868,140 @@ mod tests {
         assert!(
             matches!(results[0].input, LogicalInput::ToolReturned { .. }),
             "the executor records a ToolReturned for the accepted args"
+        );
+    }
+
+    /// [PA-drive-live / VC-3.2] Driving a `Command::SendPeer` through the LIVE driver
+    /// (1) routes the drive to the injected `PeerSender` seam (addressed to the decoded
+    /// peer, with a content-addressed envelope), and (2) records the seam's returned
+    /// `DeliveryOutcome` as a `PeerSendOutcome` whose `entity` is read back from the
+    /// `Peer` slot the emitting tick opened — so the PeerDriveSystem settles that slot.
+    /// The model client is NEVER reached (`ExplodingClient`), and the `SendPeer`
+    /// dispatch-intent is write-ahead'd in stratum-2 (Inv 5).
+    #[tokio::test]
+    async fn live_driver_dispatches_send_peer_and_records_peer_send_outcome() {
+        use crate::agent::world::budget::Budget;
+        use crate::agent::world::gates::EntityGate;
+        use crate::agent::world::inputs::DriveCommand;
+        use crate::agent::world::world::{Components, Identity, Inbox, Lineage, ToolSlot};
+
+        // The owning entity is id 5 (NOT the World root 0), so a correct entity
+        // recovery is provably the slot scan, not the root fallback. Its Peer slot is
+        // `Pending { cmd: Some(7) }` — the shape PeerDriveSystem leaves after emitting.
+        let mut world = empty_world();
+        world.entities.insert(
+            5,
+            Components {
+                identity: Identity::Primary,
+                lineage: Lineage { parent: None, depth: 0 },
+                history: History::default(),
+                activity: Activity::ResolvingToolUses {
+                    slots: vec![ToolSlot {
+                        tool_use_id: "tu_peer".into(),
+                        ordinal: 0,
+                        kind: SlotKind::Peer,
+                        state: SlotState::Pending { cmd: Some(7) },
+                        result: None,
+                    }],
+                },
+                gate: EntityGate::default(),
+                budget: Budget::default(),
+                inbox: Inbox::default(),
+                turns: 0,
+                spawned: 0,
+                model: None,
+            },
+        );
+
+        let to = PeerId {
+            app_id: "app-b".into(),
+            node_id: "n1".into(),
+        };
+        let payload = PeerPayload::Drive(DriveCommand {
+            surface_ops: Vec::new(),
+            prompt: Some("drive the peer".into()),
+        });
+        let command = Command::SendPeer {
+            cmd: 7,
+            to: to.clone(),
+            payload: payload.clone(),
+            key: CommandKey,
+        };
+        let stamp = ResultStamp {
+            edge: 4,
+            app_edge: 1,
+            at: 9,
+            wall: Some(1_700_000_000),
+        };
+        let mut log = MemoryEventLog::new();
+        let peer_sender = ScriptedPeerSender {
+            outcome: DeliveryOutcome::Delivered,
+            seen: std::sync::Mutex::new(None),
+        };
+
+        let results = drive_live(
+            &[command],
+            stamp,
+            &world,
+            &ExplodingClient,
+            &CapturingSurfaceDriver::default(),
+            &peer_sender,
+            &mut log,
+        )
+        .await
+        .expect("drive_live dispatches the SendPeer");
+
+        // (1) The drive was routed to the seam, addressed to the decoded peer, with a
+        // content-addressed envelope id derived from the send's fingerprint.
+        let expected_fp = fingerprint_peer(&to, &payload).expect("fingerprint");
+        let (seen_to, seen_env) = peer_sender
+            .seen
+            .lock()
+            .expect("lock seen")
+            .clone()
+            .expect("the peer seam was reached exactly once");
+        assert_eq!(seen_to, to, "the SendPeer is routed to the decoded peer");
+        assert_eq!(
+            seen_env,
+            PeerEnvelopeId(expected_fp.0.clone()),
+            "the envelope is the content-addressed, retry-stable send id"
+        );
+
+        // (2) One PeerSendOutcome recorded: entity recovered from the slot (5, not the
+        // root 0), correlated by cmd, carrying the seam's outcome and the send fingerprint.
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        assert_eq!(result.origin, Origin::Agent, "origin inherited from ctx");
+        assert_eq!(result.edge, 4, "the PeerSendOutcome routes on the turn's edge (stamp.edge)");
+        match &result.input {
+            LogicalInput::PeerSendOutcome {
+                cmd,
+                entity,
+                fingerprint,
+                to: out_to,
+                outcome,
+            } => {
+                assert_eq!(*cmd, 7, "correlates back to the dispatched SendPeer cmd");
+                assert_eq!(*entity, 5, "entity recovered from the Peer slot, NOT the root fallback");
+                assert_eq!(fingerprint, &expected_fp, "carries the content-addressed send fingerprint");
+                assert_eq!(out_to, &to, "carries the peer it was addressed to");
+                assert_eq!(*outcome, DeliveryOutcome::Delivered, "records exactly the seam's outcome");
+            }
+            other => panic!("expected PeerSendOutcome, got {other:?}"),
+        }
+
+        // Log-before-apply (Inv 4): the PeerSendOutcome is durable in stratum-1, and
+        // the SendPeer dispatch-intent is write-ahead'd in stratum-2 (Inv 5).
+        assert_eq!(log.load().expect("load").len(), 1, "one PeerSendOutcome appended");
+        assert!(
+            matches!(
+                log.load_lifecycle().expect("load lifecycle").as_slice(),
+                [LifecycleEvent::CommandDispatched {
+                    kind: EffectKind::SendPeer,
+                    ..
+                }]
+            ),
+            "the SendPeer dispatch-intent is write-ahead'd in stratum-2"
         );
     }
 
@@ -1648,9 +2065,10 @@ mod tests {
         drive_live(
             &[surface_call],
             stamp,
-            &SurfaceView::new(),
+            &empty_world(),
             &client,
             &CapturingSurfaceDriver::default(),
+            &ExplodingPeerSender,
             &mut log,
         )
         .await
@@ -1688,9 +2106,10 @@ mod tests {
         drive_live(
             &[plain_call],
             stamp,
-            &SurfaceView::new(),
+            &empty_world(),
             &plain_client,
             &CapturingSurfaceDriver::default(),
+            &ExplodingPeerSender,
             &mut plain_log,
         )
         .await
@@ -2033,6 +2452,7 @@ mod tests {
                 budget: crate::agent::world::budget::Budget::default(),
                 inbox: crate::agent::world::world::Inbox::default(),
                 turns: 0,
+                spawned: 0,
                 model: None,
             },
         );

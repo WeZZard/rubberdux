@@ -156,10 +156,13 @@ fn begin_resolving_tool_uses(world: &World, entity: &EntityId, blocks: &[Block])
 ///   minted HERE so the slot's identity is fixed before the child is spawned (Inv 16);
 ///   ONLY a spawn block draws an entity id — every other kind leaves `ids` untouched.
 /// - `"ask_human"` → `Human` (HumanActionSystem emits `RequestHumanAction`).
+/// - `"drive_peer"` → `Peer` (PeerDriveSystem emits `Command::SendPeer`). The slot
+///   carries no entity id — a peer drive is addressed by the `to`/`payload` on the
+///   `drive_peer` block, resolved against another World, not a child minted here.
 /// - Everything else → `Local` (ToolSystem emits `RunTool`).
 ///
-/// EXTENSION POINT: when PeerDriveSystem lands, route a peer-drive block → `Peer`
-/// here. See docs/agent/world/ecs-runtime.md (TurnSystem `ModelResponded·ToolUse`).
+/// See docs/agent/world/ecs-runtime.md (TurnSystem `ModelResponded·ToolUse`;
+/// PeerDriveSystem; `SlotKind::Peer`).
 fn classify_slot_kind(block: &Block, ids: &mut IdAlloc) -> SlotKind {
     match block {
         Block::ToolUse { name, .. } if is_subagent_spawn(name) => {
@@ -168,6 +171,10 @@ fn classify_slot_kind(block: &Block, ids: &mut IdAlloc) -> SlotKind {
             SlotKind::Child(child)
         }
         Block::ToolUse { name, .. } if name == "ask_human" => SlotKind::Human,
+        // A `drive_peer` tool use opens a `Peer` slot the PeerDriveSystem owns: it
+        // reads the slot's `drive_peer` block for the `to`/`payload`, emits one
+        // `Command::SendPeer`, and settles the slot by `PeerSendOutcome` (Inv 16).
+        Block::ToolUse { name, .. } if name == "drive_peer" => SlotKind::Peer,
         _ => SlotKind::Local,
     }
 }
@@ -176,4 +183,44 @@ fn classify_slot_kind(block: &Block, ids: &mut IdAlloc) -> SlotKind {
 /// `"spawn_subagent"` and the Claude-style `"task"` alias map to a `Child` slot.
 fn is_subagent_spawn(name: &str) -> bool {
     name == "spawn_subagent" || name == "task"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool_use(name: &str) -> Block {
+        Block::ToolUse {
+            id: "tu".into(),
+            name: name.into(),
+            input: serde_json::json!({}),
+        }
+    }
+
+    /// VC-3.2 routing: a `drive_peer` tool use opens a `Peer` slot — activating the
+    /// PeerDriveSystem's OUTBOUND path — and mints NO entity id (unlike a sub-agent
+    /// spawn, a peer drive is addressed against another World, not a child here).
+    #[test]
+    fn drive_peer_block_routes_to_a_peer_slot_without_minting_an_entity() {
+        let mut ids = IdAlloc::default();
+        let before = ids;
+        let kind = classify_slot_kind(&tool_use("drive_peer"), &mut ids);
+        assert_eq!(kind, SlotKind::Peer, "a drive_peer tool use opens a Peer slot");
+        assert_eq!(ids, before, "only a spawn mints an id; a Peer slot leaves `ids` untouched");
+    }
+
+    /// The sibling classifications are unchanged by the new arm: a spawn mints a
+    /// child, `ask_human` is a Human slot, any other tool is a Local slot.
+    #[test]
+    fn sibling_tool_uses_keep_their_existing_classification() {
+        let mut ids = IdAlloc::default();
+        assert!(matches!(
+            classify_slot_kind(&tool_use("spawn_subagent"), &mut ids),
+            SlotKind::Child(_)
+        ));
+        let mut ids = IdAlloc::default();
+        assert_eq!(classify_slot_kind(&tool_use("ask_human"), &mut ids), SlotKind::Human);
+        let mut ids = IdAlloc::default();
+        assert_eq!(classify_slot_kind(&tool_use("set_value"), &mut ids), SlotKind::Local);
+    }
 }

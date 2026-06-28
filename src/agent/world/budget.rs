@@ -58,9 +58,11 @@ pub struct Limits {
     /// docs/agent/world/ecs-runtime.md (Loop guard — bound the tool/turn loop).
     #[serde(default)]
     pub loop_cap: u32,
-    /// Max LIVE direct sub-agents an entity may hold before a further spawn is DENIED
-    /// inline with an `is_error` `ToolResult` (Inv 10), like the depth cap; `0` ⇒
-    /// unbounded. Checked against the entity's live-child count (SubagentSystem). See
+    /// Max sub-agents an entity may EVER spawn (cumulative) before a further spawn is
+    /// DENIED inline with an `is_error` `ToolResult` (Inv 10), like the depth cap; `0`
+    /// ⇒ unbounded. Checked against the CUMULATIVE `Components.spawned` counter — bumped
+    /// on each successful spawn and NEVER decremented on child completion — so a finished
+    /// child does NOT refund budget (SubagentSystem). See
     /// docs/agent/world/ecs-runtime.md (Fan-out budget — bound sub-agent spawning).
     #[serde(default)]
     pub fanout_cap: u32,

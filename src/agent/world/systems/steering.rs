@@ -184,6 +184,7 @@ mod tests {
                 budget: Budget::default(),
                 inbox: Inbox::default(),
                 turns: 0,
+                spawned: 0,
                 model: None,
             },
         );
@@ -544,11 +545,12 @@ mod tests {
     /// reached. (Inv 11.)
     #[tokio::test]
     async fn inbox_overflow_emits_message_dropped_on_the_live_driver_path() {
-        use crate::agent::world::effects::{ModelCaller, ResultStamp, SurfaceDriver, drive_live};
+        use crate::agent::world::effects::{
+            drive_live, ModelCaller, ResultStamp, SurfaceDriver, UnattachedPeerSender,
+        };
         use crate::agent::world::event_log::{EventLog, MemoryEventLog};
         use crate::agent::world::inputs::ModelMeta;
         use crate::agent::world::lifecycle::{DropReason, LifecycleEvent};
-        use crate::agent::world::surface::SurfaceView;
         use crate::error::Error;
 
         /// A model client that must never be invoked: a steering overflow emits ONLY
@@ -613,9 +615,10 @@ mod tests {
         let results = drive_live(
             &commands,
             stamp,
-            &SurfaceView::new(),
+            &world,
             &NoCallClient,
             &NoSurfaceDrive,
+            &UnattachedPeerSender,
             &mut log,
         )
         .await
