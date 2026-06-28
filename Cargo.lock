@@ -6313,6 +6313,7 @@ dependencies = [
  "dirs",
  "dotenvy",
  "hex",
+ "rubberdux",
  "sha2",
  "time",
  "tokio",

@@ -26,6 +26,10 @@
 mod live_gate;
 
 mod app {
+    #[path = "counterfactual_branch_live.rs"]
+    pub mod counterfactual_branch_live;
+    #[path = "session_resume.rs"]
+    pub mod session_resume;
     #[path = "surface_drive.rs"]
     pub mod surface_drive;
     #[path = "surface_mixed_replay.rs"]
@@ -74,8 +78,23 @@ fn main() {
     let want_modes = case == "modes" || args.iter().any(|a| a.contains("surface_modes"));
     let want_mixed_replay =
         case == "mixed_replay" || args.iter().any(|a| a.contains("surface_mixed_replay"));
+    // The VC-1.2 counterfactual-replay LIVE half (`app::counterfactual_branch_live`):
+    // selected by `RUBBERDUX_SYSTEM_E2E_CASE=counterfactual_branch_live` or a matching
+    // test filter. It needs no surface/macOS harness — a pure CallModel branch flip.
+    let want_counterfactual = case == "counterfactual_branch_live"
+        || args.iter().any(|a| a.contains("counterfactual_branch_live"));
+    // The VC-4.1 session-resume case (`app::session_resume`): selected by
+    // `RUBBERDUX_SYSTEM_E2E_CASE=session_resume` or a matching test filter. Like
+    // the counterfactual case it needs no surface/macOS harness — it drives the
+    // worker's resume path (`WorldDriver::open` over the latest session) in-process.
+    let want_session_resume =
+        case == "session_resume" || args.iter().any(|a| a.contains("session_resume"));
 
-    if want_mixed_replay {
+    if want_counterfactual {
+        runtime.block_on(app::counterfactual_branch_live::run());
+    } else if want_session_resume {
+        runtime.block_on(app::session_resume::run());
+    } else if want_mixed_replay {
         runtime.block_on(app::surface_mixed_replay::run());
     } else if want_modes {
         runtime.block_on(app::surface_modes::run());

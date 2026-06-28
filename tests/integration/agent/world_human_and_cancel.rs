@@ -33,11 +33,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde_json::Value as Json;
 
 use rubberdux::agent::world::autonomy::{Autonomy, InteractionResponse};
-use rubberdux::agent::world::effects::{
-    Command, ModelCaller, ReplayCursor, Replayed, drive_replay, fingerprint_call,
-};
+use rubberdux::agent::world::effects::{Command, ModelCaller, fingerprint_call};
 use rubberdux::agent::world::gates::{EntityGate, PauseReason};
 use rubberdux::agent::world::history::{Block, History, Role};
+use rubberdux::agent::world::replay;
 use rubberdux::agent::world::inputs::{
     Capabilities, Event, Fingerprint, HumanResult, LogicalInput, ModelMeta, Origin, ReasoningPolicy,
     StopReason, Usage,
@@ -78,14 +77,7 @@ fn genesis(seed: u64, model: &ModelConfig) -> World {
 }
 
 fn genesis_from_log(events: &[Event], model: &ModelConfig) -> Result<World, Error> {
-    let seed = events
-        .iter()
-        .find_map(|e| match &e.input {
-            LogicalInput::SessionStarted { seed, .. } => Some(*seed),
-            _ => None,
-        })
-        .ok_or_else(|| Error::World("recorded log has no SessionStarted header".into()))?;
-    Ok(genesis(seed, model))
+    replay::genesis_from_log(events, |seed| genesis(seed, model))
 }
 
 fn offline_model() -> ModelConfig {
@@ -112,68 +104,23 @@ impl ModelCaller for ExplodingClient {
 
 /// The canonical ("live") World: re-apply every recorded Event through `tick`.
 fn fold_log(events: &[Event], model: &ModelConfig) -> Result<World, Error> {
-    let mut world = genesis_from_log(events, model)?;
-    for ev in events {
-        let (next, _commands) = tick(&world, ev);
-        world = next;
-    }
-    Ok(world)
+    Ok(replay::fold_log(genesis_from_log(events, model)?, events))
 }
 
-/// Whether an input is a model-call RESULT the replay driver stands in for via the
-/// `ReplayCursor`. Every OTHER recorded input — the exogenous free variables (incl. a
-/// mid-run `UserMessage`, `Pause`/`Resume`, `Cancel`, `SetAutonomy`, `InteractionAnswer`)
-/// AND the non-model results (`ToolReturned`, `ToolAborted`, `HumanActionDone`) — is
-/// re-applied directly by the loop, exactly as crash-resume re-applies a recorded Input.
-fn is_model_call_result(input: &LogicalInput) -> bool {
-    matches!(
-        input,
-        LogicalInput::ModelResponded { .. }
-            | LogicalInput::ModelFailed { .. }
-            | LogicalInput::InferenceCancelled { .. }
-    )
-}
-
-/// Replay under the cursor-driven driver. The `ReplayCursor` is built over the model-call
-/// results ALONE, so a continuation `CallModel` re-emitted after a `ToolReturned` /
-/// `HumanActionDone` pulls the NEXT `ModelResponded` from the cursor — never a tool/human
-/// result. A `Diverged` outcome is a replay failure.
+/// Replay under the promoted cursor-driven driver (`replay::replay_world`). The
+/// `ReplayCursor` stands in for the model-call results ALONE
+/// (`replay::is_model_call_result`), so a continuation `CallModel` re-emitted after a
+/// `ToolReturned` / `HumanActionDone` pulls the NEXT `ModelResponded` from the cursor —
+/// never a tool/human result. Every OTHER recorded input — the exogenous free variables
+/// (a mid-run `UserMessage`, `Pause`/`Resume`, `Cancel`, `SetAutonomy`,
+/// `InteractionAnswer`) AND the non-model results (`ToolReturned`, `ToolAborted`,
+/// `HumanActionDone`) — is re-applied directly. A `Diverged` outcome is a replay failure.
 fn replay_log(events: &[Event], model: &ModelConfig) -> Result<World, Error> {
-    let mut world = genesis_from_log(events, model)?;
-    let model_results: Vec<Event> = events
-        .iter()
-        .filter(|e| is_model_call_result(&e.input))
-        .cloned()
-        .collect();
-    let mut cursor = ReplayCursor::new(&model_results);
-
-    for ev in events.iter().filter(|e| !is_model_call_result(&e.input)) {
-        let (next, mut commands) = tick(&world, ev);
-        world = next;
-
-        while !commands.is_empty() {
-            let replayed = drive_replay(&commands, &mut cursor)?;
-            commands = Vec::new();
-            for outcome in replayed {
-                match outcome {
-                    Replayed::Reused(event) => {
-                        let (next, mut cmds) = tick(&world, &event);
-                        world = next;
-                        commands.append(&mut cmds);
-                    }
-                    Replayed::Diverged => {
-                        return Err(Error::World(
-                            "replay diverged: a re-emitted request did not match the \
-                             recorded result, but a faithful replay must reuse every result"
-                                .into(),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(world)
+    replay::replay_world(
+        genesis_from_log(events, model)?,
+        events,
+        replay::is_model_call_result,
+    )
 }
 
 /// Stamp each model-call result's `fingerprint` with the value the LIVE driver would have

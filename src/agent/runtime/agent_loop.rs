@@ -59,6 +59,10 @@ pub struct AgentLoopConfig {
     pub cancel: CancellationToken,
     pub compaction: Box<dyn CompactionStrategy>,
     pub context_tx: Option<broadcast::Sender<ContextEvent>>,
+    /// Channel processors keyed by channel name. Present only in a host build
+    /// because `crate::channel::processor::ChannelProcessor` is gated behind the
+    /// `host` feature; an agent-only build has no channel surface to drive.
+    #[cfg(feature = "host")]
     pub channel_processors: HashMap<String, Arc<dyn crate::channel::processor::ChannelProcessor>>,
     pub guardrails: crate::guardrail::GuardrailChain,
 }
@@ -100,7 +104,8 @@ pub struct AgentLoop {
     // Task tracking
     active_groups: TaskGroupSet,
 
-    // Channel processors
+    // Channel processors — host-only; see `AgentLoopConfig::channel_processors`.
+    #[cfg(feature = "host")]
     channel_processors: HashMap<String, Arc<dyn crate::channel::processor::ChannelProcessor>>,
 
     // Compaction
@@ -190,6 +195,7 @@ impl AgentLoop {
             context_tx,
             entry_notify_tx,
             active_groups: TaskGroupSet::new(),
+            #[cfg(feature = "host")]
             channel_processors: config.channel_processors,
             compaction: config.compaction,
             guardrails: config.guardrails,
@@ -601,6 +607,9 @@ impl AgentLoop {
                 }
 
                 // Passed or Repaired: run channel processor and proceed normally.
+                // Outbound channel processing exists only in a host build; an
+                // agent-only build has no `channel_processors` field to consult.
+                #[cfg(feature = "host")]
                 if let EntryOrigin::User { ref channel } = self.current_origin {
                     if let Some(processor) = self.channel_processors.get(channel) {
                         if let Some(ref metadata) = self.current_channel_metadata {
@@ -641,6 +650,8 @@ impl AgentLoop {
                 prompt_tokens,
                 completion_tokens,
             } => {
+                // Host-only outbound channel processing; see the `Text` arm above.
+                #[cfg(feature = "host")]
                 if let EntryOrigin::User { ref channel } = self.current_origin {
                     if let Some(processor) = self.channel_processors.get(channel) {
                         if let Some(ref metadata) = self.current_channel_metadata {

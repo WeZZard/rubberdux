@@ -32,6 +32,7 @@ use crate::agent::world::effects::{Command, SurfaceDriver};
 use crate::agent::world::event_log::FilesystemEventLog;
 use crate::agent::world::inputs::LogicalInput;
 use crate::agent::world::model_client::MessagesClient;
+use crate::agent::world::snapshot::SnapshotStore;
 use crate::agent::world::surface::{classify_native_signal, IdempotencyKey, NativeSignal, SurfaceOp};
 use crate::agent::world::world::{Effort, ModelConfig};
 use crate::error::Error;
@@ -87,19 +88,9 @@ async fn run_app_worker_inner(
     // model calls the LIVE driver dispatches. See docs/agent/world/ecs-runtime.md.
     let client = MessagesClient::from_env()?;
     let model = world_model_config(client.model());
-
-    let (session_id, session_dir) = session_manager
-        .create_session(client.model().to_owned())
-        .map_err(|e| Error::App(format!("create session for App `{app_id}`: {e}")))?;
-
-    // The World's append-only event log lives under the session directory: the
-    // single source of truth the driver appends to log-before-apply (Inv 4/9).
-    // Its stratum-2 sibling (`<name>.lifecycle.jsonl`) travels alongside it.
-    let event_log = FilesystemEventLog::new(session_dir.join("world-events.jsonl"));
-    // A deterministic per-session RNG seed: the World's sole randomness source
-    // crosses the recorded `SessionStarted` boundary so a replay reseeds
-    // identically (Inv 8/9). Derived purely from the App + session ids.
-    let seed = seed_from_session(app_id, &session_id);
+    // The model alias recorded into a fresh session's metadata, captured before
+    // `client` is moved into the driver open below.
+    let model_alias = client.model().to_owned();
 
     // The World driver's INPUT QUEUE: host `UserMessage`s and folded surface
     // inputs are submitted here; the driver task drains it one input at a time,
@@ -143,12 +134,23 @@ async fn run_app_worker_inner(
     let (surface_obs_tx, surface_obs_rx) =
         tokio::sync::mpsc::channel::<AgentToHost>(SURFACE_CHANNEL_CAPACITY);
 
-    // The World driver's LIVE surface-drive sink: convert each `set_value` surface
-    // `RunTool` Command to a `HostToAgent::SurfaceDrive` frame and forward it to
-    // the macOS app client. See `WorkerSurfaceDriver` / `surface_drive_frame`.
-    let surface_driver = WorkerSurfaceDriver {
-        tx: surface_drive_tx.clone(),
-    };
+    // Reconstruct the World driver at worker STARTUP — before the message pump
+    // (`bridge_host_messages`) begins — so a restarted App resumes its recorded
+    // World rather than starting over (US-7): resume the latest existing session
+    // via `WorldDriver::open`, falling back to a freshly bootstrapped one when no
+    // prior session exists or its recorded tail cannot be reopened. Resolution
+    // happens here, not in the per-message handler, so the pump stays non-blocking
+    // (root CLAUDE.md UX rule). The `WorkerSurfaceDriver` LIVE surface-drive sink
+    // is built inside, rooted on `surface_drive_tx`.
+    let driver = open_world_driver(
+        &session_manager,
+        app_id,
+        model,
+        model_alias,
+        client,
+        surface_drive_tx,
+    )
+    .await?;
 
     // Drive the ECS World live: drain the input queue, drive each input to
     // quiescence through `tick` + `drive_live`, and forward the derived assistant
@@ -157,17 +159,7 @@ async fn run_app_worker_inner(
     let driver_writer = writer.clone();
     let driver_app_id = app_id.to_string();
     let driver_task = tokio::spawn(async move {
-        run_world_driver(
-            seed,
-            model,
-            client,
-            surface_driver,
-            event_log,
-            world_input_rx,
-            driver_writer,
-            &driver_app_id,
-        )
-        .await;
+        run_world_driver(driver, world_input_rx, driver_writer, &driver_app_id).await;
     });
 
     // Worker → host for raised interactions: drain the queue's observer and write
@@ -291,30 +283,18 @@ impl SurfaceDriver for WorkerSurfaceDriver {
     }
 }
 
-/// Run the World tick-driver loop: bootstrap a fresh-session [`WorldDriver`] (a
-/// seeded primary `Idle` entity), then drain `world_input_rx`, driving each input
-/// to quiescence and forwarding the derived assistant `EntryNotification`s to the
-/// host as `AgentToHost::EntryNotification` frames so the macOS app renders the
-/// agent's reply. A bootstrap failure is logged and ends the worker's agent path;
-/// a per-input drive error is logged and the loop continues with the next input.
+/// Run the World tick-driver loop over an already-opened [`WorldDriver`]
+/// (resumed or freshly bootstrapped at startup by [`open_world_driver`]): drain
+/// `world_input_rx`, driving each input to quiescence and forwarding the derived
+/// assistant `EntryNotification`s to the host as `AgentToHost::EntryNotification`
+/// frames so the macOS app renders the agent's reply. A per-input drive error is
+/// logged and the loop continues with the next input.
 async fn run_world_driver(
-    seed: u64,
-    model: ModelConfig,
-    client: MessagesClient,
-    surface_driver: WorkerSurfaceDriver,
-    event_log: FilesystemEventLog,
+    mut driver: WorldDriver<MessagesClient, WorkerSurfaceDriver, FilesystemEventLog>,
     mut world_input_rx: tokio::sync::mpsc::Receiver<LogicalInput>,
     writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     app_id: &str,
 ) {
-    let mut driver = match WorldDriver::bootstrap(seed, model, client, surface_driver, event_log) {
-        Ok(driver) => driver,
-        Err(e) => {
-            log::error!("[app-worker:{}] failed to bootstrap the World driver: {}", app_id, e);
-            return;
-        }
-    };
-
     while let Some(input) = world_input_rx.recv().await {
         match driver.submit(input).await {
             Ok(notifications) => {
@@ -339,6 +319,111 @@ async fn run_world_driver(
             }
         }
     }
+}
+
+/// The concrete [`WorldDriver`] the production worker drives: an Anthropic-shape
+/// [`MessagesClient`] model caller, the [`WorkerSurfaceDriver`] LIVE surface sink,
+/// and a [`FilesystemEventLog`] rooted under the session dir.
+type WorkerWorldDriver = WorldDriver<MessagesClient, WorkerSurfaceDriver, FilesystemEventLog>;
+
+/// Open the World driver this worker drives, at STARTUP (before the message pump):
+/// RESUME the latest existing session via [`WorldDriver::open`] so a restarted App
+/// continues its recorded World (US-7), or — when no prior session exists, or the
+/// recorded tail cannot be reopened (e.g. the documented crash-mid-compaction P0
+/// limitation `open` reports as `Err`) — create and bootstrap a FRESH session so
+/// the worker always stays available. The reopen failure is logged, never fatal.
+///
+/// A resumed session reuses the SAME `world-events.jsonl` directory (the `latest`
+/// link resolves it) rather than starting a new one, and roots a [`SnapshotStore`]
+/// under that session dir's `snapshots/` so the driver's periodic snapshots land
+/// alongside the log. See docs/agent/world/ecs-runtime.md — Restore snapshots.
+async fn open_world_driver(
+    session_manager: &SessionManager,
+    app_id: &str,
+    model: ModelConfig,
+    model_alias: String,
+    client: MessagesClient,
+    surface_drive_tx: tokio::sync::mpsc::Sender<HostToAgent>,
+) -> Result<WorkerWorldDriver, Error> {
+    // Prefer resuming the latest existing session.
+    if let Some((session_id, session_dir)) = latest_session(session_manager) {
+        let event_log = FilesystemEventLog::new(session_dir.join("world-events.jsonl"));
+        let store = SnapshotStore::new(session_dir.join("snapshots"));
+        let seed = seed_from_session(app_id, &session_id);
+        let surface_driver = WorkerSurfaceDriver {
+            tx: surface_drive_tx.clone(),
+        };
+        match WorldDriver::open(seed, model.clone(), client, surface_driver, event_log, store).await
+        {
+            Ok(driver) => {
+                log::info!(
+                    "[app-worker:{}] resumed session {} from its recorded World",
+                    app_id,
+                    session_id.to_string()
+                );
+                return Ok(driver);
+            }
+            Err(e) => {
+                // `client` was consumed by the failed `open`; rebuild it from env
+                // for the fresh session below so the worker stays available.
+                log::warn!(
+                    "[app-worker:{}] could not reopen latest session {} ({}); \
+                     falling back to a fresh session",
+                    app_id,
+                    session_id.to_string(),
+                    e
+                );
+                let client = MessagesClient::from_env()?;
+                return open_fresh(session_manager, app_id, model, model_alias, client, surface_drive_tx)
+                    .await;
+            }
+        }
+    }
+
+    // No prior session: create + bootstrap a fresh one with the existing client.
+    open_fresh(session_manager, app_id, model, model_alias, client, surface_drive_tx).await
+}
+
+/// Create a fresh session and open a freshly-bootstrapped [`WorldDriver`] over its
+/// (empty) log, rooting a [`SnapshotStore`] under the new session dir. `open` on an
+/// empty log delegates to `bootstrap` (genesis + recorded `SessionStarted`) and
+/// merely attaches the store, so periodic snapshots still land under the session.
+async fn open_fresh(
+    session_manager: &SessionManager,
+    app_id: &str,
+    model: ModelConfig,
+    model_alias: String,
+    client: MessagesClient,
+    surface_drive_tx: tokio::sync::mpsc::Sender<HostToAgent>,
+) -> Result<WorkerWorldDriver, Error> {
+    let (session_id, session_dir) = session_manager
+        .create_session(model_alias)
+        .map_err(|e| Error::App(format!("create session for App `{app_id}`: {e}")))?;
+
+    // The World's append-only event log lives under the session directory: the
+    // single source of truth the driver appends to log-before-apply (Inv 4/9).
+    // Its stratum-2 sibling (`<name>.lifecycle.jsonl`) travels alongside it.
+    let event_log = FilesystemEventLog::new(session_dir.join("world-events.jsonl"));
+    let store = SnapshotStore::new(session_dir.join("snapshots"));
+    // A deterministic per-session RNG seed: the World's sole randomness source
+    // crosses the recorded `SessionStarted` boundary so a replay reseeds
+    // identically (Inv 8/9). Derived purely from the App + session ids.
+    let seed = seed_from_session(app_id, &session_id);
+    let surface_driver = WorkerSurfaceDriver {
+        tx: surface_drive_tx,
+    };
+    WorldDriver::open(seed, model, client, surface_driver, event_log, store).await
+}
+
+/// Resolve the worker's most recent existing session from the `latest` link:
+/// `Some((session_id, session_dir))` when the link resolves to a session directory
+/// whose name parses as a [`SessionId`], else `None` (no prior session to resume).
+fn latest_session(session_manager: &SessionManager) -> Option<(SessionId, PathBuf)> {
+    let target = std::fs::read_link(session_manager.latest_link()).ok()?;
+    let name = target.file_name()?.to_str()?;
+    let session_id = SessionId::from_string(name)?;
+    let session_dir = session_manager.session_dir(&session_id);
+    session_dir.is_dir().then_some((session_id, session_dir))
 }
 
 /// Capacity of the worker's peer-request channel. Peer tool calls are serviced

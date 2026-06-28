@@ -71,8 +71,10 @@ pub trait EventLog: Send + Sync {
 
 /// Append one value as a single JSON line to `path`, creating the file and any
 /// missing parent directories. No in-memory buffer, so a returned `Ok(())` is
-/// durable. Shared by both strata so the on-disk encoding is identical.
-fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
+/// durable. Shared by both strata so the on-disk encoding is identical, and by
+/// the segmented log (`segment.rs`) so a segment file is byte-identical to a
+/// single-file log.
+pub(crate) fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -86,8 +88,9 @@ fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
 
 /// Load every value from a JSONL file at `path`, in line order, skipping blank
 /// lines. A missing file is genesis (empty `Vec`). `label` names the stream in
-/// parse errors so a malformed line is attributable to its stratum.
-fn load_jsonl<T: DeserializeOwned>(path: &Path, label: &str) -> Result<Vec<T>, Error> {
+/// parse errors so a malformed line is attributable to its stratum. Shared with
+/// the segmented log (`segment.rs`) so a segment loads with identical encoding.
+pub(crate) fn load_jsonl<T: DeserializeOwned>(path: &Path, label: &str) -> Result<Vec<T>, Error> {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),

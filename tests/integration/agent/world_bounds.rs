@@ -33,13 +33,13 @@ use serde_json::Value as Json;
 
 use rubberdux::agent::world::budget::{Budget, Limits};
 use rubberdux::agent::world::effects::{
-    Command, ModelCaller, ReplayCursor, Replayed, ResultStamp, SurfaceDriver, drive_live,
-    drive_replay, fingerprint_call,
+    Command, ModelCaller, ResultStamp, SurfaceDriver, drive_live, fingerprint_call,
 };
 use rubberdux::agent::world::surface::SurfaceView;
 use rubberdux::agent::world::event_log::{EventLog, MemoryEventLog};
 use rubberdux::agent::world::gates::EntityGate;
 use rubberdux::agent::world::history::{Block, History, Role};
+use rubberdux::agent::world::replay;
 use rubberdux::agent::world::inputs::{
     Capabilities, Event, Fingerprint, LogicalInput, ModelMeta, Origin, ReasoningPolicy, StopReason,
     Usage,
@@ -101,14 +101,7 @@ fn genesis(seed: u64, model: &ModelConfig, limits: Limits) -> World {
 /// header rather than from any live source. The `limits` are genesis-parity (the same
 /// value the live run used), like the world-default `ModelConfig`.
 fn genesis_from_log(events: &[Event], model: &ModelConfig, limits: Limits) -> Result<World, Error> {
-    let seed = events
-        .iter()
-        .find_map(|e| match &e.input {
-            LogicalInput::SessionStarted { seed, .. } => Some(*seed),
-            _ => None,
-        })
-        .ok_or_else(|| Error::World("recorded log has no SessionStarted header".into()))?;
-    Ok(genesis(seed, model, limits))
+    replay::genesis_from_log(events, |seed| genesis(seed, model, limits))
 }
 
 fn offline_model() -> ModelConfig {
@@ -178,71 +171,23 @@ impl SurfaceDriver for NoSurfaceDrive {
 
 /// The canonical ("live") World: re-apply every recorded Event through `tick`.
 fn fold_log(events: &[Event], model: &ModelConfig, limits: Limits) -> Result<World, Error> {
-    let mut world = genesis_from_log(events, model, limits)?;
-    for ev in events {
-        let (next, _commands) = tick(&world, ev);
-        world = next;
-    }
-    Ok(world)
+    Ok(replay::fold_log(
+        genesis_from_log(events, model, limits)?,
+        events,
+    ))
 }
 
-/// Whether an input is a model-call RESULT the replay driver stands in for via the
-/// `ReplayCursor` (the `CallModel` duals). Every OTHER recorded input — the exogenous
-/// free variables AND the `ToolReturned` tool results — is re-applied directly by the
-/// loop, exactly as crash-resume re-applies a recorded Input through the reducer.
-fn is_model_call_result(input: &LogicalInput) -> bool {
-    matches!(
-        input,
-        LogicalInput::ModelResponded { .. }
-            | LogicalInput::ModelFailed { .. }
-            | LogicalInput::InferenceCancelled { .. }
-    )
-}
-
-/// Fold the SAME recorded log from genesis under the REPLAY driver. The loop re-applies
-/// every input EXCEPT the model-call results, and for each tick's Commands it calls
-/// `drive_replay` — which takes NO `ModelCaller` and so cannot call the model by
-/// construction — standing in the already-logged result while the re-emitted request
-/// re-hashes to its `Fingerprint`. The `ReplayCursor` is built over the model-call
-/// results ALONE, so a continuation `CallModel` re-emitted after a `ToolReturned` pulls
-/// the NEXT `ModelResponded` from the cursor. A `Diverged` outcome is a replay failure.
-/// Mirrors the walking-skeleton / tool-loop replay harness.
+/// Fold the SAME recorded log from genesis under the promoted REPLAY driver
+/// (`replay::replay_world`). The `ReplayCursor` stands in for the model-call results
+/// ALONE (`replay::is_model_call_result`), so a continuation `CallModel` re-emitted after
+/// a `ToolReturned` pulls the NEXT `ModelResponded` from the cursor; every other input is
+/// re-applied directly. A `Diverged` outcome is a replay failure.
 fn replay_log(events: &[Event], model: &ModelConfig, limits: Limits) -> Result<World, Error> {
-    let mut world = genesis_from_log(events, model, limits)?;
-    let model_results: Vec<Event> = events
-        .iter()
-        .filter(|e| is_model_call_result(&e.input))
-        .cloned()
-        .collect();
-    let mut cursor = ReplayCursor::new(&model_results);
-
-    for ev in events.iter().filter(|e| !is_model_call_result(&e.input)) {
-        let (next, mut commands) = tick(&world, ev);
-        world = next;
-
-        while !commands.is_empty() {
-            let replayed = drive_replay(&commands, &mut cursor)?;
-            commands = Vec::new();
-            for outcome in replayed {
-                match outcome {
-                    Replayed::Reused(event) => {
-                        let (next, mut cmds) = tick(&world, &event);
-                        world = next;
-                        commands.append(&mut cmds);
-                    }
-                    Replayed::Diverged => {
-                        return Err(Error::World(
-                            "replay diverged: a re-emitted request did not match the \
-                             recorded result, but a faithful replay must reuse every result"
-                                .into(),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(world)
+    replay::replay_world(
+        genesis_from_log(events, model, limits)?,
+        events,
+        replay::is_model_call_result,
+    )
 }
 
 /// Stamp each model-call result's `fingerprint` with the value the LIVE driver would
@@ -631,7 +576,7 @@ async fn vc_2_3_inbox_overflow_drops_oldest_and_live_driver_logs_message_dropped
 /// sub-agents spawns the FIRST and DENIES the second: the denied `Child` slot resolves
 /// `is_error` WITHOUT inserting a child Entity, so `entities` does not grow past parent
 /// + one child — a capped spawn never leaves the parent waiting on a child that will
-/// never exist.
+///   never exist.
 #[test]
 fn vc_2_3_fanout_cap_denies_spawn_is_error_without_growing_entities() {
     let model = offline_model();

@@ -246,6 +246,44 @@ pub enum SlotState {
 pub const HELD_CMD: CmdId = u32::MAX;
 
 // ---------------------------------------------------------------------------
+// Caps — bounded-resource knobs (World-state, replayable). P0 subset.
+// ---------------------------------------------------------------------------
+
+/// Bounded-resource knobs for the World: every queue, growing structure, and
+/// retry loop carries an explicit brake here so the runtime cannot grow without
+/// bound. `Caps` is World state (a `Resources` singleton) and therefore replays
+/// deterministically with everything else. A value of `0` in any numeric cap
+/// means **unbounded** — the brake is intentionally disabled.
+///
+/// See docs/agent/world/ecs-runtime.md §"Boundedness"/Caps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Caps {
+    /// Ticks between consecutive World snapshots. A snapshot anchors restore
+    /// to `nearest-snapshot + tail` (Inv 9). `0` = no periodic snapshots.
+    pub snapshot_interval: Tick,
+    /// Maximum number of snapshots to retain per branch. Older snapshots
+    /// beyond this count are eligible for eviction (Inv 11). `0` = unbounded.
+    pub snapshot_keep: u32,
+    /// Grace window (in ticks) after a branch goes dead before it is eligible
+    /// for reclaim. `0` = unbounded (dead branches never auto-expire).
+    pub branch_grace: Tick,
+}
+
+impl Default for Caps {
+    fn default() -> Self {
+        Caps {
+            snapshot_interval: 64,
+            snapshot_keep: 3,
+            // 0 = unbounded: dead branches never auto-expire by default;
+            // branch-reclaim logic (a later milestone) reads this and skips
+            // eviction when the value is 0.
+            branch_grace: 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Resources — world singletons. P0 subset.
 // ---------------------------------------------------------------------------
 
@@ -305,13 +343,20 @@ pub struct Resources {
     /// docs/agent/world/ecs-runtime.md (Anthropic model-call mapping; SurfaceSystem).
     #[serde(default)]
     pub surface_tools: ToolSet,
+    /// Bounded-resource knobs: snapshot cadence, retention limit, and branch
+    /// grace window. `#[serde(default)]` so Milestone-1 logs (which carry no
+    /// `caps` key) deserialise byte-identically with the struct defaults.
+    /// See docs/agent/world/ecs-runtime.md §"Boundedness"/Caps.
+    #[serde(default)]
+    pub caps: Caps,
 }
 
 impl Resources {
     /// World singletons seeded for a fresh session: `rng` from `seed`, an
     /// unobserved `wall`, the given world-default `model`, no edges, an open
     /// gate, a zeroed allocator, an empty surface view, no raised interactions,
-    /// and a `RunFree` autonomy policy (approve everything by default).
+    /// a `RunFree` autonomy policy (approve everything by default), and
+    /// default `Caps` (snapshot_interval=64, snapshot_keep=3, branch_grace=0).
     pub fn new(seed: u64, model: ModelConfig) -> Self {
         Resources {
             rng: Rng::seeded(seed),
@@ -327,6 +372,7 @@ impl Resources {
             // No surface tools by default ⇒ a tool-less call (byte-identical to a
             // pre-tools request). The live tick-driver opts the surface entity in.
             surface_tools: ToolSet::default(),
+            caps: Caps::default(),
         }
     }
 }
