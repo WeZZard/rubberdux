@@ -89,7 +89,9 @@ impl System for CompactionSystem {
                     let history_len = e.history.0.len();
                     let upto = (history_len / 2).max(1).min(history_len) as u32;
                     let msgs = e.history.0[..upto as usize].to_vec();
-                    let params = e.model.clone().unwrap_or_else(|| world.resources.model.clone());
+                    // The compaction call's model: the entity's override else the
+                    // world default. See docs/agent/world/ecs-runtime.md §343-348.
+                    let params = world.model_for(*entity);
                     (
                         upto,
                         crate::agent::world::history::History(msgs),
@@ -140,7 +142,9 @@ impl System for CompactionSystem {
                 let mut world = world.clone();
                 let (cont_cmd, ids) = world.resources.ids.mint_cmd();
                 world.resources.ids = ids;
-                let default_model = world.resources.model.clone();
+                // The post-compaction continuation's model: the entity's override
+                // else the world default. See docs/agent/world/ecs-runtime.md §343-348.
+                let params = world.model_for(*entity);
                 // Re-offer the ROOT (surface-capable) entity its surface tools on the
                 // post-compaction continuation so it does not lose `set_value` for the
                 // rest of the turn (GAP A). A non-root entity is offered none.
@@ -172,7 +176,6 @@ impl System for CompactionSystem {
                             content,
                         });
                     }
-                    let params = e.model.clone().unwrap_or(default_model);
                     let messages = e.history.clone();
                     e.activity = Activity::Thinking { cmd: cont_cmd };
                     return (
@@ -213,7 +216,9 @@ impl System for CompactionSystem {
                 let mut world = world.clone();
                 let (cont_cmd, ids) = world.resources.ids.mint_cmd();
                 world.resources.ids = ids;
-                let default_model = world.resources.model.clone();
+                // The un-compacted continuation's model: the entity's override else
+                // the world default. See docs/agent/world/ecs-runtime.md §343-348.
+                let params = world.model_for(*entity);
                 // Re-offer the ROOT (surface-capable) entity its surface tools on the
                 // un-compacted continuation (GAP A); a non-root entity is offered none.
                 let surface_tools = if *entity == world.root {
@@ -232,7 +237,6 @@ impl System for CompactionSystem {
                             content,
                         });
                     }
-                    let params = e.model.clone().unwrap_or(default_model);
                     let messages = e.history.clone();
                     e.activity = Activity::Thinking { cmd: cont_cmd };
                     return (
@@ -316,6 +320,7 @@ mod tests {
                 turns: 0,
                 spawned: 0,
                 model: None,
+                autonomy: None,
             },
         );
         world

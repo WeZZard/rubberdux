@@ -70,11 +70,32 @@ pub trait EventLog: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Append one value as a single JSON line to `path`, creating the file and any
-/// missing parent directories. No in-memory buffer, so a returned `Ok(())` is
-/// durable. Shared by both strata so the on-disk encoding is identical, and by
-/// the segmented log (`segment.rs`) so a segment file is byte-identical to a
-/// single-file log.
+/// missing parent directories. Every successful return is durable: the data is
+/// flushed to the storage device via `sync_data` before `Ok(())` is returned,
+/// closing the power-loss gap described in docs/agent/world/ecs-runtime.md
+/// §"APPEND FSYNC". Shared by both strata so the on-disk encoding is identical,
+/// and by the segmented log (`segment.rs`) so a segment file is byte-identical
+/// to a single-file log.
 pub(crate) fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
+    // Production has nothing to observe about the fsync, so it passes a no-op
+    // observer. The closure captures nothing, allocates nothing, and produces
+    // bytes identical to a direct `sync_data` — the seam is format-neutral.
+    append_jsonl_observing_sync(path, value, &|| {})
+}
+
+/// Like [`append_jsonl`], but invokes `on_sync` IFF the durable `sync_data`
+/// succeeds — FUSED into the sync call so that deleting (or reordering after the
+/// `Ok`) the fsync also deletes the observation. This is the additive
+/// sync-observation seam ([`FilesystemEventLog::with_sync_observer`]): a test
+/// injects a spy to prove `append` `sync_data`'d the bytes BEFORE returning `Ok`,
+/// and the fusion means removing the fsync makes that spy not fire ⇒ the test
+/// fails. Production (`append_jsonl`) passes a no-op, so behavior and on-disk
+/// bytes are unchanged. See docs/agent/world/ecs-runtime.md §"APPEND FSYNC".
+pub(crate) fn append_jsonl_observing_sync<T: Serialize>(
+    path: &Path,
+    value: &T,
+    on_sync: &(dyn Fn() + Send + Sync),
+) -> Result<(), Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -83,6 +104,14 @@ pub(crate) fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<(), E
     let json = serde_json::to_string(value)?;
     file.write_all(json.as_bytes())?;
     file.write_all(b"\n")?;
+    // Flush content (and the file-size metadata needed to read it back) to
+    // durable storage before acknowledging the append, THEN notify the sync
+    // observer — fused via `map` so the observer fires only when `sync_data`
+    // itself succeeds. `sync_data` is preferred over `sync_all` because it omits
+    // non-essential metadata (e.g. mtime), which is cheaper while still
+    // guaranteeing readers see every byte written. Cost: one fsync per append —
+    // correctness-first per §"APPEND FSYNC".
+    file.sync_data().map(|()| on_sync())?;
     Ok(())
 }
 
@@ -129,15 +158,45 @@ pub(crate) fn load_jsonl<T: DeserializeOwned>(path: &Path, label: &str) -> Resul
 /// See docs/agent/world/ecs-runtime.md.
 pub struct FilesystemEventLog {
     path: PathBuf,
+    /// Additive sync-observation seam: invoked the instant a stratum-1 `append`
+    /// completes its durable `sync_data`, BEFORE `append` returns `Ok`. The
+    /// default is a no-op ([`FilesystemEventLog::new`]), so production behavior
+    /// and the on-disk bytes are unchanged; a test injects a spy via
+    /// [`FilesystemEventLog::with_sync_observer`] to prove the fsync fired before
+    /// the ack. See docs/agent/world/ecs-runtime.md §"APPEND FSYNC".
+    on_sync: Box<dyn Fn() + Send + Sync>,
 }
 
 impl FilesystemEventLog {
     /// Create a `FilesystemEventLog` backed by `path`.
     ///
     /// The file and any missing parent directories are created on the first
-    /// `append` call.
+    /// `append` call. The sync-observation seam defaults to a no-op, so the log
+    /// behaves and serializes exactly as before the seam existed.
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            on_sync: Box::new(|| {}),
+        }
+    }
+
+    /// Create a `FilesystemEventLog` whose stratum-1 `append` calls `on_sync` at
+    /// the instant its durable `sync_data` succeeds, before returning `Ok`.
+    ///
+    /// This is the test seam for the durable-before-ack contract: a spy proves
+    /// `append` fsync'd before the ack, and — because the observation is fused
+    /// with the `sync_data` call in [`append_jsonl_observing_sync`] — removing
+    /// that fsync makes the spy not fire, turning the proof red. Production uses
+    /// [`FilesystemEventLog::new`] (a no-op observer); only the stratum-1 stream
+    /// is observed, since durability is asserted at the `append` boundary.
+    pub fn with_sync_observer(
+        path: impl Into<PathBuf>,
+        on_sync: Box<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            on_sync,
+        }
     }
 
     /// The sibling path holding the stratum-2 operational stream, derived from
@@ -150,7 +209,7 @@ impl FilesystemEventLog {
 
 impl EventLog for FilesystemEventLog {
     fn append(&mut self, event: &Event) -> Result<(), Error> {
-        append_jsonl(&self.path, event)
+        append_jsonl_observing_sync(&self.path, event, self.on_sync.as_ref())
     }
 
     fn load(&self) -> Result<Vec<Event>, Error> {
@@ -386,5 +445,36 @@ mod tests {
         // A fresh handle over the same path reads both streams back (durable).
         let reopened = FilesystemEventLog::new(&path);
         assert_eq!(reopened.load_lifecycle().expect("reload stratum-2"), dispatches);
+    }
+
+    /// Every stratum-1 append is readable immediately after `append` returns,
+    /// without any additional flush step from the caller — the fsync contract
+    /// (§"APPEND FSYNC") guarantees this. A fresh `FilesystemEventLog` handle
+    /// opened on the same path after each append must observe the event.
+    #[test]
+    fn filesystem_log_each_append_is_immediately_durable() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("events.jsonl");
+        let events = sample_events();
+        let mut log = FilesystemEventLog::new(&path);
+
+        for (i, event) in events.iter().enumerate() {
+            log.append(event).expect("append to filesystem log");
+
+            // Open a brand-new handle so there is no shared OS file-description
+            // or in-process cache between writer and reader.
+            let reader = FilesystemEventLog::new(&path);
+            let loaded = reader.load().expect("load after append");
+            assert_eq!(
+                loaded.len(),
+                i + 1,
+                "after append #{i} the log must contain exactly {} event(s)",
+                i + 1,
+            );
+            assert_eq!(
+                loaded[i], *event,
+                "after append #{i} the last loaded event must equal the appended event",
+            );
+        }
     }
 }

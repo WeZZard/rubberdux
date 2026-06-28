@@ -41,7 +41,8 @@ use crate::error::Error;
 
 use super::edge;
 use super::effects::{
-    drive_live, ModelCaller, PeerSender, ResultStamp, SurfaceDriver, UnattachedPeerSender,
+    drive_live, Command, CommandKey, ModelCaller, PeerSender, ResultStamp, SurfaceDriver,
+    UnattachedPeerSender,
 };
 use super::event_log::EventLog;
 use super::gates::EntityGate;
@@ -50,8 +51,8 @@ use super::inputs::{Event, LogicalInput, Origin};
 use super::replay::{outstanding_cmds, restore};
 use super::snapshot::{capture, SnapshotStore};
 use super::world::{
-    Activity, Components, Counterpart, EdgeId, EntityId, Identity, Inbox, Lineage, ModelConfig,
-    Resources, Tick, Timestamp, World,
+    Activity, CmdId, Components, Counterpart, EdgeId, EntityId, Identity, Inbox, Lineage,
+    ModelConfig, Resources, Tick, Timestamp, World,
 };
 
 /// The primary entity's id. The shell SEEDS this `Idle` entity at startup because
@@ -217,13 +218,18 @@ where
     ///    `Command::Compact`), so a `Compact` `Redispatch` IS reachable on a crash
     ///    tail. `effects::resume` does not LOG a `Redispatch`, so
     ///    `resume_reconciliations` (which folds only newly-logged events) cannot
-    ///    settle it, leaving the entity reconstructed in `Compacting`. This P0
-    ///    driver cannot yet reconstruct the `Compact` request payload to re-issue
-    ///    it, so `open` FAILS LOUDLY on such a tail rather than opening with a
-    ///    silently-stranded entity — a documented P0 limitation; full
-    ///    compaction-resume re-dispatch is deferred. peer / timer / human-action
-    ///    are never dispatched by this driver, so those `Redispatch` kinds do not
-    ///    arise on this path,
+    ///    settle it, leaving the entity reconstructed in `Compacting { cmd }`.
+    ///    `open` then RECONSTRUCTS that `Command::Compact` from the rebuilt World's
+    ///    tail Activity (the held `cmd` + the unchanged History the deferral
+    ///    summarized, via [`rebuild_compact_command`]) and RE-DISPATCHES it through
+    ///    `drive_live` under the SAME `cmd`, driving the compaction — and the
+    ///    continuation it resumes — to quiescence, so a session that crashed
+    ///    mid-compaction COMPLETES the compaction instead of failing loud or
+    ///    stranding (idempotency via content-addressed replay, Inv 7). peer / timer
+    ///    / human-action are never dispatched by this driver, so those `Redispatch`
+    ///    kinds do not arise on this path; an outstanding cmd that is none of these
+    ///    (no reconstructable `Compacting` tail) still fails loudly rather than
+    ///    opening stranded,
     ///  - sets `next_at` to the reconstructed `World.clock + 1` so ticks continue
     ///    monotonically past everything already recorded (Inv 8/12), and
     ///  - sets `history_emitted` to the reconstructed primary entity's `History`
@@ -295,24 +301,29 @@ where
         // the loaded tail and drive any retry Commands to live quiescence.
         driver.resume_reconciliations(events.len()).await?;
 
-        // Crash-mid-compaction guard (P0 limitation). `restore`'s bounded resume
-        // reconciles each outstanding effect per its `EffectKind`: a `CallModel` /
-        // `RunTool` tail settles to a LOGGED stratum-1 result that
-        // `resume_reconciliations` just folded in, but a `Compact` tail reconciles
-        // to a `Redispatch` (re-dispatch under the same key) that `effects::resume`
-        // does NOT log — so nothing was folded for it and the entity is still
-        // `Compacting`. This driver cannot yet reconstruct the `Compact` request
-        // payload (the dispatch's `upto` / `messages` / `params` are not carried in
-        // `Activity::Compacting { cmd }`), so rather than open a driver with an
-        // entity silently stranded `Compacting` forever, fail LOUDLY. Any cmd still
-        // outstanding after resume is, by construction, such an un-re-issued
-        // `Redispatch` — the only effect kind this P0 driver dispatches that resume
-        // cannot settle (peer / timer / human-action are never dispatched). Full
-        // compaction-resume re-dispatch is deferred. See
-        // docs/agent/world/ecs-runtime.md — Reconciliation (Inv 5/17).
-        let unsettled = outstanding_cmds(&driver.world);
-        if let Some(&cmd) = unsettled.iter().next() {
-            let entity = driver
+        // Crash-mid-compaction RESUME (US-3). `restore`'s bounded resume reconciles
+        // each outstanding effect per its `EffectKind`: a `CallModel` / `RunTool`
+        // tail settles to a LOGGED stratum-1 result that `resume_reconciliations`
+        // just folded in, but a `Compact` tail reconciles to a `Redispatch`
+        // (re-dispatch under the same key) that `effects::resume` does NOT log — so
+        // nothing was folded for it and the entity is still reconstructed
+        // `Compacting { cmd }`. Rather than strand it, RECONSTRUCT the in-flight
+        // `Command::Compact` from the rebuilt World's tail Activity (the held `cmd`
+        // + the unchanged History the deferral summarized, via
+        // `rebuild_compact_command`) and RE-DISPATCH it through the LIVE driver
+        // under the SAME `cmd`, then drive the compaction — and the continuation it
+        // resumes — to quiescence, so a session that crashed mid-compaction
+        // COMPLETES it (idempotency via content-addressed replay, Inv 7). A clean
+        // resume (no `Compacting` tail) leaves `outstanding_cmds` empty, so this
+        // loop is never entered and the open path stays byte-identical to before.
+        // An outstanding cmd with no reconstructable `Compacting` tail is an
+        // un-re-issued `Redispatch` of a kind this driver never dispatches (peer /
+        // timer / human-action), so it still fails LOUDLY rather than opening with a
+        // silently-stranded entity. See docs/agent/world/ecs-runtime.md §1285-1318 —
+        // Context-window compaction; Reconciliation (Inv 5/17).
+        let mut redispatch: Vec<Command> = Vec::new();
+        for cmd in outstanding_cmds(&driver.world) {
+            let compacting = driver
                 .world
                 .entities
                 .iter()
@@ -320,13 +331,27 @@ where
                     matches!(components.activity, Activity::Compacting { cmd: held } if held == cmd)
                 })
                 .map(|(id, _)| *id);
-            return Err(Error::World(format!(
-                "crash-mid-compaction resume is not yet supported: entity {entity:?} is \
-                 reconstructed in Compacting with an outstanding Compact cmd {cmd}, which the \
-                 bounded resume reconciled to a Redispatch this P0 driver does not re-issue; \
-                 failing loudly rather than opening with a silently-stranded entity (full \
-                 compaction-resume re-dispatch is deferred)"
-            )));
+            match compacting.and_then(|entity| rebuild_compact_command(&driver.world, entity, cmd)) {
+                Some(command) => redispatch.push(command),
+                None => {
+                    return Err(Error::World(format!(
+                        "crash-mid-compaction resume cannot reconstruct outstanding cmd {cmd}: \
+                         no reconstructable Compacting tail owns it (only a Compact tail is \
+                         re-dispatched; peer / timer / human-action Redispatch kinds are never \
+                         dispatched by this driver); failing loudly rather than opening with a \
+                         silently-stranded entity"
+                    )));
+                }
+            }
+        }
+        if !redispatch.is_empty() {
+            // Re-dispatch the reconstructed Compact(s) through the live driver under
+            // the SAME cmd; `resume_reconciliations` already set `next_at` /
+            // `last_snapshot_at` to the reconstructed frontier, so the appended
+            // `Compacted` + continuation ticks continue monotonically (Inv 8/12).
+            driver
+                .drive_to_quiescence(redispatch, &UnattachedPeerSender)
+                .await?;
         }
 
         // Continue past everything recorded, and suppress re-emitting old text.
@@ -626,8 +651,7 @@ where
             return out;
         };
         let messages = &entity.history.0;
-        for index in self.history_emitted..messages.len() {
-            let message = &messages[index];
+        for (index, message) in messages.iter().enumerate().skip(self.history_emitted) {
             if !matches!(message.role, Role::Assistant) {
                 continue;
             }
@@ -672,6 +696,43 @@ fn genesis_world(seed: u64, model: ModelConfig) -> World {
     world
 }
 
+/// Reconstruct the in-flight `Command::Compact` a crash-tail entity reconstructed
+/// in `Activity::Compacting { cmd }` was awaiting, so [`open`](WorldDriver::open)
+/// can RE-DISPATCH it under the SAME `cmd` and finish the compaction a crash
+/// interrupted (US-3). The dispatch payload (`upto` / `messages` / `params`) is NOT
+/// carried in `Activity::Compacting { cmd }` — but it is a DETERMINISTIC function
+/// of the reconstructed entity's tail: CompactionSystem defers the continuation
+/// WITHOUT mutating History, so the entity's CURRENT History is byte-identical to
+/// the slice the original `Compact` summarized. Re-running that SAME deferral
+/// heuristic — the older half `(len/2).max(1).min(len)` and the entity's resolved
+/// model (`model_for`) — rebuilds the identical `(upto, messages, params)`, so the
+/// re-dispatched request re-hashes to the SAME `Fingerprint` the live run recorded
+/// (content-addressed replay, Inv 7). It MUST track CompactionSystem's deferral
+/// (the `ModelResponded` arm of `systems/compaction.rs`); a divergence here would
+/// re-dispatch a different request and break replay byte-identity. Returns `None`
+/// for an entity with EMPTY History — a degenerate `Compacting` that cannot arise
+/// from a real compaction (which only defers a non-empty conversation), leaving
+/// nothing to summarize. See docs/agent/world/ecs-runtime.md §1285-1318
+/// (Context-window compaction; compaction-resume re-dispatch).
+fn rebuild_compact_command(world: &World, entity: EntityId, cmd: CmdId) -> Option<Command> {
+    let components = world.entities.get(&entity)?;
+    let history_len = components.history.0.len();
+    if history_len == 0 {
+        return None;
+    }
+    let upto = (history_len / 2).max(1).min(history_len) as u32;
+    let messages = History(components.history.0[..upto as usize].to_vec());
+    let params = world.model_for(entity);
+    Some(Command::Compact {
+        cmd,
+        entity,
+        upto,
+        messages,
+        params,
+        key: CommandKey,
+    })
+}
+
 /// Whether advancing the logical clock from `last` to `current` crossed an
 /// `interval`-tick snapshot boundary. `interval == 0` disables periodic
 /// snapshots (an unbounded cap), and a non-advancing clock never crosses. See
@@ -698,6 +759,7 @@ fn primary_idle_components() -> Components {
         turns: 0,
         spawned: 0,
         model: None,
+        autonomy: None,
     }
 }
 
@@ -1437,6 +1499,140 @@ mod tests {
             }
             Err(other) => panic!("expected Ok or Error::World, got {other:?}"),
         }
+    }
+
+    /// VC-2.1 (lib-scope): a recorded session whose tail reconstructs the primary
+    /// entity in `Activity::Compacting { cmd }` — an in-flight `Command::Compact`
+    /// written (a stratum-2 `CommandDispatched`) but never `Compacted` — is RESUMED
+    /// on `open`: the driver reconstructs the `Compact` from the rebuilt World's
+    /// tail History, re-dispatches it under the SAME `cmd` through the live driver,
+    /// and drives the compaction AND the continuation it resumes to quiescence. The
+    /// entity ends NOT `Compacting` (settled `Idle`), exactly two model calls fire
+    /// (the compaction + the resumed continuation), and the log carries the fresh
+    /// `Compacted` under that same `cmd`. Offline: snapshot anchor + stub model +
+    /// no-op surface driver, no network.
+    #[tokio::test]
+    async fn open_redispatches_a_compacting_crash_tail_and_completes() {
+        use crate::agent::world::inputs::Fingerprint;
+        use crate::agent::world::lifecycle::{
+            ActorCtx, AppId, EffectKind, IdempotencyKey, LifecycleEvent,
+        };
+        use crate::agent::world::world::CmdId;
+
+        // The cmd of the compaction call in flight when the App crashed.
+        let cmd: CmdId = 42;
+
+        // The resume anchor: genesis + folded `SessionStarted`, the primary entity
+        // forced into `Compacting { cmd }` over a NON-EMPTY History (the older half
+        // is what the interrupted `Compact` was summarizing). Captured as a snapshot
+        // so `restore` reconstructs this Compacting state directly.
+        let session = Event {
+            origin: Origin::System,
+            edge: edge::HUMAN_EDGE,
+            at: 0,
+            wall: now_wall(),
+            input: LogicalInput::SessionStarted {
+                seed: 7,
+                surface_tools: surface_tool_names().0,
+            },
+        };
+        let (mut world, _no_commands) =
+            crate::agent::world::systems::tick(&genesis_world(7, stub_model()), &session);
+        {
+            let e = world
+                .entities
+                .get_mut(&PRIMARY_ENTITY)
+                .expect("primary entity");
+            e.history.0.push(Msg {
+                role: Role::User,
+                content: vec![Block::Text {
+                    text: "old question".into(),
+                }],
+            });
+            e.history.0.push(Msg {
+                role: Role::Assistant,
+                content: vec![Block::Text {
+                    text: "old answer".into(),
+                }],
+            });
+            e.activity = Activity::Compacting { cmd };
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SnapshotStore::new(dir.path().join("snapshots"));
+        store
+            .write(&capture(world.clone()))
+            .expect("write the compacting resume anchor");
+
+        // The recorded log: the `SessionStarted` header (stratum-1, so `open`
+        // RESUMES) plus the in-flight `Compact` dispatch-intent (stratum-2) with NO
+        // `Compacted` result — the truncated mid-effect crash.
+        let mut log = MemoryEventLog::new();
+        log.append(&session).expect("append the session header");
+        log.append_lifecycle(&LifecycleEvent::CommandDispatched {
+            at: 0,
+            cmd,
+            kind: EffectKind::Compact,
+            ctx: ActorCtx {
+                entity: PRIMARY_ENTITY,
+                origin: Origin::Agent,
+                edge: edge::HUMAN_EDGE,
+            },
+            key: IdempotencyKey {
+                app_id: AppId::default(),
+                tick: 0,
+                effect_id: 0,
+            },
+            fingerprint: Fingerprint(format!("fp-compact-{cmd}")),
+        })
+        .expect("append the in-flight Compact dispatch-intent");
+
+        let driver = WorldDriver::open(
+            7,
+            stub_model(),
+            StubModelCaller {
+                text: "summary of old turns".into(),
+                calls: AtomicUsize::new(0),
+            },
+            NoSurfaceDrive,
+            log,
+            store,
+        )
+        .await
+        .expect("open resumes and completes the interrupted compaction");
+
+        // No entity is left `Compacting`: the compaction was driven to completion.
+        assert!(
+            !driver
+                .world
+                .entities
+                .values()
+                .any(|c| matches!(c.activity, Activity::Compacting { .. })),
+            "open drove the interrupted compaction to quiescence — no entity left Compacting"
+        );
+        // The primary entity settled back to Idle (the resumed continuation ended).
+        assert!(
+            matches!(
+                driver.world.entities.get(&PRIMARY_ENTITY).unwrap().activity,
+                Activity::Idle
+            ),
+            "the resumed continuation drove the entity back to Idle"
+        );
+        // Exactly two model calls: the re-dispatched Compact + the continuation it
+        // resumed (proving the session both COMPLETED the compaction and continued).
+        assert_eq!(
+            driver.client.calls.load(Ordering::SeqCst),
+            2,
+            "the re-dispatched Compact and the resumed continuation each made one call"
+        );
+        // The fresh `Compacted` was appended to the log under the SAME cmd.
+        let events = driver.log.load().expect("load the resumed log");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.input, LogicalInput::Compacted { cmd: c, .. } if *c == cmd)),
+            "the re-dispatch recorded a Compacted result under the same cmd"
+        );
     }
 
     /// `crosses_snapshot_boundary` fires exactly on the tick advance that enters a

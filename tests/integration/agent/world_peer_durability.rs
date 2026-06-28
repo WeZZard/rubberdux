@@ -396,6 +396,7 @@ fn genesis() -> World {
             turns: 0,
             spawned: 0,
             model: None,
+            autonomy: None,
         },
     );
     world

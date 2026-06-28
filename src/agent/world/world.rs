@@ -76,6 +76,34 @@ impl World {
             resources,
         }
     }
+
+    /// Resolve the EFFECTIVE `ModelConfig` for an entity: its per-entity override
+    /// (`Components.model`) else the world default (`Resources.model`). A PURE
+    /// lookup over `Components` + `Resources` — no IO/clock/RNG — consulted at
+    /// every `CallModel` emit so an entity's call uses its overridden model. An
+    /// entity with `model: None` (the only shape any recorded log carries today)
+    /// resolves byte-identically to the world default, so existing replay sinks
+    /// stay green. See docs/agent/world/ecs-runtime.md §343-348 (per-entity overrides).
+    pub fn model_for(&self, entity: EntityId) -> ModelConfig {
+        self.entities
+            .get(&entity)
+            .and_then(|e| e.model.clone())
+            .unwrap_or_else(|| self.resources.model.clone())
+    }
+
+    /// Resolve the EFFECTIVE `Autonomy` policy for an entity: its per-entity
+    /// override (`Components.autonomy`) else the world default
+    /// (`Resources.autonomy`). A PURE lookup over `Components` + `Resources` — no
+    /// IO/clock/RNG — consulted at the autonomy gate (AutonomySystem). An entity
+    /// with `autonomy: None` (the only shape any recorded log carries today)
+    /// resolves byte-identically to the world default, so existing replay sinks
+    /// stay green. See docs/agent/world/ecs-runtime.md §343-348 (per-entity overrides).
+    pub fn autonomy_for(&self, entity: EntityId) -> Autonomy {
+        self.entities
+            .get(&entity)
+            .and_then(|e| e.autonomy.clone())
+            .unwrap_or_else(|| self.resources.autonomy.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +157,13 @@ pub struct Components {
     pub spawned: u32,
     /// Per-entity override of the world-default `ModelConfig` (`None` ⇒ inherit).
     pub model: Option<ModelConfig>,
+    /// Per-entity override of the world-default autonomy policy (`None` ⇒ inherit
+    /// `Resources.autonomy`). Resolution is this override else the world default.
+    /// `#[serde(default)]` so M1/M2/M3 logs and snapshots without this field
+    /// deserialise byte-identically. See docs/agent/world/ecs-runtime.md
+    /// (Autonomy/Tier; AutonomySystem; per-entity overrides).
+    #[serde(default)]
+    pub autonomy: Option<Autonomy>,
 }
 
 /// A per-entity FIFO of inbound user messages parked while the entity is mid-run
@@ -264,6 +299,12 @@ pub const HELD_CMD: CmdId = u32::MAX;
 /// See docs/agent/world/ecs-runtime.md §"Boundedness"/Caps.
 pub type QueueCap = u32;
 
+/// A byte-count capacity. `0` means **unbounded** — the brake is intentionally
+/// disabled (blobs are never externalized regardless of size).
+///
+/// See docs/agent/world/ecs-runtime.md §1415-1434 (two-stage blob design).
+pub type ByteCap = u32;
+
 /// Bounded-resource knobs for the World: every queue, growing structure, and
 /// retry loop carries an explicit brake here so the runtime cannot grow without
 /// bound. `Caps` is World state (a `Resources` singleton) and therefore replays
@@ -289,6 +330,15 @@ pub struct Caps {
     /// `DeliveryOutcome::Rejected`. `0` = unbounded (no backpressure). See
     /// docs/agent/world/ecs-runtime.md §"Durable peer delivery" (§1335–1338).
     pub peer_inbox: QueueCap,
+    /// Maximum number of bytes a blob (`Block::Image`) may carry inline in the
+    /// log/snapshot. Payloads exceeding this cap are externalized to the blob
+    /// store (BL-store) and recorded as `ImageSource::Blob{hash}`.
+    /// `0` ⇒ unbounded: blobs are never externalized regardless of size.
+    /// `#[serde(default)]` so M1/M2/M3 logs and snapshots (which carry no
+    /// `blob_inline_cap` key) deserialise byte-identically.
+    /// See docs/agent/world/ecs-runtime.md §1415-1434 (two-stage blob design).
+    #[serde(default)]
+    pub blob_inline_cap: ByteCap,
 }
 
 impl Default for Caps {
@@ -303,6 +353,9 @@ impl Default for Caps {
             // 0 = unbounded: no inbox backpressure by default; an operator
             // sets a positive value to bound the per-App peer inbox.
             peer_inbox: 0,
+            // 0 = unbounded: blobs are never externalized by default; an
+            // operator sets a positive value to engage the BL-cap policy.
+            blob_inline_cap: 0,
         }
     }
 }
@@ -344,9 +397,10 @@ pub struct Resources {
     #[serde(default)]
     pub raised: BTreeMap<ReqId, (EntityId, ToolUseId)>,
     /// World-default autonomy policy; per-entity overrides live in
-    /// `Components.autonomy` (a future milestone). Resolution is entity override
-    /// else this default. Updated by `SetAutonomy`; owned by AutonomySystem.
-    /// See docs/agent/world/ecs-runtime.md (Autonomy/Tier; AutonomySystem).
+    /// `Components.autonomy`. Resolution is entity override else this default.
+    /// Updated by `SetAutonomy`; owned by AutonomySystem.
+    /// See docs/agent/world/ecs-runtime.md (Autonomy/Tier; AutonomySystem;
+    /// per-entity overrides).
     #[serde(default = "default_autonomy")]
     pub autonomy: Autonomy,
     /// Max sub-agent NESTING depth along any root→leaf path — a single global
@@ -636,6 +690,7 @@ pub enum Effort {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::world::autonomy::Autonomy;
     use crate::agent::world::history::{Block, History, Msg, Role, ToolResult};
 
     fn sample_model() -> ModelConfig {
@@ -671,6 +726,7 @@ mod tests {
                 turns: 4,
                 spawned: 2,
                 model: None,
+                autonomy: None,
             },
         );
         world.entities.insert(
@@ -689,6 +745,7 @@ mod tests {
                 turns: 0,
                 spawned: 0,
                 model: Some(sample_model()),
+                autonomy: None,
             },
         );
 
@@ -808,6 +865,80 @@ mod tests {
         }
     }
 
+    /// A `Caps` JSON without a `blob_inline_cap` key (any M1/M2/M3 log) must
+    /// deserialise with `blob_inline_cap == 0` (never externalize). The field is
+    /// additive — old logs round-trip byte-identically (BL-types VC-1.2 back-compat).
+    #[test]
+    fn caps_blob_inline_cap_defaults_to_zero_for_old_logs() {
+        let old_caps =
+            r#"{"snapshot_interval":64,"snapshot_keep":3,"branch_grace":0,"peer_inbox":0}"#;
+        let caps: Caps = serde_json::from_str(old_caps).expect("deserialise old caps");
+        assert_eq!(
+            caps.blob_inline_cap, 0,
+            "missing blob_inline_cap must default to 0 (unbounded, never externalize)"
+        );
+        // A full round-trip with the new field set is also stable.
+        let caps_with_cap = Caps { blob_inline_cap: 65536, ..Caps::default() };
+        let json = serde_json::to_string(&caps_with_cap).expect("serialise");
+        let back: Caps = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(caps_with_cap, back);
+    }
+
+    /// `Components.autonomy` round-trips a `Some(override)` and defaults to `None`
+    /// when absent from old JSON — the additive `#[serde(default)]` field must be
+    /// byte-identical to today for serialised data that omits it (OV-types VC-3.1).
+    #[test]
+    fn components_autonomy_override_round_trips_and_defaults_to_none() {
+        use crate::agent::world::autonomy::Autonomy;
+
+        // A Some(override) round-trips exactly.
+        let with_override = Components {
+            identity: Identity::Primary,
+            lineage: Lineage { parent: None, depth: 0 },
+            history: History::default(),
+            activity: Activity::Idle,
+            gate: EntityGate::default(),
+            budget: Budget::default(),
+            inbox: Inbox::default(),
+            turns: 0,
+            spawned: 0,
+            model: None,
+            autonomy: Some(Autonomy::RunFree),
+        };
+        let json = serde_json::to_string(&with_override).expect("serialise Components");
+        let back: Components = serde_json::from_str(&json).expect("deserialise Components");
+        assert_eq!(with_override, back);
+        assert_eq!(back.autonomy, Some(Autonomy::RunFree));
+
+        // A Components JSON written BEFORE the `autonomy` field existed (no key present)
+        // must deserialise to `autonomy: None` — the additive back-compat guarantee.
+        // Build the "old" JSON by serialising a real Components and removing the key.
+        let base = Components {
+            identity: Identity::Primary,
+            lineage: Lineage { parent: None, depth: 0 },
+            history: History::default(),
+            activity: Activity::Idle,
+            gate: EntityGate::default(),
+            budget: Budget::default(),
+            inbox: Inbox::default(),
+            turns: 0,
+            spawned: 0,
+            model: None,
+            autonomy: None,
+        };
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&serde_json::to_string(&base).expect("serialise"))
+                .expect("parse to map");
+        map.remove("autonomy");
+        let old_json = serde_json::to_string(&map).expect("re-serialise without autonomy key");
+        let c: Components =
+            serde_json::from_str(&old_json).expect("deserialise old Components");
+        assert_eq!(
+            c.autonomy, None,
+            "old JSON without autonomy key must deserialise to None"
+        );
+    }
+
     #[test]
     fn compacting_and_cancelling_round_trip() {
         let compacting = Activity::Compacting { cmd: 99 };
@@ -821,5 +952,102 @@ mod tests {
         let json = serde_json::to_string(&cancelling).expect("serialise Cancelling");
         let back: Activity = serde_json::from_str(&json).expect("deserialise Cancelling");
         assert_eq!(cancelling, back);
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-entity override resolution (model_for / autonomy_for) — VC-3.1
+    // -----------------------------------------------------------------------
+
+    /// One `Idle` entity carrying the given per-entity overrides (`None` ⇒ inherit).
+    fn entity_with_overrides(
+        model: Option<ModelConfig>,
+        autonomy: Option<Autonomy>,
+    ) -> Components {
+        Components {
+            identity: Identity::Primary,
+            lineage: Lineage { parent: None, depth: 0 },
+            history: History::default(),
+            activity: Activity::Idle,
+            gate: EntityGate::default(),
+            budget: Budget::default(),
+            inbox: Inbox::default(),
+            turns: 0,
+            spawned: 0,
+            model,
+            autonomy,
+        }
+    }
+
+    /// `model_for` resolves an entity's `Components.model` override when present and
+    /// inherits `Resources.model` (the world default) when it is `None`. The pure
+    /// per-entity resolution consulted at every `CallModel` emit; a `None` entity is
+    /// byte-identical to the prior world-default read. See VC-3.1.
+    #[test]
+    fn model_for_resolves_override_else_world_default() {
+        let world_default = sample_model();
+        let mut world = World::new(0, Resources::new(42, world_default.clone()));
+        let override_model = ModelConfig {
+            model: "claude-cheap".into(),
+            max_tokens: 256,
+            effort: Effort::Low,
+        };
+        // Entity 0: no override ⇒ inherits the world default.
+        world.entities.insert(0, entity_with_overrides(None, None));
+        // Entity 1: a Some(override) ⇒ resolves to its own model.
+        world
+            .entities
+            .insert(1, entity_with_overrides(Some(override_model.clone()), None));
+
+        assert_eq!(
+            world.model_for(0),
+            world_default,
+            "None inherits Resources.model (byte-identical to the world default)"
+        );
+        assert_eq!(
+            world.model_for(1),
+            override_model,
+            "Some(override) resolves to the entity's own model"
+        );
+        // Pure and total: an unknown entity also falls back to the world default.
+        assert_eq!(
+            world.model_for(99),
+            world_default,
+            "a missing entity inherits the world default"
+        );
+    }
+
+    /// `autonomy_for` resolves an entity's `Components.autonomy` override when present
+    /// and inherits `Resources.autonomy` (the world default) when it is `None`. The
+    /// pure per-entity resolution consulted at the autonomy gate; a `None` entity is
+    /// byte-identical to the prior world-default read. See VC-3.1.
+    #[test]
+    fn autonomy_for_resolves_override_else_world_default() {
+        let mut world = World::new(0, Resources::new(42, sample_model()));
+        // `Resources::new` seeds the world default as RunFree.
+        assert_eq!(world.resources.autonomy, Autonomy::RunFree);
+        // Entity 0: no override ⇒ inherits the world default (RunFree).
+        world.entities.insert(0, entity_with_overrides(None, None));
+        // Entity 1: a Some(override) ⇒ resolves to its own policy.
+        world.entities.insert(
+            1,
+            entity_with_overrides(None, Some(Autonomy::AskEverything)),
+        );
+
+        assert_eq!(
+            world.autonomy_for(0),
+            Autonomy::RunFree,
+            "None inherits Resources.autonomy (byte-identical to the world default)"
+        );
+        assert_eq!(
+            world.autonomy_for(1),
+            Autonomy::AskEverything,
+            "Some(override) resolves to the entity's own policy"
+        );
+        // Pure and total: an unknown entity also falls back to the world default.
+        assert_eq!(
+            world.autonomy_for(99),
+            Autonomy::RunFree,
+            "a missing entity inherits the world default"
+        );
     }
 }

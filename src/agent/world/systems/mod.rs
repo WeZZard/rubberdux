@@ -10,6 +10,7 @@ pub mod steering;
 pub mod cancel;
 pub mod autonomy;
 pub mod gate;
+pub mod guardrail;
 pub mod budget;
 pub mod compaction;
 pub mod subagent;
@@ -90,6 +91,19 @@ const REGISTRY: &[(Phase, &'static dyn System)] = &[
     // guarded settling Systems, never double-processed. `Cancel` is total across every
     // active state (Inv 10, 14). See docs/agent/world/ecs-runtime.md (CancelSystem).
     (Phase::Lifecycle, &cancel::CancelSystem),
+    // GuardrailSystem is the App-wide policy-halt TRIP SOURCE (phase 1 Lifecycle).
+    // On a policy-predicate match (P0: a `ModelResponded` whose `stop_reason` is
+    // `Refusal`) it ADDS a `PolicyHalt(GuardrailTrip)` hold to the `WorldGate`,
+    // closing the gate so NEW WORK is gated (Inv 13). The hold is APPENDED, never
+    // substituted, so it coexists with a concurrent `User` pause and the gate
+    // reopens only when ALL holds clear. It runs at the END of phase 1 — after the
+    // explicit lifecycle folds (GateSystem) and cancel arbitration (CancelSystem),
+    // but still BEFORE the new-work phases (Intake phase 2, TurnAdvance phase 5)
+    // the gate suppresses — so a trip observed this tick gates this tick's
+    // dispatch. It only TRIPS; the named clearing input `ClearPolicyHalt` is folded
+    // by GateSystem. See docs/agent/world/ecs-runtime.md (GuardrailSystem;
+    // WorldGate; PolicyHalt(GuardrailTrip); Tick discipline phase 1).
+    (Phase::Lifecycle, &guardrail::GuardrailSystem),
     // SteeringSystem owns the `UserMessage` half of steering (phase 2): a mid-run
     // message does NOT interrupt the in-flight turn (steering is a COMPOSITION —
     // `UserMessage` + optional `Cancel` — never its own Input). It runs BEFORE
@@ -283,6 +297,7 @@ mod tests {
                 turns: 0,
                 spawned: 0,
                 model: None,
+                autonomy: None,
             },
         );
         world

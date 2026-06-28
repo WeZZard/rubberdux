@@ -92,6 +92,7 @@ fn genesis(seed: u64, model: &ModelConfig, limits: Limits) -> World {
             turns: 0,
             spawned: 0,
             model: None,
+            autonomy: None,
         },
     );
     world

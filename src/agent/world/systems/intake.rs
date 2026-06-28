@@ -84,7 +84,10 @@ impl System for IntakeSystem {
         // as a pure function of World state, so replay mints the same id (Inv 8).
         let (cmd, ids) = world.resources.ids.mint_cmd();
         world.resources.ids = ids;
-        let default_model = world.resources.model.clone();
+        // Resolve this turn's model at the `CallModel` emit: the entity's override
+        // (`Components.model`) else the world default — computed BEFORE the mutable
+        // entity borrow below. See docs/agent/world/ecs-runtime.md §343-348.
+        let params = world.model_for(*to);
         // The surface tools offered to the App's ROOT (surface-capable) entity, read
         // into this turn's `ToolSet` so a live model call is told `set_value` EXISTS
         // and can request it. A non-root entity (a sub-agent) is offered none, and the
@@ -130,8 +133,6 @@ impl System for IntakeSystem {
         // Advance the loop-guard counter — World state, so replay reproduces the brake.
         entity.turns = next_turns;
         entity.activity = Activity::Thinking { cmd };
-        // Entity model override else world default (Resources.model).
-        let params = entity.model.clone().unwrap_or(default_model);
         let messages = entity.history.clone();
 
         let command = Command::CallModel {
@@ -193,6 +194,7 @@ mod tests {
                 turns: 0,
                 spawned: 0,
                 model: None,
+                autonomy: None,
             },
         );
         world
