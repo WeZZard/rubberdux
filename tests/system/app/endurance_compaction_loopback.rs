@@ -19,7 +19,7 @@
 //! **Phase 1 — the live low-context TRIGGER (real model call).** A user turn drives
 //! the pure `tick` reducer to a `CallModel`, a SECOND user message parks in the
 //! entity's Inbox (a continuation is pending), and the `CallModel` is dispatched
-//! through the production [`drive_live`] against a REAL [`MessagesClient`]. Folding
+//! through the production [`drive_live`] against the REAL selected provider. Folding
 //! the real `ModelResponded` settles the turn `Idle`, `BudgetSystem` folds the REAL
 //! usage (over the limit), and `CompactionSystem` DEFERS the continuation:
 //! `Idle → Compacting { cmd }` + a `Command::Compact`. The low `context_limit`
@@ -58,25 +58,27 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::Value as Json;
-
 use rubberdux::agent::world::budget::{Budget, Limits};
 use rubberdux::agent::world::driver::WorldDriver;
 use rubberdux::agent::world::edge::HUMAN_EDGE;
 use rubberdux::agent::world::effects::{
-    drive_live, Command, ModelCaller, ResultStamp, SurfaceDriver, UnattachedPeerSender,
+    drive_live, Command, ResultStamp, SurfaceDriver, UnattachedPeerSender,
 };
 use rubberdux::agent::world::event_log::{EventLog, MemoryEventLog};
 use rubberdux::agent::world::gates::EntityGate;
-use rubberdux::agent::world::history::{Block, History};
+use rubberdux::agent::world::history::History;
 use rubberdux::agent::world::inputs::{
-    Event, Fingerprint, LogicalInput, ModelMeta, Origin,
+    Event, Fingerprint, LogicalInput, Origin,
 };
 use rubberdux::agent::world::lifecycle::{
     ActorCtx, AppId, EffectKind, IdempotencyKey, LifecycleEvent,
 };
-use rubberdux::agent::world::model_client::MessagesClient;
 use rubberdux::agent::world::replay::restore;
+use rubberdux::provider::{
+    ModelApi, ModelInfo, ModelRequest, ModelResponse, selected_from_env,
+};
+use std::future::Future;
+use std::pin::Pin;
 use rubberdux::agent::world::snapshot::{capture, SnapshotStore};
 use rubberdux::agent::world::systems::tick;
 use rubberdux::agent::world::world::{
@@ -137,7 +139,7 @@ fn genesis(model: &ModelConfig) -> World {
 }
 
 /// The real-env `ModelConfig` the live calls target. `model` is the alias
-/// `MessagesClient::from_env` resolved from `RUBBERDUX_LLM_MODEL`; `max_tokens` from
+/// `selected_from_env` resolved from `RUBBERDUX_LLM_MODEL`; `max_tokens` from
 /// `RUBBERDUX_LLM_MAX_TOKENS` (default 1024); effort `Medium`. Mirrors the sibling
 /// endurance loopbacks.
 fn env_model_config(model_alias: &str) -> ModelConfig {
@@ -188,19 +190,30 @@ impl SurfaceDriver for NoSurfaceDrive {
     }
 }
 
-/// A `ModelCaller` that forwards to a REAL [`MessagesClient`] and COUNTS its calls,
+/// A `ModelCaller` that forwards to the REAL selected provider and COUNTS its calls,
 /// so the test proves the resume advanced the REAL call count (the compaction +
 /// continuation each made a real call). The guard is dropped before the await so the
 /// future stays `Send`.
 struct CountingCaller<'a> {
-    inner: &'a MessagesClient,
+    inner: &'a dyn ModelApi,
     calls: Arc<AtomicUsize>,
 }
 
-impl ModelCaller for CountingCaller<'_> {
-    async fn call(&self, request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+impl ModelApi for CountingCaller<'_> {
+    fn turn<'a>(
+        &'a self,
+        req: &'a ModelRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.call(request_body).await
+        self.inner.turn(req)
+    }
+    fn list_models<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+        self.inner.list_models()
+    }
+    fn model(&self) -> &str {
+        self.inner.model()
     }
 }
 
@@ -257,8 +270,8 @@ pub async fn run() {
         return;
     }
 
-    let client = MessagesClient::from_env()
-        .expect("build a MessagesClient from RUBBERDUX_LLM_* for the live compaction turn");
+    let client = selected_from_env()
+        .expect("build a provider from RUBBERDUX_LLM_* for the live compaction turn");
     let model = env_model_config(client.model());
     eprintln!(
         "[VC-2.2] real env model={:?}; context_limit={} (any real usage overflows it → \

@@ -1,7 +1,7 @@
 use tokio::sync::{broadcast, mpsc};
 
 use crate::agent::entry::{Entry, EntryOrigin};
-use crate::provider::moonshot::Message;
+use crate::provider::kimi_for_coding::Message;
 
 /// An event injected into the agent loop from any input source.
 pub enum LoopEvent {
@@ -120,7 +120,7 @@ impl OutputPort {
 mod tests {
     use super::*;
     use crate::agent::entry::EntryOrigin;
-    use crate::provider::moonshot::{Message, UserContent};
+    use crate::provider::kimi_for_coding::{Message, UserContent};
 
     #[tokio::test]
     async fn test_input_port_send_user_message_with_origin() {

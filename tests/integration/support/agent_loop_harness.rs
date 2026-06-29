@@ -9,7 +9,8 @@ use rubberdux::agent::entry::EntryOrigin;
 use rubberdux::agent::runtime::agent_loop::{AgentLoop, AgentLoopConfig};
 use rubberdux::agent::runtime::compaction::EvictOldestTurns;
 use rubberdux::agent::runtime::port::{EntryNotification, LoopEvent};
-use rubberdux::provider::moonshot::{Message, MoonshotClient, UserContent};
+use rubberdux::provider::kimi_for_coding::{Message, KimiForCodingClient, UserContent};
+use rubberdux::provider::{ModelApi, selected_from_env};
 use rubberdux::tool::ToolRegistry;
 
 /// Collected output from the agent loop broadcast.
@@ -22,7 +23,7 @@ pub struct LoopOutput {
 }
 
 /// Test harness that drives `AgentLoop` directly, bypassing the Telegram channel layer.
-/// Uses real LLM calls (MoonshotClient::from_env) and the full tool registry.
+/// Uses real LLM calls (KimiForCodingClient::from_env) and the full tool registry.
 pub struct AgentLoopHarness {
     input_port: rubberdux::agent::runtime::port::InputPort,
     entry_rx: tokio::sync::Mutex<broadcast::Receiver<EntryNotification>>,
@@ -37,15 +38,20 @@ pub struct MessageExchange {
 
 impl AgentLoopHarness {
     pub async fn new(system_prompt: &str, session_path: PathBuf) -> Self {
-        let client = Arc::new(MoonshotClient::from_env());
-        let registry = build_tool_registry(client.clone());
+        // The $web_search/web_fetch tools and subagent registries need a concrete
+        // Kimi client (Kimi-over-OpenAI builtins); the loop's turns route through
+        // the config-selected provider, exactly as production `AgentLoopBuilder` does.
+        let web_search_client = Arc::new(KimiForCodingClient::from_env());
+        let client: Arc<dyn ModelApi> =
+            Arc::from(selected_from_env().expect("build provider from env"));
+        let registry = build_tool_registry(web_search_client, client.clone());
         Self::new_with_registry(system_prompt, session_path, client, Arc::new(registry)).await
     }
 
     pub async fn new_with_registry(
         system_prompt: &str,
         session_path: PathBuf,
-        client: Arc<MoonshotClient>,
+        client: Arc<dyn ModelApi>,
         registry: Arc<ToolRegistry>,
     ) -> Self {
         let session_dir = session_path.parent().map(|p| p.to_path_buf());
@@ -190,11 +196,17 @@ impl AgentLoopHarness {
     }
 }
 
-/// Build the full tool registry the same way production does.
-fn build_tool_registry(client: Arc<MoonshotClient>) -> ToolRegistry {
-    use rubberdux::provider::moonshot::tool::bash::MoonshotBashTool;
-    use rubberdux::provider::moonshot::tool::web_fetch::MoonshotWebFetchTool;
-    use rubberdux::provider::moonshot::tool::web_search::WebSearchTool;
+/// Build the full tool registry the same way production does: `web_search_client`
+/// (concrete Kimi) backs the Kimi-over-OpenAI `$web_search` quirk tool and the
+/// subagent registries, while `model` (the config-selected provider) drives the
+/// agent tool's subagent turns.
+fn build_tool_registry(
+    web_search_client: Arc<KimiForCodingClient>,
+    model: Arc<dyn ModelApi>,
+) -> ToolRegistry {
+    use rubberdux::provider::kimi_for_coding::tool::bash::KimiForCodingBashTool;
+    use rubberdux::provider::kimi_for_coding::tool::web_fetch::KimiForCodingWebFetchTool;
+    use rubberdux::provider::kimi_for_coding::tool::web_search::WebSearchTool;
     use rubberdux::tool::agent::{AgentTool, build_subagent_registries};
     use rubberdux::tool::edit::EditFileTool;
     use rubberdux::tool::glob::GlobTool;
@@ -203,18 +215,18 @@ fn build_tool_registry(client: Arc<MoonshotClient>) -> ToolRegistry {
     use rubberdux::tool::write::WriteFileTool;
 
     let mut r = ToolRegistry::new();
-    r.register(Box::new(MoonshotBashTool::new()));
-    r.register(Box::new(MoonshotWebFetchTool::new()));
+    r.register(Box::new(KimiForCodingBashTool::new()));
+    r.register(Box::new(KimiForCodingWebFetchTool::new()));
     r.register(Box::new(ReadFileTool));
     r.register(Box::new(WriteFileTool));
     r.register(Box::new(EditFileTool));
     r.register(Box::new(GlobTool));
     r.register(Box::new(GrepTool));
-    r.register(Box::new(WebSearchTool::new(client.clone())));
+    r.register(Box::new(WebSearchTool::new(web_search_client.clone())));
 
-    let subagent_registries = build_subagent_registries(&client, &None, &None);
+    let subagent_registries = build_subagent_registries(&web_search_client, &None, &None);
     r.register(Box::new(AgentTool::new(
-        client.clone(),
+        model,
         subagent_registries,
         String::new(), // system_prompt — will be overridden by AgentLoopConfig
         tokio::sync::broadcast::channel::<rubberdux::agent::runtime::subagent::ContextEvent>(64).0,

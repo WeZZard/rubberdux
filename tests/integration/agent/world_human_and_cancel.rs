@@ -33,7 +33,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde_json::Value as Json;
 
 use rubberdux::agent::world::autonomy::{Autonomy, InteractionResponse};
-use rubberdux::agent::world::effects::{Command, ModelCaller, fingerprint_call};
+use rubberdux::agent::world::effects::{Command, fingerprint_call};
+use rubberdux::provider::{ModelApi, ModelInfo, ModelRequest, ModelResponse};
+use std::future::Future;
+use std::pin::Pin;
+
 use rubberdux::agent::world::gates::{EntityGate, PauseReason};
 use rubberdux::agent::world::history::{Block, History, Role};
 use rubberdux::agent::world::replay;
@@ -97,10 +101,21 @@ struct ExplodingClient {
     calls: Arc<AtomicUsize>,
 }
 
-impl ModelCaller for ExplodingClient {
-    async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+impl ModelApi for ExplodingClient {
+    fn turn<'a>(
+        &'a self,
+        _req: &'a ModelRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         panic!("the replay driver must never invoke the model client");
+    }
+    fn list_models<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn model(&self) -> &str {
+        "stub"
     }
 }
 

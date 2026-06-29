@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rubberdux::provider::moonshot::tool::{FunctionCall, ToolCall};
+use rubberdux::provider::kimi_for_coding::tool::{FunctionCall, ToolCall};
 use rubberdux::tool::ToolRegistry;
 
 use crate::support::mock_tools::MockTool;

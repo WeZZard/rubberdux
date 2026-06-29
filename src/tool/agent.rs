@@ -9,8 +9,9 @@ use tokio::sync::{Mutex, broadcast};
 
 use crate::agent::runtime::subagent::{ContextEvent, spawn_subagent};
 use crate::hardened_prompts::subagent_preamble;
-use crate::provider::moonshot::MoonshotClient;
-use crate::provider::moonshot::tool::ToolDefinition;
+use crate::provider::ModelApi;
+use crate::provider::kimi_for_coding::KimiForCodingClient;
+use crate::provider::kimi_for_coding::tool::ToolDefinition;
 use crate::session::{AgentMetadata, SessionManager};
 use crate::tool::{SubagentType, ToolRegistry};
 
@@ -21,12 +22,12 @@ use super::ToolOutcome;
 /// Explore and Plan share a single read-only registry.
 /// GeneralPurpose and ComputerUse get a full registry (no recursive `agent`).
 pub fn build_subagent_registries(
-    client: &Arc<MoonshotClient>,
+    client: &Arc<KimiForCodingClient>,
     workspace: &Option<Arc<crate::workspace::Workspace>>,
     mindset: &Option<Arc<crate::mindset::Mindset>>,
 ) -> HashMap<SubagentType, Arc<ToolRegistry>> {
-    use crate::provider::moonshot::tool::web_fetch::MoonshotWebFetchTool;
-    use crate::provider::moonshot::tool::web_search::WebSearchTool;
+    use crate::provider::kimi_for_coding::tool::web_fetch::KimiForCodingWebFetchTool;
+    use crate::provider::kimi_for_coding::tool::web_search::WebSearchTool;
     use crate::tool::glob::GlobTool;
     use crate::tool::grep::GrepTool;
     use crate::tool::read::ReadFileTool;
@@ -36,19 +37,19 @@ pub fn build_subagent_registries(
         r.register(Box::new(GlobTool));
         r.register(Box::new(GrepTool));
         r.register(Box::new(ReadFileTool));
-        r.register(Box::new(MoonshotWebFetchTool::new()));
+        r.register(Box::new(KimiForCodingWebFetchTool::new()));
         r.register(Box::new(WebSearchTool::new(client.clone())));
         r
     });
 
     let general_purpose = Arc::new({
-        use crate::provider::moonshot::tool::bash::MoonshotBashTool;
+        use crate::provider::kimi_for_coding::tool::bash::KimiForCodingBashTool;
         use crate::tool::edit::EditFileTool;
         use crate::tool::write::WriteFileTool;
 
         let mut r = ToolRegistry::new();
-        r.register(Box::new(MoonshotBashTool::new()));
-        r.register(Box::new(MoonshotWebFetchTool::new()));
+        r.register(Box::new(KimiForCodingBashTool::new()));
+        r.register(Box::new(KimiForCodingWebFetchTool::new()));
         r.register(Box::new(ReadFileTool));
         r.register(Box::new(WriteFileTool));
         r.register(Box::new(EditFileTool));
@@ -75,7 +76,7 @@ pub fn build_subagent_registries(
 /// Unified agent tool that routes to the correct execution strategy
 /// based on `subagent_type`.
 pub struct AgentTool {
-    client: Arc<MoonshotClient>,
+    client: Arc<dyn ModelApi>,
     registries: HashMap<SubagentType, Arc<ToolRegistry>>,
     base_system_prompt: String,
     context_tx: broadcast::Sender<ContextEvent>,
@@ -107,7 +108,7 @@ pub struct AgentTool {
 
 impl AgentTool {
     pub fn new(
-        client: Arc<MoonshotClient>,
+        client: Arc<dyn ModelApi>,
         registries: HashMap<SubagentType, Arc<ToolRegistry>>,
         base_system_prompt: String,
         context_tx: broadcast::Sender<ContextEvent>,
@@ -546,7 +547,7 @@ impl super::Tool for AgentTool {
             let (subagent_session, subagent_tool_results) =
                 if let (Some(mgr), Some(session_id)) = (&self.session_manager, &self.session_id) {
                     let metadata = AgentMetadata::for_subagent(
-                        "kimi-for-coding".into(), // TODO: get actual model from client
+                        self.client.model().to_owned(),
                         task_id.clone(),
                         session_id.to_string(),
                         format!("{:?}", subagent_type),
@@ -591,12 +592,26 @@ mod tests {
     use super::*;
     use crate::tool::Tool;
 
-    fn dummy_client() -> Arc<MoonshotClient> {
-        Arc::new(MoonshotClient::new(
+    fn dummy_client() -> Arc<KimiForCodingClient> {
+        Arc::new(KimiForCodingClient::new(
             reqwest::Client::new(),
             "http://localhost:0".into(),
             "test-key".into(),
             "test-model".into(),
+        ))
+    }
+
+    /// A `dyn ModelApi` for `AgentTool`'s turn-driving client (distinct from the
+    /// Kimi `$web_search` client that `build_subagent_registries` still needs).
+    fn dummy_model_api() -> Arc<dyn ModelApi> {
+        use crate::provider::AuthScheme;
+        use crate::provider::dialect::openai_chat_completions::OpenAiChatCompletions;
+        Arc::new(OpenAiChatCompletions::new(
+            reqwest::Client::new(),
+            "http://localhost:0".into(),
+            "test-key".into(),
+            "test-model".into(),
+            AuthScheme::Bearer,
         ))
     }
 
@@ -606,11 +621,10 @@ mod tests {
     }
 
     fn dummy_agent_tool() -> AgentTool {
-        let client = dummy_client();
         let registries = dummy_registries();
         let (context_tx, _) = broadcast::channel(4);
         AgentTool::new(
-            client,
+            dummy_model_api(),
             registries,
             "test system prompt".into(),
             context_tx,
@@ -903,10 +917,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_registry_for_type() {
-        let client = dummy_client();
         let (context_tx, _) = broadcast::channel(4);
         let tool = AgentTool::new(
-            client,
+            dummy_model_api(),
             HashMap::new(), // empty registries
             "test system prompt".into(),
             context_tx,

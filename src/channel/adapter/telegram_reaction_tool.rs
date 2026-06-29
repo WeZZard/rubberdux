@@ -6,7 +6,7 @@ use teloxide::prelude::*;
 use teloxide::types::{MessageId, ReactionType};
 use tokio::sync::Mutex;
 
-use crate::provider::moonshot::tool::ToolDefinition;
+use crate::provider::kimi_for_coding::tool::ToolDefinition;
 use crate::tool::{Tool, ToolOutcome};
 
 pub struct TelegramReactionTool {

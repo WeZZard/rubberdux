@@ -26,9 +26,13 @@ use serde_json::Value as Json;
 
 use rubberdux::agent::world::budget::Budget;
 use rubberdux::agent::world::effects::{
-    Command, CommandKey, ModelCaller, Reconciliation, ResultStamp, SurfaceDriver, ToolSet,
+    Command, CommandKey, Reconciliation, ResultStamp, SurfaceDriver, ToolSet,
     UnattachedPeerSender, drive_live, fingerprint_call, resume,
 };
+use rubberdux::provider::{ContentBlock, ModelApi, ModelInfo, ModelRequest, ModelResponse};
+use std::future::Future;
+use std::pin::Pin;
+
 use rubberdux::agent::world::event_log::{EventLog, MemoryEventLog};
 use rubberdux::agent::world::gates::EntityGate;
 use rubberdux::agent::world::history::{Block, History, Msg, Role};
@@ -131,21 +135,32 @@ fn user_message(at: u64, text: &str) -> Event {
 /// `ModelResponded` without a network. Mirrors the effects.rs unit-test stub.
 struct StubClient;
 
-impl ModelCaller for StubClient {
-    async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
-        Ok((
-            vec![Block::Text { text: "ok".into() }],
-            ModelMeta {
+impl ModelApi for StubClient {
+    fn turn<'a>(
+        &'a self,
+        _req: &'a ModelRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
+        Box::pin(async {
+            Ok(ModelResponse {
+                blocks: vec![ContentBlock::Text { text: "ok".into() }],
+                stop_reason: StopReason::EndTurn,
                 usage: Usage {
                     input_tokens: 1,
                     output_tokens: 1,
                 },
                 model_id: "claude-crash-recovery".into(),
-                stop_reason: StopReason::EndTurn,
-                capabilities: Capabilities(serde_json::json!({})),
                 reasoning: ReasoningPolicy::Drop,
-            },
-        ))
+                capabilities: serde_json::json!({}),
+            })
+        })
+    }
+    fn list_models<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn model(&self) -> &str {
+        "claude-crash-recovery"
     }
 }
 

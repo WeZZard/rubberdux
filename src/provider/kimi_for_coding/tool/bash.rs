@@ -1,21 +1,21 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::provider::moonshot::tool::ToolDefinition;
+use crate::provider::kimi_for_coding::tool::ToolDefinition;
 use crate::tool::bash::BashTool;
 use crate::tool::{Tool, ToolOutcome};
 
-pub struct MoonshotBashTool {
+pub struct KimiForCodingBashTool {
     inner: BashTool,
 }
 
-impl MoonshotBashTool {
+impl KimiForCodingBashTool {
     pub fn new() -> Self {
         Self { inner: BashTool }
     }
 }
 
-impl Tool for MoonshotBashTool {
+impl Tool for KimiForCodingBashTool {
     fn name(&self) -> &str {
         "bash"
     }
@@ -37,8 +37,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_moonshot_bash_definition_has_behavioral_overlay() {
-        let tool = MoonshotBashTool::new();
+    fn test_kimi_for_coding_bash_definition_has_behavioral_overlay() {
+        let tool = KimiForCodingBashTool::new();
         let def = tool.definition();
         let desc = def.function.description.as_deref().unwrap_or("");
         assert!(

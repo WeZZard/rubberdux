@@ -1,5 +1,5 @@
 use crate::agent::entry::EntryHistory;
-use crate::provider::moonshot::Message;
+use crate::provider::kimi_for_coding::Message;
 
 /// Strategy for compacting history when token budget is exceeded.
 pub trait CompactionStrategy: Send + Sync {
@@ -73,8 +73,8 @@ impl CompactionStrategy for EvictOldestTurns {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::moonshot::tool::{FunctionCall, ToolCall};
-    use crate::provider::moonshot::{Message, UserContent};
+    use crate::provider::kimi_for_coding::tool::{FunctionCall, ToolCall};
+    use crate::provider::kimi_for_coding::{Message, UserContent};
 
     /// Helper to build test history.
     fn build_test_history() -> EntryHistory {

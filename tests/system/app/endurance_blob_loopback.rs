@@ -22,7 +22,7 @@
 //! 1. The user message drives the pure `tick` reducer, which emits the turn's
 //!    `CallModel`.
 //! 2. That `CallModel` is dispatched through the production
-//!    [`drive_live_with_blob_sink`] against a REAL [`MessagesClient`], wrapped so the
+//!    [`drive_live_with_blob_sink`] against the REAL selected provider, wrapped so the
 //!    turn's response carries a REAL large image payload (over the cap) alongside the
 //!    model's genuine text — exactly the shape a multimodal turn (or a large
 //!    image-bearing tool result folded into the response) produces. The model CALL
@@ -53,23 +53,28 @@
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::Value as Json;
+use base64::Engine;
 
 use rubberdux::agent::world::blob::BlobStore;
 use rubberdux::agent::world::budget::Budget;
 use rubberdux::agent::world::effects::{
-    drive_live_with_blob_sink, Command, ModelCaller, ResultStamp, SurfaceDriver,
+    drive_live_with_blob_sink, Command, ResultStamp, SurfaceDriver,
     UnattachedPeerSender,
 };
 use rubberdux::agent::world::event_log::{EventLog, MemoryEventLog};
 use rubberdux::agent::world::gates::EntityGate;
 use rubberdux::agent::world::history::{Block, History, ImageSource};
-use rubberdux::agent::world::inputs::{Event, LogicalInput, ModelMeta, Origin};
-use rubberdux::agent::world::model_client::MessagesClient;
+use rubberdux::agent::world::inputs::{Event, LogicalInput, Origin};
 use rubberdux::agent::world::world::{
     Activity, Components, Effort, EntityId, Identity, Inbox, Lineage, ModelConfig, Resources, World,
 };
 use rubberdux::error::Error;
+use rubberdux::provider::{
+    ContentBlock, ImageSource as NeutralImageSource, ModelApi, ModelInfo, ModelRequest,
+    ModelResponse, selected_from_env,
+};
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::live_gate::skip_without_live_llm;
 
@@ -117,7 +122,7 @@ fn genesis(model: &ModelConfig) -> World {
 }
 
 /// The world-default `ModelConfig` (the real env model the live call targets).
-/// `model` is the alias `MessagesClient::from_env` resolved from `RUBBERDUX_LLM_MODEL`
+/// `model` is the alias `selected_from_env` resolved from `RUBBERDUX_LLM_MODEL`
 /// (so a REAL call hits a valid model); `max_tokens` from `RUBBERDUX_LLM_MAX_TOKENS`
 /// (default 1024); effort `Medium`. Mirrors `endurance_overrides_loopback`.
 fn env_model_config(model_alias: &str) -> ModelConfig {
@@ -152,57 +157,82 @@ impl SurfaceDriver for NoSurfaceDrive {
     }
 }
 
-/// A `ModelCaller` that forwards to a REAL [`MessagesClient`] and then attaches a
+/// A `ModelCaller` that forwards to the REAL selected provider and then attaches a
 /// REAL large image payload to the response — exactly the shape a multimodal turn
 /// (or a large image-bearing tool result folded into the response) produces. The
 /// model CALL is real (text in/out); the attached image is the real over-cap payload
 /// the production driver must externalize to the `BlobStore`. The request body lock
 /// is dropped before the await so the future stays `Send`.
 struct LargeImageCaller<'a> {
-    inner: &'a MessagesClient,
+    inner: &'a dyn ModelApi,
     image_bytes: Vec<u8>,
     mime: String,
-    last_body: Mutex<Option<Json>>,
+    last_request_had_image: Mutex<Option<bool>>,
 }
 
 impl<'a> LargeImageCaller<'a> {
-    fn new(inner: &'a MessagesClient, image_bytes: Vec<u8>) -> Self {
+    fn new(inner: &'a dyn ModelApi, image_bytes: Vec<u8>) -> Self {
         Self {
             inner,
             image_bytes,
             mime: "image/png".into(),
-            last_body: Mutex::new(None),
+            last_request_had_image: Mutex::new(None),
         }
     }
 
-    /// Whether the request body the live driver assembled and sent contained NO image
-    /// — the request is text-only (the over-cap payload is carried by the RESPONSE,
-    /// so the real provider never has to accept an image, keeping the live call
-    /// robust). `Some(false)` only if an image somehow appeared in the request.
+    /// Whether the neutral request the live driver assembled and sent contained NO
+    /// image block — the request is text-only (the over-cap payload is carried by the
+    /// RESPONSE, so the real provider never has to accept an image, keeping the live
+    /// call robust). `Some(false)` only if an image somehow appeared in the request.
     fn request_was_text_only(&self) -> Option<bool> {
-        let guard = self.last_body.lock().expect("lock the recorded request body");
-        let body = guard.as_ref()?;
-        Some(!serde_json::to_string(body).unwrap_or_default().contains("\"image\""))
+        self.last_request_had_image
+            .lock()
+            .expect("lock the recorded request image flag")
+            .map(|had_image| !had_image)
     }
 }
 
-impl ModelCaller for LargeImageCaller<'_> {
-    async fn call(&self, request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+impl ModelApi for LargeImageCaller<'_> {
+    fn turn<'a>(
+        &'a self,
+        req: &'a ModelRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
+        let had_image = req
+            .messages
+            .iter()
+            .any(|m| m.content.iter().any(|b| matches!(b, ContentBlock::Image { .. })));
         {
-            let mut guard = self.last_body.lock().expect("lock the recorded request body");
-            *guard = Some(request_body.clone());
+            let mut guard = self
+                .last_request_had_image
+                .lock()
+                .expect("lock the recorded request image flag");
+            *guard = Some(had_image);
         }
-        let (mut blocks, meta) = self.inner.call(request_body).await?;
-        // Attach the REAL large image payload to the genuine model response — the
-        // production externalize policy will `put` it to the BlobStore and rewrite it
-        // to `ImageSource::Blob{hash}` because it is over the cap.
-        blocks.push(Block::Image {
-            source: ImageSource::Inline {
-                mime: self.mime.clone(),
-                bytes: self.image_bytes.clone(),
-            },
-        });
-        Ok((blocks, meta))
+        let image_bytes = self.image_bytes.clone();
+        let mime = self.mime.clone();
+        let fut = self.inner.turn(req);
+        Box::pin(async move {
+            let mut resp = fut.await?;
+            // Attach the REAL large image payload to the genuine model response — the
+            // production externalize policy will `put` it to the BlobStore and rewrite
+            // it to `ImageSource::Blob{hash}` because it is over the cap. The neutral
+            // Base64 source round-trips to the world `Inline` bytes at the seam.
+            resp.blocks.push(ContentBlock::Image {
+                source: NeutralImageSource::Base64 {
+                    media_type: mime,
+                    data: base64::engine::general_purpose::STANDARD.encode(&image_bytes),
+                },
+            });
+            Ok(resp)
+        })
+    }
+    fn list_models<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+        self.inner.list_models()
+    }
+    fn model(&self) -> &str {
+        self.inner.model()
     }
 }
 
@@ -218,8 +248,8 @@ pub async fn run() {
         return;
     }
 
-    let client = MessagesClient::from_env()
-        .expect("build a MessagesClient from RUBBERDUX_LLM_* for the live blob turn");
+    let client = selected_from_env()
+        .expect("build a provider from RUBBERDUX_LLM_* for the live blob turn");
     let model = env_model_config(client.model());
 
     let payload = large_image_payload();

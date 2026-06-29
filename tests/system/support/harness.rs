@@ -5,7 +5,9 @@ use std::time::Duration;
 use rubberdux::agent::entry::{Entry, EntryOrigin};
 use rubberdux::agent::runtime::port::{EntryNotification, InputPort, LoopEvent};
 use rubberdux::hardened_prompts;
-use rubberdux::provider::moonshot::{Message, MoonshotClient, UserContent};
+use rubberdux::provider::ModelApi;
+use rubberdux::provider::kimi_for_coding::{Message, UserContent};
+use rubberdux::provider::selected_from_env;
 
 /// A collected response from the agent loop, matching the shape tests expect.
 #[derive(Debug, Clone)]
@@ -93,7 +95,8 @@ pub struct MessageExchange {
 
 impl ChannelHarness {
     pub async fn new(system_prompt: &str, session_path: PathBuf) -> Self {
-        let client = Arc::new(MoonshotClient::from_env());
+        let client: Arc<dyn ModelApi> =
+            Arc::from(selected_from_env().expect("build provider from env"));
         let system_prompt = system_prompt.to_string();
         let sp = session_path.clone();
 

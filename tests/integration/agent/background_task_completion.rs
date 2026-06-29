@@ -11,10 +11,11 @@ use rubberdux::agent::entry::EntryOrigin;
 use rubberdux::agent::runtime::agent_loop::{AgentLoop, AgentLoopConfig};
 use rubberdux::agent::runtime::compaction::EvictOldestTurns;
 use rubberdux::agent::runtime::port::{EntryNotification, LoopEvent};
-use rubberdux::provider::moonshot::{Message, MoonshotClient, UserContent};
+use rubberdux::provider::kimi_for_coding::{Message, UserContent};
 
 use crate::support::artifact;
 use crate::support::mock_tools::{MockBackgroundTool, build_registry_with};
+use crate::support::model_api_stub::openai_model_api;
 
 /// Test that background task completion reaches the AgentLoop and triggers
 /// a final response.
@@ -24,7 +25,7 @@ async fn test_background_task_completion_reaches_agent_loop() {
 
     // First response: assistant triggers a tool call
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "cmpl-1",
             "object": "chat.completion",
@@ -51,7 +52,7 @@ async fn test_background_task_completion_reaches_agent_loop() {
 
     // Second response: after background task completes
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "cmpl-2",
@@ -73,12 +74,7 @@ async fn test_background_task_completion_reaches_agent_loop() {
     let mock_tool = MockBackgroundTool::new("bg_task");
     let registry = build_registry_with(vec![Box::new(mock_tool.clone())]);
 
-    let client = Arc::new(MoonshotClient::new(
-        reqwest::Client::new(),
-        mock_server.uri(),
-        "test-key".into(),
-        "test-model".into(),
-    ));
+    let client = openai_model_api(mock_server.uri(), "test-model");
 
     let artifact_dir = artifact::artifact_dir("test_background_task_completion");
     let session_path = artifact_dir.join("transcript.jsonl");

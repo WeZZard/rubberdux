@@ -9,7 +9,8 @@ use rubberdux::agent::entry::EntryOrigin;
 use rubberdux::agent::runtime::agent_loop::{AgentLoop, AgentLoopConfig};
 use rubberdux::agent::runtime::compaction::EvictOldestTurns;
 use rubberdux::agent::runtime::port::{EntryNotification, LoopEvent};
-use rubberdux::provider::moonshot::{Message, MoonshotClient, UserContent};
+use rubberdux::provider::kimi_for_coding::{Message, UserContent};
+use crate::support::model_api_stub::openai_model_api;
 
 use crate::support::artifact;
 use crate::support::mock_tools::{MockTool, build_registry_with};
@@ -31,7 +32,7 @@ async fn test_tool_entry_ids_persisted_and_broadcast() {
 
     // First response: assistant triggers two tool calls
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "cmpl-1",
             "object": "chat.completion",
@@ -65,7 +66,7 @@ async fn test_tool_entry_ids_persisted_and_broadcast() {
 
     // Second response: plain text, stop
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "cmpl-2",
             "object": "chat.completion",
@@ -89,12 +90,7 @@ async fn test_tool_entry_ids_persisted_and_broadcast() {
     let tool_b = MockTool::new("tool_b", Duration::ZERO);
     let registry = build_registry_with(vec![Box::new(tool_a), Box::new(tool_b)]);
 
-    let client = Arc::new(MoonshotClient::new(
-        reqwest::Client::new(),
-        mock_server.uri(),
-        "test-key".into(),
-        "test-model".into(),
-    ));
+    let client = openai_model_api(mock_server.uri(), "test-model");
 
     let artifact_dir = artifact::artifact_dir("test_tool_entry_ids_persisted_and_broadcast");
     let session_path = artifact_dir.join("transcript.jsonl");

@@ -27,9 +27,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde_json::Value as Json;
 
 use rubberdux::agent::world::effects::{
-    Command, ModelCaller, ResultStamp, SurfaceDriver, ToolSet, UnattachedPeerSender, drive_live,
+    Command, ResultStamp, SurfaceDriver, ToolSet, UnattachedPeerSender, drive_live,
     fingerprint_call,
 };
+use rubberdux::provider::{ModelApi, ModelInfo, ModelRequest, ModelResponse, selected_from_env};
+use std::future::Future;
+use std::pin::Pin;
+
 use rubberdux::agent::world::event_log::{EventLog, MemoryEventLog};
 use rubberdux::agent::world::gates::EntityGate;
 use rubberdux::agent::world::history::{Block, History, Msg, Role};
@@ -37,7 +41,6 @@ use rubberdux::agent::world::replay;
 use rubberdux::agent::world::inputs::{
     Capabilities, Event, LogicalInput, ModelMeta, Origin, ReasoningPolicy, StopReason, Usage,
 };
-use rubberdux::agent::world::model_client::MessagesClient;
 use rubberdux::agent::world::systems::tick;
 use rubberdux::agent::world::world::{
     Activity, Components, Effort, Identity, Lineage, ModelConfig, Resources, Tick, World,
@@ -107,7 +110,7 @@ impl SurfaceDriver for NoSurfaceDrive {
     }
 }
 
-async fn run_live<C: ModelCaller>(
+async fn run_live<C: ModelApi>(
     client: &C,
     model: &ModelConfig,
     seed: u64,
@@ -205,10 +208,21 @@ struct ExplodingClient {
     calls: Arc<AtomicUsize>,
 }
 
-impl ModelCaller for ExplodingClient {
-    async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+impl ModelApi for ExplodingClient {
+    fn turn<'a>(
+        &'a self,
+        _req: &'a ModelRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         panic!("the replay driver must never invoke the model client");
+    }
+    fn list_models<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn model(&self) -> &str {
+        "stub"
     }
 }
 
@@ -227,9 +241,9 @@ fn offline_model() -> ModelConfig {
 }
 
 /// The world-default `ModelConfig` for the LIVE turn. The model id rides in the
-/// `/v1/messages` request body (`MessageBuilder` reads `params.model`), so it is
-/// taken from `RUBBERDUX_LLM_MODEL` — the same knob `MessagesClient::from_env`
-/// uses — defaulting to the Anthropic default so the gate and the call agree.
+/// request body the active dialect builds (`params.model`), so it is taken from
+/// `RUBBERDUX_LLM_MODEL` — the same knob `selected_from_env` reads — defaulting to
+/// the Anthropic default so the gate and the call agree.
 fn live_model() -> ModelConfig {
     let model = std::env::var("RUBBERDUX_LLM_MODEL")
         .unwrap_or_else(|_| "claude-opus-4-5-20251101".into());
@@ -257,7 +271,7 @@ async fn vc_0_1_live_turn_records_then_vc_0_2_replays_byte_identical() {
 
     let model = live_model();
     let seed: u64 = 42;
-    let client = MessagesClient::from_env().expect("build MessagesClient from env");
+    let client = selected_from_env().expect("build provider from env");
 
     // --- VC-0.1: one real turn ------------------------------------------------
     let (live_world, log) = run_live(&client, &model, seed, "Reply with exactly one word: pong")

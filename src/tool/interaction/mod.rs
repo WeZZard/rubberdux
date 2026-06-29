@@ -13,7 +13,7 @@ use crate::agent::external::interaction_queue::{InteractionQueue, PendingInterac
 use crate::agent::interaction::{
     AgentInteraction, ApprovalFlavor, ChoiceOption, InteractionResponse, PreviewArtifact,
 };
-use crate::provider::moonshot::tool::ToolDefinition;
+use crate::provider::kimi_for_coding::tool::ToolDefinition;
 use crate::trajectory::{SharedTrajectoryRecorder, TrajectoryEventDraft};
 
 use super::{Tool, ToolOutcome};

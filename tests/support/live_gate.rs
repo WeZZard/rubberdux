@@ -7,16 +7,16 @@
 //! returns early with a clear, printed reason when the credentials are absent.
 //! When `RUBBERDUX_LLM_API_KEY` (and optionally a base URL/model) are present —
 //! the human-run suite — the test proceeds against the real provider via
-//! `MoonshotClient::from_env`.
+//! `KimiForCodingClient::from_env`.
 //!
-//! This mirrors the env vars `MoonshotClient::from_env` reads, so a test gated
+//! This mirrors the env vars `KimiForCodingClient::from_env` reads, so a test gated
 //! here and a client built with `from_env` always agree on whether the live
 //! provider is reachable.
 
 #![allow(dead_code)]
 
 /// The credentials a live-LLM test needs, read from the same environment
-/// `MoonshotClient::from_env` consults. `Some` only when an API key is set, so
+/// `KimiForCodingClient::from_env` consults. `Some` only when an API key is set, so
 /// the gate never sends an unauthenticated request the provider would reject.
 pub struct LiveLlmCredentials {
     pub base_url: String,
@@ -26,7 +26,7 @@ pub struct LiveLlmCredentials {
 /// Resolve live-LLM credentials from the environment, or `None` when this is a
 /// developer run without them. The required signal is a non-empty
 /// `RUBBERDUX_LLM_API_KEY`; base URL and model fall back to the same defaults
-/// `MoonshotClient::from_env` uses so the gate and the client stay in lockstep.
+/// `KimiForCodingClient::from_env` uses so the gate and the client stay in lockstep.
 pub fn live_llm_credentials() -> Option<LiveLlmCredentials> {
     let api_key = std::env::var("RUBBERDUX_LLM_API_KEY").ok()?;
     if api_key.trim().is_empty() {

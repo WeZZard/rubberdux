@@ -20,7 +20,7 @@
 //!
 //! - **VC-1.1 (live; gated)** — a real one-child fan-out driven by `WorldDriver` with a
 //!   hybrid `ModelCaller` (stub parent spawn, real child + continuation calls via
-//!   `MessagesClient`) drives the child to `EndTurn`, the parent receives the child's
+//!   the selected provider) drives the child to `EndTurn`, the parent receives the child's
 //!   answer, and the parent responds, producing a `ChildReturned` in the log.
 //!
 //! The offline and cumulative-cap tests make NO live model calls, so they need no
@@ -34,11 +34,14 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde_json::Value as Json;
-
 use rubberdux::agent::world::budget::Budget;
 use rubberdux::agent::world::driver::WorldDriver;
-use rubberdux::agent::world::effects::{Command, ModelCaller, SurfaceDriver, fingerprint_call};
+use rubberdux::agent::world::effects::{Command, SurfaceDriver, fingerprint_call};
+use rubberdux::provider::{
+    ContentBlock, ModelApi, ModelInfo, ModelRequest, ModelResponse, selected_from_env,
+};
+use std::future::Future;
+use std::pin::Pin;
 use rubberdux::agent::world::event_log::{EventLog, MemoryEventLog};
 use rubberdux::agent::world::gates::EntityGate;
 use rubberdux::agent::world::history::{Block, History, Role};
@@ -47,7 +50,6 @@ use rubberdux::agent::world::inputs::{
     Usage,
 };
 use rubberdux::agent::world::lifecycle::LifecycleEvent;
-use rubberdux::agent::world::model_client::MessagesClient;
 use rubberdux::agent::world::replay;
 use rubberdux::agent::world::systems::tick;
 use rubberdux::agent::world::world::{
@@ -683,41 +685,55 @@ fn vc_1_2_cumulative_cap_denies_second_spawn_after_first_finishes() {
 /// - Call 0 (parent's first call): returns a `spawn_subagent` ToolUse so the
 ///   `WorldDriver` opens a child slot and spawns the child Entity.
 /// - Call 1+ (child's call + parent's continuation): delegates to the real
-///   `MessagesClient`, proving at least two REAL model calls bracket the fan-out.
+///   selected provider, proving at least two REAL model calls bracket the fan-out.
 ///
 /// This isolates the TEST's control over WHICH calls happen (the spawn) from the
 /// REAL model's responses (the child's answer + the parent's continuation).
 struct FanoutCaller {
-    real: MessagesClient,
+    real: Box<dyn ModelApi>,
     calls: AtomicUsize,
 }
 
-impl ModelCaller for FanoutCaller {
-    async fn call(&self, request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+impl ModelApi for FanoutCaller {
+    fn turn<'a>(
+        &'a self,
+        req: &'a ModelRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         if n == 0 {
             // Parent's first call: return a `spawn_subagent` ToolUse so the driver
             // opens the child slot and spawns the child Entity.
-            Ok((
-                vec![Block::ToolUse {
-                    id: "tu_live_child".into(),
-                    name: "spawn_subagent".into(),
-                    input: serde_json::json!({
-                        "prompt": "Reply with exactly two words: child done"
-                    }),
-                }],
-                ModelMeta {
-                    usage: Usage { input_tokens: 1, output_tokens: 1 },
-                    model_id: "stub-spawn".into(),
+            Box::pin(async {
+                Ok(ModelResponse {
+                    blocks: vec![ContentBlock::ToolUse {
+                        id: "tu_live_child".into(),
+                        name: "spawn_subagent".into(),
+                        input: serde_json::json!({
+                            "prompt": "Reply with exactly two words: child done"
+                        }),
+                    }],
                     stop_reason: StopReason::ToolUse,
-                    capabilities: Capabilities(serde_json::json!({})),
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },
+                    model_id: "stub-spawn".into(),
                     reasoning: ReasoningPolicy::Drop,
-                },
-            ))
+                    capabilities: serde_json::json!({}),
+                })
+            })
         } else {
             // Child's call (n==1) and parent's continuation (n==2): REAL model calls.
-            self.real.call(request_body).await
+            self.real.turn(req)
         }
+    }
+    fn list_models<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+        self.real.list_models()
+    }
+    fn model(&self) -> &str {
+        self.real.model()
     }
 }
 
@@ -725,7 +741,7 @@ impl ModelCaller for FanoutCaller {
 ///
 /// - The parent's first (stubbed) call returns `spawn_subagent`, opening the
 ///   child slot.
-/// - The child's call is REAL (via `MessagesClient`), runs to `EndTurn`.
+/// - The child's call is REAL (via the selected provider), runs to `EndTurn`.
 /// - The `WorldDriver` regenerates `ChildReturned` (non-fingerprinted, Inv 7),
 ///   records it, and folds it — the parent resumes.
 /// - The parent's continuation is REAL, runs to `EndTurn`.
@@ -741,7 +757,7 @@ async fn vc_1_1_live_fanout_child_returns_to_parent() {
     }
 
     let model = live_model();
-    let real_client = MessagesClient::from_env().expect("build MessagesClient from env");
+    let real_client = selected_from_env().expect("build provider from env");
     let caller = FanoutCaller {
         real: real_client,
         calls: AtomicUsize::new(0),

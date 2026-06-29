@@ -2,8 +2,8 @@ use serial_test::serial;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use rubberdux::provider::moonshot::MoonshotClient;
-use rubberdux::provider::moonshot::{Message, UserContent};
+use rubberdux::provider::kimi_for_coding::KimiForCodingClient;
+use rubberdux::provider::kimi_for_coding::{Message, UserContent};
 use rubberdux::tool;
 
 /// Test: simple text response (no tool calls)
@@ -35,7 +35,7 @@ async fn test_simple_text_response() {
         .mount(&mock_server)
         .await;
 
-    let client = MoonshotClient::new(
+    let client = KimiForCodingClient::new(
         reqwest::Client::new(),
         mock_server.uri(),
         "test-key".into(),
@@ -126,7 +126,7 @@ async fn test_tool_call_loop() {
         .mount(&mock_server)
         .await;
 
-    let client = MoonshotClient::new(
+    let client = KimiForCodingClient::new(
         reqwest::Client::new(),
         mock_server.uri(),
         "test-key".into(),
@@ -463,7 +463,7 @@ async fn test_background_tool_call_loop() {
         .mount(&mock_server)
         .await;
 
-    let client = MoonshotClient::new(
+    let client = KimiForCodingClient::new(
         reqwest::Client::new(),
         mock_server.uri(),
         "test-key".into(),
@@ -629,7 +629,7 @@ async fn test_mixed_sync_background_tool_calls() {
         .mount(&mock_server)
         .await;
 
-    let client = MoonshotClient::new(
+    let client = KimiForCodingClient::new(
         reqwest::Client::new(),
         mock_server.uri(),
         "test-key".into(),
@@ -873,7 +873,7 @@ async fn test_multi_step_tool_chain() {
         .mount(&mock_server)
         .await;
 
-    let client = MoonshotClient::new(
+    let client = KimiForCodingClient::new(
         reqwest::Client::new(),
         mock_server.uri(),
         "test-key".into(),
@@ -1049,7 +1049,7 @@ async fn test_web_search_tool_via_registry() {
         .mount(&mock_server)
         .await;
 
-    let client = Arc::new(MoonshotClient::new(
+    let client = Arc::new(KimiForCodingClient::new(
         reqwest::Client::new(),
         mock_server.uri(),
         "test-key".into(),
@@ -1057,7 +1057,7 @@ async fn test_web_search_tool_via_registry() {
     ));
 
     let registry = {
-        use rubberdux::provider::moonshot::tool::web_search::WebSearchTool;
+        use rubberdux::provider::kimi_for_coding::tool::web_search::WebSearchTool;
 
         let mut r = rubberdux::tool::ToolRegistry::new();
         r.register(Box::new(WebSearchTool::new(client.clone())));

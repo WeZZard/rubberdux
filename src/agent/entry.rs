@@ -1,4 +1,4 @@
-use crate::provider::moonshot::Message;
+use crate::provider::kimi_for_coding::Message;
 use serde::{Deserialize, Serialize};
 
 /// Identifies who produced an entry in the conversation.
@@ -214,7 +214,7 @@ impl EntryHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::moonshot::UserContent;
+    use crate::provider::kimi_for_coding::UserContent;
 
     #[test]
     fn test_entry_serialization_roundtrip() {

@@ -453,13 +453,13 @@ mod tests {
     #[test]
     fn test_entry_notification_roundtrip() {
         use crate::agent::entry::{Entry, EntryOrigin};
-        use crate::provider::moonshot::UserContent;
+        use crate::provider::kimi_for_coding::UserContent;
 
         let msg = AgentToHost::EntryNotification {
             entry: Entry {
                 id: 7,
                 parent_id: Some(3),
-                message: crate::provider::moonshot::Message::User {
+                message: crate::provider::kimi_for_coding::Message::User {
                     content: UserContent::Text("hi".into()),
                 },
                 origin: EntryOrigin::User { channel: "board".into() },

@@ -6,7 +6,9 @@ use rubberdux::agent::builder::AgentLoopBuilder;
 use rubberdux::agent::entry::{Entry, EntryOrigin};
 use rubberdux::agent::runtime::port::{EntryNotification, InputPort};
 use rubberdux::host::HostConfig;
-use rubberdux::provider::moonshot::{Message, MoonshotClient, UserContent};
+use rubberdux::provider::kimi_for_coding::{Message, UserContent};
+use rubberdux::provider::ModelApi;
+use rubberdux::provider::dialect::openai_chat_completions::OpenAiChatCompletions;
 use rubberdux::vm::setup::ssh_private_key;
 use tokio::sync::broadcast;
 use wiremock::matchers::{method, path};
@@ -118,11 +120,12 @@ impl VmSystemTestHarness {
             .expect("Failed to create session");
 
         let system_prompt = "You are a test agent.".to_string();
-        let client = Arc::new(MoonshotClient::new(
+        let client: Arc<dyn ModelApi> = Arc::new(OpenAiChatCompletions::new(
             reqwest::Client::new(),
             format!("http://127.0.0.1:{}", wiremock_port),
             "test-key".into(),
             "test-model".into(),
+            rubberdux::provider::AuthScheme::Bearer,
         ));
 
         let builder = AgentLoopBuilder::new(system_prompt, session_manager)
@@ -153,7 +156,7 @@ impl VmSystemTestHarness {
     /// Mount a wiremock response for the Moonshot chat completions endpoint.
     pub async fn mock_llm(&self, response: serde_json::Value, expected_calls: Option<u64>) {
         let mut mock = Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(response));
 
         if let Some(n) = expected_calls {

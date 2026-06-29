@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::super::{Message, MoonshotClient};
+use super::super::{Message, KimiForCodingClient};
 
 #[derive(Serialize)]
 struct EstimateRequest {
@@ -18,7 +18,7 @@ struct EstimateData {
     total_tokens: usize,
 }
 
-impl MoonshotClient {
+impl KimiForCodingClient {
     pub async fn estimate_tokens(
         &self,
         messages: &[Message],

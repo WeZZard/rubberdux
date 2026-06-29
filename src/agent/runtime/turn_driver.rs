@@ -4,12 +4,20 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::agent::entry::EntryHistory;
+use crate::agent::runtime::model_bridge::{from_model_response, to_model_request};
 use crate::agent::runtime::subagent::SubagentResult;
 use crate::error::Error;
-use crate::provider::moonshot::tool::ToolCall;
-use crate::provider::moonshot::{Message, MoonshotClient};
+use crate::provider::kimi_for_coding::Message;
+use crate::provider::kimi_for_coding::tool::ToolCall;
+use crate::provider::{Effort, ModelApi, Sampling};
 use crate::tool::{BackgroundTaskResult, ToolOutcome, ToolRegistry};
 use crate::trajectory::{SharedTrajectoryRecorder, TrajectoryEventDraft};
+
+/// Per-turn output-token cap sent on the neutral request. The former
+/// OpenAI-only path left this uncapped, but the neutral `Sampling` requires an
+/// explicit limit (the Anthropic dialect mandates one); this ceiling is high
+/// enough for chat and moderate code generation without risking model rejection.
+const DEFAULT_TURN_MAX_TOKENS: u32 = 16_384;
 
 // ---------------------------------------------------------------------------
 // TurnOutcome — result of driving one LLM turn
@@ -44,7 +52,7 @@ pub enum TurnOutcome {
 // ---------------------------------------------------------------------------
 
 pub struct TurnDriver {
-    client: Arc<MoonshotClient>,
+    client: Arc<dyn ModelApi>,
     registry: Arc<ToolRegistry>,
     tool_results_dir: Option<PathBuf>,
     bg_tx: mpsc::Sender<BackgroundTaskResult>,
@@ -56,7 +64,7 @@ pub struct TurnDriver {
 
 impl TurnDriver {
     pub fn new(
-        client: Arc<MoonshotClient>,
+        client: Arc<dyn ModelApi>,
         registry: Arc<ToolRegistry>,
         tool_results_dir: Option<PathBuf>,
         bg_tx: mpsc::Sender<BackgroundTaskResult>,
@@ -93,8 +101,19 @@ impl TurnDriver {
             }),
         );
 
-        let chat_response = match self.client.chat(messages, Some(tools)).await {
-            Ok(r) => r,
+        // Route through the selected ModelApi: translate the OpenAI-shaped
+        // message list into the neutral request, run the turn, and translate the
+        // neutral response back into the ChatResponse the rest of this driver
+        // consumes unchanged. See `model_bridge`.
+        let sampling = Sampling {
+            model: self.client.model().to_owned(),
+            max_tokens: DEFAULT_TURN_MAX_TOKENS,
+            effort: Effort::Medium,
+        };
+        let request = to_model_request(&messages, Some(&tools), sampling);
+
+        let chat_response = match self.client.turn(&request).await {
+            Ok(resp) => from_model_response(resp),
             Err(e) => {
                 self.record(
                     "model.failed",

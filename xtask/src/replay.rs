@@ -19,7 +19,6 @@ use rubberdux::agent::world::event_log::{EventLog, FilesystemEventLog, MemoryEve
 use rubberdux::agent::world::gates::EntityGate;
 use rubberdux::agent::world::history::History;
 use rubberdux::agent::world::inputs::{Event, Fingerprint, LogicalInput};
-use rubberdux::agent::world::model_client::MessagesClient;
 use rubberdux::agent::world::reclaim::{
     drop_branch as reclaim_drop_branch, load_latest_descriptors, pin as reclaim_pin,
     reclaim_branches, Roots,
@@ -312,9 +311,10 @@ pub fn fork(session_id: &str, at: u64, edit_spec: &str) -> Result<(), String> {
 /// past the edit's divergence and appending the fresh tail to the branch log.
 ///
 /// A THIN wrapper over `replay_branch`: load the branch events, reseed its
-/// genesis, then run the single replay→live mode with the PRODUCTION
-/// [`MessagesClient`] (so this makes real, PAID model calls past the divergence)
-/// and a no-op CLI surface sink. The resulting World's tick + digest are printed.
+/// genesis, then run the single replay→live mode with the selected
+/// [`rubberdux::provider::ModelApi`] (so this makes real, PAID model calls past
+/// the divergence) and a no-op CLI surface sink. The resulting World's tick +
+/// digest are printed.
 ///
 /// See docs/agent/world/ecs-runtime.md — Branch replay (replay→live handoff); VC-5.1.
 pub async fn run(session_id: &str, branch: &str) -> Result<(), String> {
@@ -333,7 +333,7 @@ pub async fn run(session_id: &str, branch: &str) -> Result<(), String> {
     let model = resolve_model_config();
     let genesis = genesis_from_log(&branch_events, |seed| build_genesis_world(seed, model.clone()))
         .map_err(|e| format!("failed to reseed branch genesis: {e}"))?;
-    let client = MessagesClient::from_env().map_err(|e| format!("model client: {e}"))?;
+    let client = rubberdux::provider::selected_from_env().map_err(|e| format!("model client: {e}"))?;
     let surface = CliSurfaceDriver;
 
     // The live tail appends to the branch's own log (prefix-by-reference + edit +
@@ -604,7 +604,7 @@ fn load_events_for(session_dir: &Path, name: &str) -> Result<Vec<Event>, String>
 /// model is not recorded in the event log, so the caller supplies the same value
 /// the live run resolved — read from the same `RUBBERDUX_LLM_*` environment the
 /// production worker reads (mirrors `app::runtime::worker::world_model_config` and
-/// [`MessagesClient::from_env`]'s `RUBBERDUX_LLM_MODEL` default).
+/// the `RUBBERDUX_LLM_MODEL` env var read by `rubberdux::provider::resolve_from_env`).
 fn resolve_model_config() -> ModelConfig {
     let model = std::env::var("RUBBERDUX_LLM_MODEL")
         .unwrap_or_else(|_| "claude-opus-4-5-20251101".into());

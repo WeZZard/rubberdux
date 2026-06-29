@@ -7,10 +7,11 @@ use crate::agent::runtime::agent_loop::{AgentLoop, AgentLoopConfig};
 use crate::agent::runtime::compaction::EvictOldestTurns;
 use crate::agent::runtime::port::InputPort;
 use crate::agent::runtime::subagent::ContextEvent;
-use crate::provider::moonshot::MoonshotClient;
-use crate::provider::moonshot::tool::bash::MoonshotBashTool;
-use crate::provider::moonshot::tool::web_fetch::MoonshotWebFetchTool;
-use crate::provider::moonshot::tool::web_search::WebSearchTool;
+use crate::provider::ModelApi;
+use crate::provider::kimi_for_coding::KimiForCodingClient;
+use crate::provider::kimi_for_coding::tool::bash::KimiForCodingBashTool;
+use crate::provider::kimi_for_coding::tool::web_fetch::KimiForCodingWebFetchTool;
+use crate::provider::kimi_for_coding::tool::web_search::WebSearchTool;
 use crate::session::SessionManager;
 use crate::tool::ToolRegistry;
 use crate::tool::agent::{AgentTool, build_subagent_registries};
@@ -173,10 +174,20 @@ impl AgentLoopBuilder {
     }
 
     /// Build the AgentLoop and return it along with its input port and context broadcaster.
+    ///
+    /// `client` is the selected [`ModelApi`] every turn (this loop's and any
+    /// subagent's) is driven through. The Kimi `$web_search` quirk tool and the
+    /// subagent registries still need a concrete `KimiForCodingClient` (the
+    /// `$web_search` builtin is a Kimi-over-OpenAI capability, not part of the
+    /// unified `ModelApi` surface), so one is built from the environment here.
     pub async fn build(
         self,
-        client: Arc<MoonshotClient>,
+        client: Arc<dyn ModelApi>,
     ) -> (AgentLoop, InputPort, broadcast::Sender<ContextEvent>) {
+        // The $web_search builtin is Kimi-specific and reached over the OpenAI
+        // dialect, independent of the selected turn-driving provider, so it keeps
+        // its own env-built Kimi client.
+        let web_search_client = Arc::new(KimiForCodingClient::from_env());
         // Fall back to a freshly generated session id rather than panicking when
         // a caller builds without one: a missing id names "this run's session",
         // so a new timestamped id is a correct default and keeps `build`
@@ -195,14 +206,14 @@ impl AgentLoopBuilder {
 
         let registry = {
             let mut r = ToolRegistry::new();
-            r.register(Box::new(MoonshotBashTool::new()));
-            r.register(Box::new(MoonshotWebFetchTool::new()));
+            r.register(Box::new(KimiForCodingBashTool::new()));
+            r.register(Box::new(KimiForCodingWebFetchTool::new()));
             r.register(Box::new(ReadFileTool));
             r.register(Box::new(WriteFileTool));
             r.register(Box::new(EditFileTool));
             r.register(Box::new(GlobTool));
             r.register(Box::new(GrepTool));
-            r.register(Box::new(WebSearchTool::new(client.clone())));
+            r.register(Box::new(WebSearchTool::new(web_search_client.clone())));
 
             if let Some(ref ws) = self.workspace {
                 r.register(Box::new(crate::tool::project::ProjectTool::new(ws.clone())));
@@ -245,7 +256,7 @@ impl AgentLoopBuilder {
             }
 
             if self.with_agent_tool {
-                let subagent_registries = build_subagent_registries(&client, &self.workspace, &self.mindset);
+                let subagent_registries = build_subagent_registries(&web_search_client, &self.workspace, &self.mindset);
                 let mut agent_tool = AgentTool::new(
                     client.clone(),
                     subagent_registries,
@@ -311,12 +322,15 @@ mod tests {
     use super::*;
     use crate::session::SessionManager;
 
-    fn dummy_client() -> Arc<MoonshotClient> {
-        Arc::new(MoonshotClient::new(
+    fn dummy_client() -> Arc<dyn ModelApi> {
+        use crate::provider::AuthScheme;
+        use crate::provider::dialect::openai_chat_completions::OpenAiChatCompletions;
+        Arc::new(OpenAiChatCompletions::new(
             reqwest::Client::new(),
             "http://localhost:0".into(),
             "test-key".into(),
             "test-model".into(),
+            AuthScheme::Bearer,
         ))
     }
 

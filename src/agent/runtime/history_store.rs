@@ -3,7 +3,7 @@ use std::pin::Pin;
 
 use crate::agent::entry::{Entry, EntryHistory};
 use crate::error::Error;
-use crate::provider::moonshot::Message;
+use crate::provider::kimi_for_coding::Message;
 
 // ---------------------------------------------------------------------------
 // HistoryStore trait — async persistence abstraction

@@ -1,10 +1,10 @@
 //! LLM prompt construction for identity derivation.
 //!
-//! Builds the system + user messages sent to the Moonshot API to obtain a
+//! Builds the system + user messages sent to the Kimi for Coding API to obtain a
 //! constrained JSON identity response. See `docs/app/identity.md`.
 
 use super::{COLOR_PALETTE, SYMBOL_ALLOWLIST};
-use crate::provider::moonshot::{Message, UserContent};
+use crate::provider::kimi_for_coding::{Message, UserContent};
 
 /// Build the system message that instructs the model to return a constrained
 /// JSON identity object.

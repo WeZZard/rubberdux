@@ -9,7 +9,7 @@ use tokio::sync::broadcast::error::RecvError;
 use super::state::GatewayState;
 use crate::agent::entry::{Entry, EntryOrigin};
 use crate::agent::runtime::port::{EntryNotification, InputPort, LoopEvent, OutputPort};
-use crate::provider::moonshot::{Message, UserContent};
+use crate::provider::kimi_for_coding::{Message, UserContent};
 use crate::trajectory::TrajectoryEvent;
 
 #[derive(serde::Deserialize)]

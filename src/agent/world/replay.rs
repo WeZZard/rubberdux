@@ -18,7 +18,7 @@
 //!   ("live") `World` a replay must reproduce byte-for-byte.
 //! - [`replay_world`] — fold the SAME log from genesis under the REPLAY driver:
 //!   re-apply the recorded results' COMPLEMENT directly and, for each tick's
-//!   Commands, call `effects::drive_replay` — which takes NO `ModelCaller`, so it
+//!   Commands, call `effects::drive_replay` — which takes NO model client, so it
 //!   cannot reach the model by construction — standing in the already-logged result
 //!   while the re-emitted request re-hashes to its `Fingerprint` (Inv 7). A
 //!   `Diverged` outcome is a replay failure: a faithful replay reuses every result.
@@ -54,10 +54,11 @@
 use std::collections::BTreeSet;
 
 use crate::agent::world::effects::{
-    drive_live, drive_replay, resume, Command, ModelCaller, Reconciliation, ReplayCursor, Replayed,
+    drive_live, drive_replay, resume, Command, Reconciliation, ReplayCursor, Replayed,
     ResultStamp, SurfaceDriver, UnattachedPeerSender,
 };
 use crate::agent::world::event_log::EventLog;
+use crate::provider::ModelApi;
 use crate::agent::world::inputs::{Event, LogicalInput};
 use crate::agent::world::lifecycle::LifecycleEvent;
 use crate::agent::world::snapshot::SnapshotStore;
@@ -297,7 +298,7 @@ where
 ///    `target`, through the pure `tick` reducer. Folding is ASSOCIATIVE and the
 ///    snapshot is itself `fold_log(genesis, prefix)`, so this equals folding the
 ///    whole `events[..=target]` from genesis — provably identical ids/RNG/clock to
-///    a full replay (Inv 8/9). `fold_log` takes NO `ModelCaller`, so the tail is
+///    a full replay (Inv 8/9). `fold_log` takes NO model client, so the tail is
 ///    reconstructed with ZERO model calls by construction.
 /// 3. **Resume.** Reconcile the reconstructed World's [`outstanding_cmds`] against
 ///    the full `lifecycle` (so a dispatch predating the snapshot still settles),
@@ -404,7 +405,7 @@ pub async fn replay_branch<C, S, L>(
     log: &mut L,
 ) -> Result<World, Error>
 where
-    C: ModelCaller,
+    C: ModelApi,
     S: SurfaceDriver,
     L: EventLog,
 {
@@ -785,22 +786,36 @@ mod tests {
     // --- CR-branch-replay: the counterfactual replay → live boundary -----------
 
     use crate::agent::world::event_log::{EventLog, MemoryEventLog};
-    use serde_json::Value as Json;
+    use crate::agent::world::model_bridge::to_model_response;
+    use crate::provider::{ModelInfo, ModelRequest, ModelResponse};
+    use std::future::Future;
+    use std::pin::Pin;
 
-    /// A `ModelCaller` that PANICS if invoked, proving the replay path makes ZERO
-    /// live calls: an unchanged branch reuses the whole recorded tail and never
-    /// flips to live, so this client is structurally unreachable.
+    /// A model client (`ModelApi`) that PANICS if invoked, proving the replay path
+    /// makes ZERO live calls: an unchanged branch reuses the whole recorded tail and
+    /// never flips to live, so this client is structurally unreachable.
     struct ExplodingClient;
 
-    impl ModelCaller for ExplodingClient {
-        async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
-            panic!("an unchanged branch must never invoke the model client");
+    impl ModelApi for ExplodingClient {
+        fn turn<'a>(
+            &'a self,
+            _req: &'a ModelRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
+            Box::pin(async { panic!("an unchanged branch must never invoke the model client") })
+        }
+        fn list_models<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn model(&self) -> &str {
+            "stub"
         }
     }
 
-    /// A `ModelCaller` that returns a fixed `EndTurn` assistant text and COUNTS its
-    /// invocations, so a test proves the live client fires only PAST the divergence
-    /// boundary — and exactly once.
+    /// A model client (`ModelApi`) that returns a fixed `EndTurn` assistant text and
+    /// COUNTS its invocations, so a test proves the live client fires only PAST the
+    /// divergence boundary — and exactly once.
     struct CountingClient {
         text: String,
         calls: std::sync::atomic::AtomicUsize,
@@ -818,21 +833,33 @@ mod tests {
         }
     }
 
-    impl ModelCaller for CountingClient {
-        async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+    impl ModelApi for CountingClient {
+        fn turn<'a>(
+            &'a self,
+            _req: &'a ModelRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok((
-                vec![Block::Text {
-                    text: self.text.clone(),
-                }],
-                ModelMeta {
-                    usage: Usage::default(),
-                    model_id: "claude-replay-spine-unit".into(),
-                    stop_reason: StopReason::EndTurn,
-                    capabilities: Capabilities(serde_json::json!({})),
-                    reasoning: ReasoningPolicy::Drop,
-                },
-            ))
+            let text = self.text.clone();
+            Box::pin(async move {
+                Ok(to_model_response(
+                    vec![Block::Text { text }],
+                    ModelMeta {
+                        usage: Usage::default(),
+                        model_id: "claude-replay-spine-unit".into(),
+                        stop_reason: StopReason::EndTurn,
+                        capabilities: Capabilities(serde_json::json!({})),
+                        reasoning: ReasoningPolicy::Drop,
+                    },
+                ))
+            })
+        }
+        fn list_models<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn model(&self) -> &str {
+            "stub"
         }
     }
 

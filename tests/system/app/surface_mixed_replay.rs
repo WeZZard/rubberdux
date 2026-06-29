@@ -59,17 +59,19 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use serde_json::Value as Json;
-
 use rubberdux::agent::world::effects::{
-    drive_replay, ModelCaller, ReplayCursor, Replayed,
+    drive_replay, ReplayCursor, Replayed,
 };
 use rubberdux::agent::world::gates::EntityGate;
-use rubberdux::agent::world::history::{Block, History};
-use rubberdux::agent::world::inputs::{Event, LogicalInput, ModelMeta, Origin};
+use rubberdux::agent::world::history::History;
+use rubberdux::agent::world::inputs::{Event, LogicalInput, Origin};
 use rubberdux::agent::world::mode::{mode, Mode};
-use rubberdux::agent::world::model_client::MessagesClient;
 use rubberdux::agent::world::systems::tick;
+use rubberdux::provider::{
+    ModelApi, ModelInfo, ModelRequest, ModelResponse, selected_from_env,
+};
+use std::future::Future;
+use std::pin::Pin;
 use rubberdux::agent::world::world::{
     Activity, Components, Effort, Identity, Lineage, ModelConfig, Resources, World,
 };
@@ -141,7 +143,7 @@ fn genesis_from_log(events: &[Event], model: &ModelConfig) -> Result<World, Erro
 /// Reconstruct the EXACT `ModelConfig` the worker fingerprinted its `CallModel`
 /// requests against, mirroring `worker::world_model_config(client.model())`: the
 /// model ALIAS is the request alias the worker resolved from `RUBBERDUX_LLM_MODEL`
-/// (NOT the provider's effective `meta.model_id`, which `MessagesClient` reports
+/// (NOT the provider's effective `meta.model_id`, which the selected provider reports
 /// post-call and may differ), `max_tokens` is read from `RUBBERDUX_LLM_MAX_TOKENS`
 /// (default 4096), and effort is `Medium`. The test process and the worker share
 /// this environment (the `system` target's `main` loads the repo-root `.env` before
@@ -172,10 +174,21 @@ struct ExplodingClient {
     calls: Arc<AtomicUsize>,
 }
 
-impl ModelCaller for ExplodingClient {
-    async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+impl ModelApi for ExplodingClient {
+    fn turn<'a>(
+        &'a self,
+        _req: &'a ModelRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         panic!("the replay driver must never invoke the model client");
+    }
+    fn list_models<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn model(&self) -> &str {
+        "stub"
     }
 }
 
@@ -426,8 +439,8 @@ pub async fn run() {
     // The request alias the worker resolved from the shared env (NOT the provider's
     // effective post-call model id), so the re-emitted CallModel re-hashes to the
     // recorded ModelResponded fingerprint.
-    let model_alias = MessagesClient::from_env()
-        .expect("build a MessagesClient to read the worker's model alias")
+    let model_alias = selected_from_env()
+        .expect("build a provider to read the worker's model alias")
         .model()
         .to_owned();
     let model = reconstruct_model_config(&model_alias);

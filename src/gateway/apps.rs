@@ -406,7 +406,7 @@ async fn create_app(
         let mut app = app.clone();
         let board_tx = state.board_tx.clone();
         tokio::spawn(async move {
-            let identity = derive_identity(&client, &task).await;
+            let identity = derive_identity(client.as_ref(), &task).await;
             log::info!(
                 "derived identity for App `{}`: title={:?} symbol={:?}",
                 app.id,
@@ -434,7 +434,7 @@ async fn create_app(
     }
 
     // Consult the clusterer off the request path. Reuses the gateway's existing
-    // identity client (a `MoonshotClient`) — no new state field — and the
+    // identity client (the selected `ModelApi`) — no new state field — and the
     // supervisor already in state. See `docs/app/merge/clustering.md`.
     if let (Some(client), Some(supervisor)) =
         (state.identity_client.clone(), state.supervisor.clone())
@@ -459,7 +459,7 @@ async fn create_app(
 /// propagated. See `docs/app/merge/clustering.md`.
 async fn consult_clusterer(
     supervisor: Arc<dyn DynAppSupervisor>,
-    client: Arc<crate::provider::moonshot::MoonshotClient>,
+    client: Arc<dyn crate::provider::ModelApi>,
     new_app_id: AppId,
     summary: String,
 ) {
@@ -754,7 +754,9 @@ mod tests {
     use crate::agent::runtime::port::{InputPort, LoopEvent};
     use crate::app::registry::store::{AppStore, FilesystemAppStore};
     use crate::app::supervisor::MemorySupervisor;
-    use crate::provider::moonshot::MoonshotClient;
+    use crate::gateway::state::ProviderMeta;
+    use crate::provider::ModelApi;
+    use crate::provider::dialect::openai_chat_completions::OpenAiChatCompletions;
     use crate::session::SessionManager;
 
     /// Serializes tests that mutate the process-global `RUBBERDUX_HOME` so the
@@ -767,13 +769,22 @@ mod tests {
         InputPort::new(tx)
     }
 
-    fn dummy_client() -> Arc<MoonshotClient> {
-        Arc::new(MoonshotClient::new(
+    fn dummy_client() -> Arc<dyn ModelApi> {
+        Arc::new(OpenAiChatCompletions::new(
             reqwest::Client::new(),
             "http://localhost:0".into(),
             "test-key".into(),
             "test-model".into(),
+            crate::provider::AuthScheme::Bearer,
         ))
+    }
+
+    fn dummy_provider_meta() -> ProviderMeta {
+        ProviderMeta {
+            provider: "kimi-for-coding".into(),
+            model: "test-model".into(),
+            dialect: "anthropic-messages".into(),
+        }
     }
 
     fn memory_supervisor() -> Arc<MemorySupervisor> {
@@ -796,6 +807,8 @@ mod tests {
             dummy_input_port(),
             memory_supervisor(),
             dummy_client(),
+            dummy_client(),
+            dummy_provider_meta(),
         ));
         router().with_state(state)
     }

@@ -16,7 +16,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use crate::provider::moonshot::tool::ToolDefinition;
+use crate::provider::kimi_for_coding::tool::ToolDefinition;
 
 /// Subagent execution strategy. Determines the tool registry and
 /// execution environment for a spawned subagent.

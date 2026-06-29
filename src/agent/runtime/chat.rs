@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::provider::moonshot::MoonshotClient;
+use crate::provider::ModelApi;
+use crate::provider::kimi_for_coding::KimiForCodingClient;
 use crate::tool::ToolRegistry;
 
 use super::agent_loop::{AgentLoop, AgentLoopConfig};
@@ -16,10 +17,14 @@ const DEFAULT_BEST_PERFORMANCE_TOKENS: usize = 153_600;
 /// Returns the loop and its input port. The caller is responsible for
 /// sending `LoopEvent`s through the `InputPort` and calling `agent_loop.run()`.
 pub async fn run_with_session(
-    client: Arc<MoonshotClient>,
+    client: Arc<dyn ModelApi>,
     system_prompt: String,
     session_path: std::path::PathBuf,
 ) -> (AgentLoop, InputPort) {
+    // The $web_search builtin is Kimi-specific and reached over the OpenAI
+    // dialect, independent of the selected turn-driving provider, so it keeps its
+    // own env-built Kimi client; turns route through `client` (the ModelApi).
+    let web_search_client = Arc::new(KimiForCodingClient::from_env());
     let best_perf_tokens: usize = std::env::var("RUBBERDUX_LLM_BEST_PERFORMANCE_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -34,9 +39,9 @@ pub async fn run_with_session(
 
     // Build tool registry
     let registry = {
-        use crate::provider::moonshot::tool::bash::MoonshotBashTool;
-        use crate::provider::moonshot::tool::web_fetch::MoonshotWebFetchTool;
-        use crate::provider::moonshot::tool::web_search::WebSearchTool;
+        use crate::provider::kimi_for_coding::tool::bash::KimiForCodingBashTool;
+        use crate::provider::kimi_for_coding::tool::web_fetch::KimiForCodingWebFetchTool;
+        use crate::provider::kimi_for_coding::tool::web_search::WebSearchTool;
         use crate::tool::agent::{AgentTool, build_subagent_registries};
         use crate::tool::edit::EditFileTool;
         use crate::tool::glob::GlobTool;
@@ -45,16 +50,16 @@ pub async fn run_with_session(
         use crate::tool::write::WriteFileTool;
 
         let mut r = ToolRegistry::new();
-        r.register(Box::new(MoonshotBashTool::new()));
-        r.register(Box::new(MoonshotWebFetchTool::new()));
+        r.register(Box::new(KimiForCodingBashTool::new()));
+        r.register(Box::new(KimiForCodingWebFetchTool::new()));
         r.register(Box::new(ReadFileTool));
         r.register(Box::new(WriteFileTool));
         r.register(Box::new(EditFileTool));
         r.register(Box::new(GlobTool));
         r.register(Box::new(GrepTool));
-        r.register(Box::new(WebSearchTool::new(client.clone())));
+        r.register(Box::new(WebSearchTool::new(web_search_client.clone())));
 
-        let subagent_registries = build_subagent_registries(&client, &None, &None);
+        let subagent_registries = build_subagent_registries(&web_search_client, &None, &None);
         r.register(Box::new(AgentTool::new(
             client.clone(),
             subagent_registries,
@@ -100,7 +105,7 @@ mod tests {
     use std::pin::Pin;
 
     use crate::agent::entry::EntryHistory;
-    use crate::provider::moonshot::{Message, UserContent};
+    use crate::provider::kimi_for_coding::{Message, UserContent};
 
     #[test]
     fn test_eviction_removes_oldest_pairs() {
@@ -170,7 +175,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_tool_execution() {
-        use crate::provider::moonshot::tool::ToolDefinition;
+        use crate::provider::kimi_for_coding::tool::ToolDefinition;
         use crate::tool::{Tool, ToolOutcome, ToolRegistry};
         use std::time::{Duration, Instant};
 
@@ -240,12 +245,12 @@ mod tests {
         id: &str,
         name: &str,
         depends_on: Option<&str>,
-    ) -> crate::provider::moonshot::tool::ToolCall {
-        crate::provider::moonshot::tool::ToolCall {
+    ) -> crate::provider::kimi_for_coding::tool::ToolCall {
+        crate::provider::kimi_for_coding::tool::ToolCall {
             index: None,
             id: id.into(),
             r#type: "function".into(),
-            function: crate::provider::moonshot::tool::FunctionCall {
+            function: crate::provider::kimi_for_coding::tool::FunctionCall {
                 name: name.into(),
                 arguments: "{}".into(),
             },
@@ -255,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wave_partitioning_independent() {
-        use crate::provider::moonshot::tool::ToolDefinition;
+        use crate::provider::kimi_for_coding::tool::ToolDefinition;
         use crate::tool::{Tool, ToolOutcome, ToolRegistry};
         use std::time::{Duration, Instant};
 
@@ -320,7 +325,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wave_partitioning_dependent() {
-        use crate::provider::moonshot::tool::ToolDefinition;
+        use crate::provider::kimi_for_coding::tool::ToolDefinition;
         use crate::tool::{Tool, ToolOutcome, ToolRegistry};
         use std::time::{Duration, Instant};
 
@@ -391,7 +396,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_malformed_depends_on() {
-        use crate::provider::moonshot::tool::ToolDefinition;
+        use crate::provider::kimi_for_coding::tool::ToolDefinition;
         use crate::tool::{Tool, ToolOutcome, ToolRegistry};
 
         struct DummyTool;

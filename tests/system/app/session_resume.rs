@@ -8,7 +8,7 @@
 //! `resumed_driver_emits_only_new_text_and_continues_ticks`) proves the
 //! reconstruction byte-identically with stubs; this case proves the SAME flow
 //! end-to-end against a REAL recorded session and a REAL model. Per the mock-data
-//! policy (root `CLAUDE.md`) it uses the real `MessagesClient` and is gated on
+//! policy (root `CLAUDE.md`) it uses the real selected provider and is gated on
 //! live-LLM credentials, skipping cleanly when absent.
 //!
 //! ## Why drive `WorldDriver::open` directly
@@ -55,17 +55,19 @@
 
 use std::path::PathBuf;
 
-use serde_json::Value as Json;
-
 use rubberdux::agent::world::budget::Budget;
 use rubberdux::agent::world::driver::WorldDriver;
-use rubberdux::agent::world::effects::{Command, ModelCaller, SurfaceDriver};
+use rubberdux::agent::world::effects::{Command, SurfaceDriver};
 use rubberdux::agent::world::event_log::{EventLog, FilesystemEventLog};
 use rubberdux::agent::world::gates::EntityGate;
-use rubberdux::agent::world::history::{Block, History};
-use rubberdux::agent::world::inputs::{Event, LogicalInput, ModelMeta, Origin};
-use rubberdux::agent::world::model_client::MessagesClient;
+use rubberdux::agent::world::history::History;
+use rubberdux::agent::world::inputs::{Event, LogicalInput, Origin};
 use rubberdux::agent::world::replay::{self, is_model_call_result, replay_world};
+use rubberdux::provider::{
+    ModelApi, ModelInfo, ModelRequest, ModelResponse, selected_from_env,
+};
+use std::future::Future;
+use std::pin::Pin;
 use rubberdux::agent::world::snapshot::{snapshot_at, SnapshotStore};
 use rubberdux::agent::world::world::{
     Activity, Components, Effort, Identity, Inbox, Lineage, ModelConfig, Resources, Tick, World,
@@ -183,9 +185,20 @@ fn canonical(world: &World) -> Vec<u8> {
 /// turn nor re-genesises.
 struct ExplodingModelCaller;
 
-impl ModelCaller for ExplodingModelCaller {
-    async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+impl ModelApi for ExplodingModelCaller {
+    fn turn<'a>(
+        &'a self,
+        _req: &'a ModelRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
         panic!("a clean resume reconstructs from the log + snapshot alone; it must never call the model");
+    }
+    fn list_models<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn model(&self) -> &str {
+        "exploding"
     }
 }
 
@@ -202,9 +215,9 @@ impl SurfaceDriver for AcceptingSurfaceDriver {
     }
 }
 
-/// The concrete recording/resuming driver: the real `MessagesClient`, the accepting
+/// The concrete recording/resuming driver: the real selected provider, the accepting
 /// surface sink, and a `FilesystemEventLog` rooted under the session dir.
-type LiveDriver = WorldDriver<MessagesClient, AcceptingSurfaceDriver, FilesystemEventLog>;
+type LiveDriver = WorldDriver<Box<dyn ModelApi>, AcceptingSurfaceDriver, FilesystemEventLog>;
 
 /// The structural restart driver: an `ExplodingModelCaller` proves a clean resume
 /// makes zero model calls.
@@ -245,8 +258,8 @@ pub async fn run() {
         latest_link: app_home.path().join("latest"),
     };
 
-    let client = MessagesClient::from_env()
-        .expect("build a MessagesClient from RUBBERDUX_LLM_* for the live recording");
+    let client = selected_from_env()
+        .expect("build a provider from RUBBERDUX_LLM_* for the live recording");
     let model = model_config(client.model());
     let model_alias = client.model().to_owned();
     eprintln!(
@@ -396,8 +409,8 @@ pub async fn run() {
     // -- (3) Restart, live: continue the session with a NEW turn ---------------
     // Reopen the SAME session with the REAL client and drive a DIFFERENT question
     // so its reply is distinguishable from the recorded one.
-    let restart_client = MessagesClient::from_env()
-        .expect("rebuild a MessagesClient for the live restart turn");
+    let restart_client = selected_from_env()
+        .expect("rebuild a provider for the live restart turn");
     let restart_reply = {
         let event_log = FilesystemEventLog::new(&resolved_dir.join("world-events.jsonl"));
         let store = SnapshotStore::new(resolved_dir.join("snapshots"));

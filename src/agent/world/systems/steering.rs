@@ -138,7 +138,7 @@ fn bounded_enqueue(
         }
     }
     inbox.pending.push(content);
-    (dropped > 0).then(|| LifecycleEvent::MessageDropped {
+    (dropped > 0).then_some(LifecycleEvent::MessageDropped {
         at: wall,
         edge: HUMAN_EDGE,
         reason: DropReason::InboxOverflow,
@@ -547,23 +547,33 @@ mod tests {
     #[tokio::test]
     async fn inbox_overflow_emits_message_dropped_on_the_live_driver_path() {
         use crate::agent::world::effects::{
-            drive_live, ModelCaller, ResultStamp, SurfaceDriver, UnattachedPeerSender,
+            drive_live, ResultStamp, SurfaceDriver, UnattachedPeerSender,
         };
         use crate::agent::world::event_log::{EventLog, MemoryEventLog};
-        use crate::agent::world::inputs::ModelMeta;
         use crate::agent::world::lifecycle::{DropReason, LifecycleEvent};
         use crate::error::Error;
+        use crate::provider::{ModelApi, ModelInfo, ModelRequest, ModelResponse};
+        use std::future::Future;
+        use std::pin::Pin;
 
         /// A model client that must never be invoked: a steering overflow emits ONLY
         /// the stratum-2 notice Command, never a `CallModel`. A call here would prove
         /// the notice path wrongly triggered an effect.
         struct NoCallClient;
-        impl ModelCaller for NoCallClient {
-            async fn call(
-                &self,
-                _request_body: serde_json::Value,
-            ) -> Result<(Vec<Block>, ModelMeta), Error> {
-                panic!("a steering overflow must not invoke the model client");
+        impl ModelApi for NoCallClient {
+            fn turn<'a>(
+                &'a self,
+                _req: &'a ModelRequest,
+            ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
+                Box::pin(async { panic!("a steering overflow must not invoke the model client") })
+            }
+            fn list_models<'a>(
+                &'a self,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn model(&self) -> &str {
+                "stub"
             }
         }
 

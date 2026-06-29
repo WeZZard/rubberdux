@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use rubberdux::provider::moonshot::MoonshotClient;
+use rubberdux::provider::kimi_for_coding::KimiForCodingClient;
 use rubberdux::tool::agent::{AgentTool, build_subagent_registries};
 use rubberdux::tool::{SubagentType, ToolRegistry};
 use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
 
-fn dummy_client() -> Arc<MoonshotClient> {
-    Arc::new(MoonshotClient::new(
+fn dummy_client() -> Arc<KimiForCodingClient> {
+    Arc::new(KimiForCodingClient::new(
         reqwest::Client::new(),
         "http://localhost:0".into(),
         "test-key".into(),
@@ -15,19 +15,19 @@ fn dummy_client() -> Arc<MoonshotClient> {
     ))
 }
 
-fn make_registry_with_agent(client: Arc<MoonshotClient>) -> ToolRegistry {
+fn make_registry_with_agent(client: Arc<KimiForCodingClient>) -> ToolRegistry {
     make_registry_with_agent_with_rpc(client, None)
 }
 
 fn make_registry_with_agent_with_rpc(
-    client: Arc<MoonshotClient>,
+    client: Arc<KimiForCodingClient>,
     rpc_writer: Option<Arc<tokio::sync::Mutex<OwnedWriteHalf>>>,
 ) -> ToolRegistry {
     let registries = build_subagent_registries(&client, &None, &None);
     let (context_tx, _) = tokio::sync::broadcast::channel(4);
 
     let agent_tool = AgentTool::new(
-        client,
+        crate::support::model_api_stub::dummy_model_api(),
         registries,
         "integration test system prompt".into(),
         context_tx,

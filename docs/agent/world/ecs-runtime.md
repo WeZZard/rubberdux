@@ -50,13 +50,21 @@ AI-driven), and a lead agent may **drive other App processes**.
   read (the `WallClock` resource), never the ordering axis.
 - **Make illegal states unrepresentable** (Minsky) — sum types over loose flags.
 - **Provider format: Anthropic Messages** (`POST /v1/messages`); stateless.
+  Model calls now route through `provider::ModelApi` (see
+  `docs/provider/provider.md`): the former `MessagesClient`
+  (`src/agent/world/model_client.rs`) is removed; its wire logic moved to
+  `src/provider/dialect/anthropic_messages.rs`; the world↔neutral conversion
+  lives in `src/agent/world/model_bridge.rs`. The fingerprint basis
+  (`History`, `ToolSet`, `ModelConfig`) and the `fingerprint_call` hash are
+  unchanged, so existing recordings replay identically.
 
 ```
   WHAT THE USER TOUCHES  — native client renders the agent-described UI
         ▲
   WHAT RUNS              — ECS World (pure); Systems emit Commands; Events carry
         ▲                   origin + edge; "mode" = per-edge fold over event origin
-  HOW IT TALKS TO MODEL  — MessageBuilder serializes to Anthropic Messages
+  HOW IT TALKS TO MODEL  — provider::ModelApi (AnthropicMessages dialect by default)
+                           world↔neutral conversion in agent/world/model_bridge.rs
 ```
 
 ---
@@ -2058,11 +2066,17 @@ parallelism comes from spawning entities, not from multiplexing one entity's Act
 
 ## Anthropic model-call mapping
 
-`MessageBuilder` serializes a `CallModel` to `POST /v1/messages`: assembled system
-→ top-level `system`; `History` blocks → `messages[blocks]`; `ToolUse` in an
-assistant message; `ToolResult` in a USER message; `Reasoning` → `thinking`
-(echoed unchanged with signature); `ToolSet` → `tools[{name,description,input_schema}]`;
-`ModelConfig` → `model`/`max_tokens`/`thinking:adaptive`/`output_config.effort`.
+The live driver in `src/agent/world/effects.rs` does NOT serialize a `CallModel`
+directly. It builds a neutral `provider::ModelRequest` via
+`src/agent/world/model_bridge.rs` (`to_model_request`) and drives it through the
+config-selected provider with `client.turn()` (`provider::ModelApi`); the
+Anthropic Messages dialect adapter (`src/provider/dialect/anthropic_messages.rs`)
+is what serializes that request to `POST /v1/messages`. The mapping the adapter
+performs: assembled system → top-level `system`; `History` blocks →
+`messages[blocks]`; `ToolUse` in an assistant message; `ToolResult` in a USER
+message; `Reasoning` → `thinking` (echoed unchanged with signature); `ToolSet` →
+`tools[{name,description,input_schema}]`; `ModelConfig` →
+`model`/`max_tokens`/`thinking:{type:adaptive}`/`output_config.effort`.
 Stateless. UI-manipulation tools ride the standard `ToolUse` path; UI state /
 screenshots return as `ToolReturned` (may include an `Image` block).
 Any **date/time the assembled `system` embeds** (e.g. "today is …") is read from

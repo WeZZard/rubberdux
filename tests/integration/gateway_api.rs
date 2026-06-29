@@ -11,8 +11,8 @@ use rubberdux::agent::runtime::port::{InputPort, LoopEvent};
 use rubberdux::gateway::route::router;
 use rubberdux::gateway::state::GatewayState;
 use rubberdux::gateway::stream::{ws_entries, ws_trajectory};
-use rubberdux::provider::moonshot::{Message, UserContent};
-use rubberdux::provider::moonshot::tool::{FunctionCall, ToolCall};
+use rubberdux::provider::kimi_for_coding::{Message, UserContent};
+use rubberdux::provider::kimi_for_coding::tool::{FunctionCall, ToolCall};
 
 fn dummy_input_port() -> InputPort {
     let (tx, _rx) = tokio::sync::mpsc::channel::<LoopEvent>(8);
@@ -34,6 +34,12 @@ async fn seeded_state() -> Arc<GatewayState> {
         "Test identity prompt.".into(),
         "Test soul prompt.".into(),
         dummy_input_port(),
+        crate::support::model_api_stub::dummy_model_api(),
+        rubberdux::gateway::state::ProviderMeta {
+            provider: "kimi-for-coding".into(),
+            model: "test-model".into(),
+            dialect: "anthropic-messages".into(),
+        },
     );
 
     let entries = vec![

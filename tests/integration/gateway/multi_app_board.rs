@@ -24,9 +24,11 @@ use rubberdux::app::registry::store::{AppStore, FilesystemAppStore};
 use rubberdux::app::supervisor::MemorySupervisor;
 use rubberdux::app::{App, AppId, BoardPosition, IconSpec};
 use rubberdux::gateway::apps::router;
-use rubberdux::gateway::state::GatewayState;
-use rubberdux::provider::moonshot::MoonshotClient;
+use rubberdux::gateway::state::{GatewayState, ProviderMeta};
+use rubberdux::provider::ModelApi;
 use rubberdux::session::SessionManager;
+
+use crate::support::model_api_stub::openai_model_api;
 
 fn dummy_input_port() -> InputPort {
     let (tx, _rx) = tokio::sync::mpsc::channel::<LoopEvent>(8);
@@ -36,13 +38,18 @@ fn dummy_input_port() -> InputPort {
 /// A client whose base URL is unreachable: the board lifecycle routes under
 /// test never reach the network, and the background identity/clustering tasks
 /// `create_app` spawns are best-effort and tolerate a failed call.
-fn dummy_client() -> Arc<MoonshotClient> {
-    Arc::new(MoonshotClient::new(
-        reqwest::Client::new(),
-        "http://127.0.0.1:0".into(),
-        "test-key".into(),
-        "test-model".into(),
-    ))
+fn dummy_client() -> Arc<dyn ModelApi> {
+    openai_model_api("http://127.0.0.1:0", "test-model")
+}
+
+/// Provider identity snapshot for the board state under test; the routes
+/// exercised never read it, so any consistent stub serves.
+fn dummy_provider_meta() -> ProviderMeta {
+    ProviderMeta {
+        provider: "kimi-for-coding".into(),
+        model: "test-model".into(),
+        dialect: "anthropic-messages".into(),
+    }
 }
 
 /// Build the App board router over a fresh in-process supervisor rooted under a
@@ -70,6 +77,8 @@ fn board_router_with_store() -> (axum::Router, Arc<dyn AppStore>) {
         dummy_input_port(),
         supervisor,
         dummy_client(),
+        dummy_client(),
+        dummy_provider_meta(),
     ));
     (router().with_state(state), store)
 }

@@ -24,13 +24,13 @@ use sha2::{Digest, Sha256};
 use super::autonomy::{AgentInteraction, HumanAction, Notify};
 use super::blob::BlobStore;
 use super::event_log::EventLog;
-use super::history::{BlobHash, Block, History, ImageSource, MessageBuilder, Msg, ToolSchema};
+use super::history::{BlobHash, Block, History, ImageSource, Msg, ToolSchema};
 use super::inputs::{
-    CancelReason, DeliveryOutcome, Event, Fingerprint, LogicalInput, ModelError, ModelMeta, Origin,
+    CancelReason, DeliveryOutcome, Event, Fingerprint, LogicalInput, ModelError, Origin,
     PeerPayload,
 };
 use super::lifecycle::{ActorCtx, AppId, EffectId, EffectKind, IdempotencyKey, LifecycleEvent};
-use super::model_client::MessagesClient;
+use super::model_bridge::{from_model_response, to_model_request};
 use super::surface::{
     PeerEnvelopeId, SurfaceOp, fingerprint_ui_request, perceived_for_ops, set_value_tool_schema,
     surface_tool_result,
@@ -282,28 +282,15 @@ fn resolve_tools(tools: &ToolSet) -> Vec<ToolSchema> {
 }
 
 // ---------------------------------------------------------------------------
-// ModelCaller — the model-call capability the LIVE driver needs
+// Model-call capability — the config-selected provider::ModelApi
 // ---------------------------------------------------------------------------
-
-/// The model-call capability the LIVE driver depends on, abstracted behind a
-/// trait so a test can inject a stand-in without a network. `MessagesClient` is
-/// the production implementation. The REPLAY driver takes NO `ModelCaller` — it
-/// cannot make a call by construction (Inv 6). See docs/agent/world/ecs-runtime.md.
-pub trait ModelCaller {
-    /// POST the assembled `/v1/messages` body and return the assistant blocks and
-    /// call metadata, mirroring `MessagesClient::call`.
-    fn call(
-        &self,
-        request_body: Json,
-    ) -> impl Future<Output = Result<(Vec<Block>, ModelMeta), Error>> + Send;
-}
-
-impl ModelCaller for MessagesClient {
-    async fn call(&self, request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
-        // Inherent `MessagesClient::call` (resolves ahead of this trait method).
-        MessagesClient::call(self, request_body).await
-    }
-}
+//
+// The LIVE driver drives each `CallModel`/`Compact` through the config-selected
+// [`crate::provider::ModelApi`] (built by `provider::selected_from_env()`), passed
+// in as `&dyn ModelApi`. The world↔neutral conversion at this seam lives in
+// [`super::model_bridge`] (so the provider stays free of any world import). The
+// REPLAY driver takes NO model client — it cannot make a call by construction
+// (Inv 6). See docs/agent/world/ecs-runtime.md.
 
 // ---------------------------------------------------------------------------
 // SurfaceDriver — the surface-drive sink the LIVE driver needs (stratum-2/live)
@@ -311,7 +298,7 @@ impl ModelCaller for MessagesClient {
 
 /// The surface-drive capability the LIVE driver depends on, abstracted behind a
 /// trait so a test can inject a capturing stand-in without the macOS app, exactly
-/// as `ModelCaller` abstracts the model call. When the live driver executes a
+/// as the model-call seam (`provider::ModelApi`) abstracts the model call. When the live driver executes a
 /// `set_value` surface `RunTool` it hands the Command to `drive`, whose production
 /// impl converts it to a `HostToAgent::SurfaceDrive` frame (the worker's
 /// `surface_drive_frame`) and forwards it to the macOS app so the screen actually
@@ -321,7 +308,7 @@ impl ModelCaller for MessagesClient {
 /// (Theme 2a; SurfaceDrive; the agent UI-write echo is one fact).
 pub trait SurfaceDriver {
     /// Forward a `set_value` surface `RunTool` out to the macOS app as a surface
-    /// drive. Mirrors `ModelCaller::call`: the live driver awaits it as the real
+    /// drive. Mirrors the model-call seam: the live driver awaits it as the real
     /// effect; a genuine forwarding failure propagates so the driver can record it.
     fn drive(&self, command: &Command) -> impl Future<Output = Result<(), Error>> + Send;
 }
@@ -332,7 +319,7 @@ pub trait SurfaceDriver {
 
 /// The peer-send capability the LIVE driver depends on, abstracted behind a trait
 /// so a test can inject a stand-in without the shell `PeerBroker`, exactly as
-/// `ModelCaller` abstracts the model call and `SurfaceDriver` the surface drive.
+/// the model-call seam (`provider::ModelApi`) abstracts the model call and `SurfaceDriver` the surface drive.
 /// When the live driver dispatches a `Command::SendPeer` it hands the destination
 /// `to`, the `payload`, the idempotency `key`, and the sender-assigned `envelope`
 /// to `send`, whose production impl wraps the shell `PeerBroker::relay`, mapping its
@@ -383,7 +370,7 @@ impl PeerSender for UnattachedPeerSender {
 
 /// The content-addressed blob capability the LIVE driver depends on, abstracted
 /// behind a trait so the externalize/resolve IO stays in the imperative SHELL and
-/// out of the pure tick — exactly as `ModelCaller`/`SurfaceDriver`/`PeerSender`
+/// out of the pure tick — exactly as the model-call seam/`SurfaceDriver`/`PeerSender`
 /// abstract their effects. `BlobStore` (blob.rs) is the production implementation.
 /// The externalize DECISION ([`over_inline_cap`]) is a pure function of
 /// `(bytes.len(), cap)`; only `put`/`get` are this seam's shell effects, so a pure
@@ -584,17 +571,16 @@ pub struct ResultStamp {
 /// [`BlobStore`] seam is wired, BL-sink). With `Caps.blob_inline_cap == 0` (the
 /// default) the seam is never touched, so this is byte-identical to the pre-blob
 /// driver. See docs/agent/world/ecs-runtime.md §1415-1434.
-pub async fn drive_live<C, S, P, L>(
+pub async fn drive_live<S, P, L>(
     commands: &[Command],
     stamp: ResultStamp,
     world: &World,
-    client: &C,
+    client: &dyn crate::provider::ModelApi,
     surface_driver: &S,
     peer_sender: &P,
     log: &mut L,
 ) -> Result<Vec<Event>, Error>
 where
-    C: ModelCaller,
     S: SurfaceDriver,
     P: PeerSender,
     L: EventLog,
@@ -619,8 +605,10 @@ where
 /// `CommandDispatched` dispatch-intent (intent before commitment, Inv 5) BEFORE
 /// performing the effect, carrying the `ActorCtx` (the durable `cmd → ctx` index,
 /// Theme 1b/Inv 17), the `IdempotencyKey = (app_id, tick, effect_id)`, and the
-/// request `Fingerprint`. It then assembles the `/v1/messages` body via
-/// `MessageBuilder`, calls the `ModelCaller`, and builds the result
+/// request `Fingerprint`. It then builds the neutral request at the world↔neutral
+/// seam ([`super::model_bridge`]), drives it through the config-selected
+/// [`crate::provider::ModelApi`], reshapes the response back into the recorded
+/// `(Vec<Block>, ModelMeta)`, and builds the result
 /// `LogicalInput` — `ModelResponded` on success, `ModelFailed` on a call error
 /// (a failed call is a RECORDED Input that drives the failure edge, not a driver
 /// error) — whose `entity`/`origin`/`edge` INHERIT from the dispatch-intent's
@@ -662,18 +650,17 @@ where
 // same reason `drive_live` already sits at the limit; the `blob_sink` is the one
 // added here. See docs/agent/world/ecs-runtime.md §1415-1434.
 #[allow(clippy::too_many_arguments)]
-pub async fn drive_live_with_blob_sink<C, S, P, B, L>(
+pub async fn drive_live_with_blob_sink<S, P, B, L>(
     commands: &[Command],
     stamp: ResultStamp,
     world: &World,
-    client: &C,
+    client: &dyn crate::provider::ModelApi,
     surface_driver: &S,
     peer_sender: &P,
     blob_sink: &B,
     log: &mut L,
 ) -> Result<Vec<Event>, Error>
 where
-    C: ModelCaller,
     S: SurfaceDriver,
     P: PeerSender,
     B: BlobSink,
@@ -734,13 +721,18 @@ where
                 // itself, so a no-image body is byte-identical to before. See
                 // docs/agent/world/ecs-runtime.md §1415-1434.
                 let resolved = resolve_history(messages, blob_sink)?;
-                let body = MessageBuilder::new("", params, &resolved)
-                    .with_tools(&tool_schemas)
-                    .build()?;
+                // Build the neutral request at the world↔neutral seam and drive it
+                // through the config-selected provider; the returned neutral
+                // `ModelResponse` is reshaped back into the exact `(Vec<Block>,
+                // ModelMeta)` the former client returned, so the recorded result is
+                // byte-identical (replay determinism). The fingerprint above is over
+                // the UN-resolved world `messages`, untouched by this conversion.
+                let request = to_model_request("", params, &tool_schemas, &resolved);
                 // The result INHERITS its `entity` from the dispatch-intent's `ctx`
                 // (Inv 17), not from a positional scan.
-                let input = match client.call(body).await {
-                    Ok((blocks, meta)) => {
+                let input = match client.turn(&request).await {
+                    Ok(response) => {
+                        let (blocks, meta) = from_model_response(response);
                         // Externalize any over-cap image the model returned to the
                         // blob store, recording only its `Blob{hash}` — the
                         // log/snapshot then carry the hash, never the bytes (the
@@ -988,16 +980,20 @@ where
                 // Blob-form `messages`, so live and replay hash identically, Inv 7).
                 // The model returns the summary blocks.
                 let resolved = resolve_history(messages, blob_sink)?;
-                let body = MessageBuilder::new(
+                // The summarization request, built at the world↔neutral seam (no
+                // tools) and driven through the config-selected provider; the
+                // fingerprint above stays over the Blob-form `messages`.
+                let request = to_model_request(
                     "Summarize the following conversation into a single concise \
                      message that preserves all key information and context \
                      needed to continue the conversation coherently.",
                     params,
+                    &[],
                     &resolved,
-                )
-                .build()?;
-                let input = match client.call(body).await {
-                    Ok((blocks, _meta)) => {
+                );
+                let input = match client.turn(&request).await {
+                    Ok(response) => {
+                        let (blocks, _meta) = from_model_response(response);
                         // Externalize any over-cap image in the summary the same way
                         // as a `CallModel` response; a no-image summary is byte-identical.
                         let summary =
@@ -1087,6 +1083,8 @@ fn entity_owning_peer_cmd(world: &World, cmd: CmdId) -> EntityId {
 // ---------------------------------------------------------------------------
 
 /// The outcome of standing in a single emitted `CallModel` during replay.
+// Replay-critical control enum; boxing would touch drive_replay — suppress the size lint.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Replayed {
     /// The re-emitted request re-hashed to the recorded result's `Fingerprint` →
@@ -1142,7 +1140,7 @@ impl ReplayCursor {
 /// the next recorded result's: a MATCH reuses that recorded `Event` (`Reused`); a
 /// MISMATCH — or an exhausted log — is the fork/edit boundary (`Diverged`), at
 /// which the run flips one-way to live and the caller takes over from this
-/// Command onward. The driver makes NO model call (it takes no `ModelCaller`), so
+/// Command onward. The driver makes NO model call (it takes no model client), so
 /// replay reconstructs the World with zero model calls (Inv 6/7).
 pub fn drive_replay(commands: &[Command], cursor: &mut ReplayCursor) -> Result<Vec<Replayed>, Error> {
     let mut out = Vec::with_capacity(commands.len());
@@ -1471,7 +1469,11 @@ mod tests {
     use crate::agent::world::inputs::{
         Capabilities, Event, LogicalInput, ModelMeta, Origin, ReasoningPolicy, StopReason, Usage,
     };
+    use crate::agent::world::model_bridge::to_model_response;
     use crate::agent::world::world::{Effort, ModelConfig, Resources};
+    use crate::provider::{ModelApi, ModelInfo, ModelRequest, ModelResponse};
+    use std::future::Future;
+    use std::pin::Pin;
 
     /// A model client that fails loudly if invoked. The replay driver takes NO
     /// client (it cannot make a call by construction, Inv 6); this stand-in makes
@@ -1479,9 +1481,20 @@ mod tests {
     /// would panic here.
     struct ExplodingClient;
 
-    impl ModelCaller for ExplodingClient {
-        async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
-            panic!("the replay driver must never invoke the model client");
+    impl ModelApi for ExplodingClient {
+        fn turn<'a>(
+            &'a self,
+            _req: &'a ModelRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
+            Box::pin(async { panic!("the replay driver must never invoke the model client") })
+        }
+        fn list_models<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn model(&self) -> &str {
+            "stub"
         }
     }
 
@@ -1688,21 +1701,34 @@ mod tests {
     /// driver produces a `ModelResponded` without a network.
     struct StubClient;
 
-    impl ModelCaller for StubClient {
-        async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
-            Ok((
-                vec![Block::Text { text: "ok".into() }],
-                ModelMeta {
-                    usage: Usage {
-                        input_tokens: 1,
-                        output_tokens: 1,
+    impl ModelApi for StubClient {
+        fn turn<'a>(
+            &'a self,
+            _req: &'a ModelRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
+            Box::pin(async {
+                Ok(to_model_response(
+                    vec![Block::Text { text: "ok".into() }],
+                    ModelMeta {
+                        usage: Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                        },
+                        model_id: "claude-x-2026".into(),
+                        stop_reason: StopReason::EndTurn,
+                        capabilities: Capabilities(serde_json::json!({})),
+                        reasoning: ReasoningPolicy::Drop,
                     },
-                    model_id: "claude-x-2026".into(),
-                    stop_reason: StopReason::EndTurn,
-                    capabilities: Capabilities(serde_json::json!({})),
-                    reasoning: ReasoningPolicy::Drop,
-                },
-            ))
+                ))
+            })
+        }
+        fn list_models<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn model(&self) -> &str {
+            "stub"
         }
     }
 
@@ -2257,28 +2283,41 @@ mod tests {
     /// call). The model client captures the assembled body to assert on it.
     #[tokio::test]
     async fn live_driver_declares_set_value_tool_on_a_surface_capable_call_model() {
-        /// A client that CAPTURES the assembled request body, then returns a stub
-        /// reply — so a test can assert the body declares the offered tools.
+        /// A client that CAPTURES the assembled neutral request, then returns a stub
+        /// reply — so a test can assert the request declares the offered tools.
         #[derive(Default)]
         struct BodyCapturingClient {
-            body: std::sync::Mutex<Option<Json>>,
+            request: std::sync::Mutex<Option<ModelRequest>>,
         }
-        impl ModelCaller for BodyCapturingClient {
-            async fn call(&self, request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
-                *self.body.lock().expect("lock body") = Some(request_body);
-                Ok((
-                    vec![Block::Text { text: "ok".into() }],
-                    ModelMeta {
-                        usage: Usage {
-                            input_tokens: 1,
-                            output_tokens: 1,
+        impl ModelApi for BodyCapturingClient {
+            fn turn<'a>(
+                &'a self,
+                req: &'a ModelRequest,
+            ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
+                *self.request.lock().expect("lock request") = Some(req.clone());
+                Box::pin(async {
+                    Ok(to_model_response(
+                        vec![Block::Text { text: "ok".into() }],
+                        ModelMeta {
+                            usage: Usage {
+                                input_tokens: 1,
+                                output_tokens: 1,
+                            },
+                            model_id: "claude-x-2026".into(),
+                            stop_reason: StopReason::EndTurn,
+                            capabilities: Capabilities(serde_json::json!({})),
+                            reasoning: ReasoningPolicy::Drop,
                         },
-                        model_id: "claude-x-2026".into(),
-                        stop_reason: StopReason::EndTurn,
-                        capabilities: Capabilities(serde_json::json!({})),
-                        reasoning: ReasoningPolicy::Drop,
-                    },
-                ))
+                    ))
+                })
+            }
+            fn list_models<'a>(
+                &'a self,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn model(&self) -> &str {
+                "stub"
             }
         }
 
@@ -2317,22 +2356,21 @@ mod tests {
         .await
         .expect("drive the surface-capable CallModel");
 
-        let body = client
-            .body
+        let request = client
+            .request
             .lock()
             .expect("lock")
             .clone()
-            .expect("a request body was assembled");
-        let tools = body["tools"].as_array().expect("the body declares a `tools` array");
-        assert_eq!(tools.len(), 1, "exactly the one declared surface tool");
-        assert_eq!(tools[0]["name"], "set_value", "the model is told `set_value` EXISTS");
+            .expect("a request was assembled");
+        assert_eq!(request.tools.len(), 1, "exactly the one declared surface tool");
+        assert_eq!(request.tools[0].name, "set_value", "the model is told `set_value` EXISTS");
         assert_eq!(
-            tools[0]["input_schema"]["type"], "object",
+            request.tools[0].input_schema["type"], "object",
             "the declaration carries the set_value input_schema"
         );
 
-        // A tool-less CallModel (empty ToolSet) omits the `tools` key entirely —
-        // byte-identical to a pre-tools call (replay/fingerprint stability).
+        // A tool-less CallModel (empty ToolSet) declares no tools — byte-identical
+        // to a pre-tools call (replay/fingerprint stability).
         let plain_call = Command::CallModel {
             cmd: 2,
             entity: 0,
@@ -2357,10 +2395,15 @@ mod tests {
         )
         .await
         .expect("drive the tool-less CallModel");
-        let plain_body = plain_client.body.lock().expect("lock").clone().expect("body");
+        let plain_request = plain_client
+            .request
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("request");
         assert!(
-            plain_body.get("tools").is_none(),
-            "an empty ToolSet omits the `tools` key (byte-identical to a pre-tools call)"
+            plain_request.tools.is_empty(),
+            "an empty ToolSet declares no tools (byte-identical to a pre-tools call)"
         );
     }
 
@@ -2830,30 +2873,46 @@ mod tests {
         assert!(over_inline_cap(9, 8), "over the cap externalizes");
     }
 
-    /// A model client returning a SCRIPTED set of blocks and capturing the request
-    /// body it was handed — so a test asserts both the externalize of the RESPONSE
-    /// and the resolve of the REQUEST against a real `BlobStore`.
+    /// A model client returning a SCRIPTED set of blocks and capturing the neutral
+    /// request it was handed — so a test asserts both the externalize of the RESPONSE
+    /// and the resolve of the REQUEST against a real `BlobStore`. Its canned reply is
+    /// expressed in world `Block`s and converted at the seam, so the test's intent is
+    /// unchanged.
     struct ScriptedBlocksClient {
         blocks: Vec<Block>,
-        body: std::sync::Mutex<Option<Json>>,
+        request: std::sync::Mutex<Option<ModelRequest>>,
     }
 
-    impl ModelCaller for ScriptedBlocksClient {
-        async fn call(&self, request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
-            *self.body.lock().expect("lock body") = Some(request_body);
-            Ok((
-                self.blocks.clone(),
-                ModelMeta {
-                    usage: Usage {
-                        input_tokens: 1,
-                        output_tokens: 1,
+    impl ModelApi for ScriptedBlocksClient {
+        fn turn<'a>(
+            &'a self,
+            req: &'a ModelRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
+            *self.request.lock().expect("lock request") = Some(req.clone());
+            let blocks = self.blocks.clone();
+            Box::pin(async move {
+                Ok(to_model_response(
+                    blocks,
+                    ModelMeta {
+                        usage: Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                        },
+                        model_id: "claude-x-2026".into(),
+                        stop_reason: StopReason::EndTurn,
+                        capabilities: Capabilities(serde_json::json!({})),
+                        reasoning: ReasoningPolicy::Drop,
                     },
-                    model_id: "claude-x-2026".into(),
-                    stop_reason: StopReason::EndTurn,
-                    capabilities: Capabilities(serde_json::json!({})),
-                    reasoning: ReasoningPolicy::Drop,
-                },
-            ))
+                ))
+            })
+        }
+        fn list_models<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn model(&self) -> &str {
+            "stub"
         }
     }
 
@@ -2905,7 +2964,7 @@ mod tests {
                     },
                 },
             ],
-            body: std::sync::Mutex::new(None),
+            request: std::sync::Mutex::new(None),
         };
         let mut log = MemoryEventLog::new();
 
@@ -2970,7 +3029,7 @@ mod tests {
                         bytes: bytes.clone(),
                     },
                 }],
-                body: std::sync::Mutex::new(None),
+                request: std::sync::Mutex::new(None),
             };
             let mut log = MemoryEventLog::new();
             let results = drive_live_with_blob_sink(
@@ -3032,7 +3091,7 @@ mod tests {
 
         let client = ScriptedBlocksClient {
             blocks: vec![Block::Text { text: "ok".into() }],
-            body: std::sync::Mutex::new(None),
+            request: std::sync::Mutex::new(None),
         };
         let mut log = MemoryEventLog::new();
         let results = drive_live_with_blob_sink(
@@ -3048,19 +3107,28 @@ mod tests {
         .await
         .expect("drive resolves the blob for the body");
 
-        // The body the model received carries the RESOLVED inline bytes, not the hash.
-        let body = client.body.lock().expect("lock").clone().expect("body");
-        let image = &body["messages"][0]["content"][0];
-        assert_eq!(image["type"], "image");
-        assert_eq!(
-            image["source"]["type"], "inline",
-            "the Blob{{hash}} was resolved to inline bytes for the model"
-        );
-        assert_eq!(
-            image["source"]["bytes"].as_array().expect("byte array").len(),
-            bytes.len(),
-            "the resolved body carries the original bytes"
-        );
+        // The neutral request the model received carries the RESOLVED inline bytes,
+        // not the hash: the world `Blob{hash}` was resolved to inline bytes and the
+        // seam mapped that to a neutral `Base64` image source carrying the bytes.
+        use base64::Engine;
+        let request = client.request.lock().expect("lock").clone().expect("request");
+        let image = &request.messages[0].content[0];
+        match image {
+            crate::provider::ContentBlock::Image {
+                source: crate::provider::ImageSource::Base64 { media_type, data },
+            } => {
+                assert_eq!(media_type, "image/png", "the resolved image carries its mime");
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(data.as_bytes())
+                    .expect("the resolved base64 decodes");
+                assert_eq!(
+                    decoded.len(),
+                    bytes.len(),
+                    "the Blob{{hash}} was resolved to the original inline bytes for the model"
+                );
+            }
+            other => panic!("expected a resolved inline (Base64) image, got {other:?}"),
+        }
 
         // The recorded result's fingerprint binds to the Blob-form request, so a
         // replay (fingerprinting over the recorded Blob-form History) matches.
@@ -3084,7 +3152,7 @@ mod tests {
             blocks: vec![Block::Text {
                 text: "plain reply".into(),
             }],
-            body: std::sync::Mutex::new(None),
+            request: std::sync::Mutex::new(None),
         };
         let mut log = MemoryEventLog::new();
         let results = drive_live_with_blob_sink(

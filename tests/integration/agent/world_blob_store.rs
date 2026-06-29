@@ -38,7 +38,11 @@ use serde_json::Value as Json;
 
 use rubberdux::agent::world::blob::{reachable_blobs, reclaimable_blobs, BlobStore};
 use rubberdux::agent::world::budget::Budget;
-use rubberdux::agent::world::effects::{fingerprint_call, Command, ModelCaller, SurfaceDriver};
+use rubberdux::agent::world::effects::{fingerprint_call, Command, SurfaceDriver};
+use rubberdux::provider::{ModelApi, ModelInfo, ModelRequest, ModelResponse};
+use std::future::Future;
+use std::pin::Pin;
+
 use rubberdux::agent::world::event_log::{EventLog, MemoryEventLog};
 use rubberdux::agent::world::gates::EntityGate;
 use rubberdux::agent::world::history::{BlobHash, Block, History, ImageSource};
@@ -220,9 +224,20 @@ fn stamp_fingerprints(events: &mut [Event], model: &ModelConfig) {
 /// externalized-blob result is REUSED with ZERO model calls (Inv 6).
 struct ExplodingClient;
 
-impl ModelCaller for ExplodingClient {
-    async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+impl ModelApi for ExplodingClient {
+    fn turn<'a>(
+        &'a self,
+        _req: &'a ModelRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
         panic!("the offline blob replay must never invoke the model client");
+    }
+    fn list_models<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn model(&self) -> &str {
+        "stub"
     }
 }
 

@@ -1,15 +1,15 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::provider::moonshot::tool::ToolDefinition;
+use crate::provider::kimi_for_coding::tool::ToolDefinition;
 use crate::tool::web_fetch::WebFetchTool;
 use crate::tool::{Tool, ToolOutcome};
 
-pub struct MoonshotWebFetchTool {
+pub struct KimiForCodingWebFetchTool {
     inner: WebFetchTool,
 }
 
-impl MoonshotWebFetchTool {
+impl KimiForCodingWebFetchTool {
     pub fn new() -> Self {
         Self {
             inner: WebFetchTool,
@@ -17,7 +17,7 @@ impl MoonshotWebFetchTool {
     }
 }
 
-impl Tool for MoonshotWebFetchTool {
+impl Tool for KimiForCodingWebFetchTool {
     fn name(&self) -> &str {
         "web_fetch"
     }

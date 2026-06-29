@@ -430,7 +430,9 @@ mod tests {
     use crate::app::registry::store::{AppStore, FilesystemAppStore};
     use crate::app::supervisor::{AppSupervisor, CreateAppRequest, MemorySupervisor};
     use crate::app::{BoardPosition, IconSpec};
-    use crate::provider::moonshot::MoonshotClient;
+    use crate::gateway::state::ProviderMeta;
+    use crate::provider::ModelApi;
+    use crate::provider::dialect::openai_chat_completions::OpenAiChatCompletions;
     use crate::session::SessionManager;
 
     fn dummy_input_port() -> InputPort {
@@ -438,13 +440,22 @@ mod tests {
         InputPort::new(tx)
     }
 
-    fn dummy_client() -> Arc<MoonshotClient> {
-        Arc::new(MoonshotClient::new(
+    fn dummy_client() -> Arc<dyn ModelApi> {
+        Arc::new(OpenAiChatCompletions::new(
             reqwest::Client::new(),
             "http://localhost:0".into(),
             "test-key".into(),
             "test-model".into(),
+            crate::provider::AuthScheme::Bearer,
         ))
+    }
+
+    fn dummy_provider_meta() -> ProviderMeta {
+        ProviderMeta {
+            provider: "kimi-for-coding".into(),
+            model: "test-model".into(),
+            dialect: "anthropic-messages".into(),
+        }
     }
 
     fn memory_supervisor() -> Arc<MemorySupervisor> {
@@ -472,6 +483,8 @@ mod tests {
             dummy_input_port(),
             supervisor.clone(),
             dummy_client(),
+            dummy_client(),
+            dummy_provider_meta(),
         ));
 
         let app = axum::Router::new()

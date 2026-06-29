@@ -7,11 +7,13 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use rubberdux::agent::runtime::subagent::{ContextEvent, spawn_subagent};
 use rubberdux::hardened_prompts::subagent_preamble;
-use rubberdux::provider::moonshot::{Message, MoonshotClient, UserContent};
+use rubberdux::provider::kimi_for_coding::{Message, KimiForCodingClient, UserContent};
 use rubberdux::tool::{SubagentType, ToolRegistry};
 
-fn make_subagent_client(mock_uri: &str) -> Arc<MoonshotClient> {
-    Arc::new(MoonshotClient::new(
+use crate::support::model_api_stub::openai_model_api;
+
+fn make_subagent_client(mock_uri: &str) -> Arc<KimiForCodingClient> {
+    Arc::new(KimiForCodingClient::new(
         reqwest::Client::new(),
         mock_uri.into(),
         "test-key".into(),
@@ -19,9 +21,9 @@ fn make_subagent_client(mock_uri: &str) -> Arc<MoonshotClient> {
     ))
 }
 
-fn readonly_registry(client: &Arc<MoonshotClient>) -> Arc<ToolRegistry> {
-    use rubberdux::provider::moonshot::tool::web_fetch::MoonshotWebFetchTool;
-    use rubberdux::provider::moonshot::tool::web_search::WebSearchTool;
+fn readonly_registry(client: &Arc<KimiForCodingClient>) -> Arc<ToolRegistry> {
+    use rubberdux::provider::kimi_for_coding::tool::web_fetch::KimiForCodingWebFetchTool;
+    use rubberdux::provider::kimi_for_coding::tool::web_search::WebSearchTool;
     use rubberdux::tool::glob::GlobTool;
     use rubberdux::tool::grep::GrepTool;
     use rubberdux::tool::read::ReadFileTool;
@@ -31,7 +33,7 @@ fn readonly_registry(client: &Arc<MoonshotClient>) -> Arc<ToolRegistry> {
         r.register(Box::new(GlobTool));
         r.register(Box::new(GrepTool));
         r.register(Box::new(ReadFileTool));
-        r.register(Box::new(MoonshotWebFetchTool::new()));
+        r.register(Box::new(KimiForCodingWebFetchTool::new()));
         r.register(Box::new(WebSearchTool::new(client.clone())));
         r
     })
@@ -49,7 +51,7 @@ async fn test_context_broadcast_reaches_running_subagent() {
 
     // Turn 1: delayed response so the broadcast has time to arrive
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_delay(Duration::from_millis(500))
@@ -84,7 +86,7 @@ async fn test_context_broadcast_reaches_running_subagent() {
 
     // Turn 2: after tool result and broadcast, subagent stops
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "cmpl-sub-2",
             "object": "chat.completion",
@@ -105,13 +107,16 @@ async fn test_context_broadcast_reaches_running_subagent() {
 
     let client = make_subagent_client(&mock_server.uri());
     let registry = readonly_registry(&client);
+    // The subagent drives the model through the selected-provider seam; the
+    // concrete Kimi client above backs its tool registry (web_search/web_fetch).
+    let model = openai_model_api(mock_server.uri(), "test-model");
     let preamble = subagent_preamble(SubagentType::Explore);
     let system_prompt = format!("{}", preamble);
 
     let (context_tx, _) = tokio::sync::broadcast::channel(8);
     let handle = spawn_subagent(
         "ctx_test".into(),
-        client,
+        model,
         system_prompt,
         "Initial prompt".into(),
         registry,
@@ -165,7 +170,7 @@ async fn test_concurrent_subagents_all_complete() {
     let mock_b = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "cmpl-a",
             "object": "chat.completion",
@@ -182,7 +187,7 @@ async fn test_concurrent_subagents_all_complete() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "cmpl-b",
             "object": "chat.completion",
@@ -202,6 +207,10 @@ async fn test_concurrent_subagents_all_complete() {
     let client_b = make_subagent_client(&mock_b.uri());
     let registry_a = readonly_registry(&client_a);
     let registry_b = readonly_registry(&client_b);
+    // Each subagent drives its model through the selected-provider seam; the
+    // concrete Kimi clients above back the per-subagent tool registries.
+    let model_a = openai_model_api(mock_a.uri(), "test-model");
+    let model_b = openai_model_api(mock_b.uri(), "test-model");
 
     let preamble = subagent_preamble(SubagentType::Explore);
     let system_prompt = format!("{}", preamble);
@@ -211,7 +220,7 @@ async fn test_concurrent_subagents_all_complete() {
 
     let handle_a = spawn_subagent(
         "agent_a".into(),
-        client_a,
+        model_a,
         system_prompt.clone(),
         "Task A".into(),
         registry_a,
@@ -222,7 +231,7 @@ async fn test_concurrent_subagents_all_complete() {
 
     let handle_b = spawn_subagent(
         "agent_b".into(),
-        client_b,
+        model_b,
         system_prompt,
         "Task B".into(),
         registry_b,

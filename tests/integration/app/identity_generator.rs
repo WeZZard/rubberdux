@@ -13,7 +13,7 @@
 //! See `docs/app/identity.md`.
 
 use rubberdux::app::identity::{COLOR_PALETTE, SYMBOL_ALLOWLIST, derive_identity};
-use rubberdux::provider::moonshot::MoonshotClient;
+use rubberdux::provider::selected_from_env;
 
 use crate::support::live_gate::skip_without_live_llm;
 
@@ -23,7 +23,7 @@ async fn live_identity_is_allowlisted_symbol_and_color() {
         return;
     }
 
-    let client = MoonshotClient::from_env();
+    let client = selected_from_env().expect("build provider from env");
 
     // A few distinct tasks across domains: each must yield an in-allowlist
     // symbol and an in-palette color, whether the LLM picked them or the
@@ -35,7 +35,7 @@ async fn live_identity_is_allowlisted_symbol_and_color() {
     ];
 
     for task in tasks {
-        let identity = derive_identity(&client, task).await;
+        let identity = derive_identity(&*client, task).await;
 
         assert!(
             SYMBOL_ALLOWLIST.contains(&identity.icon.symbol.as_str()),
