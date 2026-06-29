@@ -45,7 +45,11 @@ use serde_json::Value as Json;
 use rubberdux::agent::world::budget::Budget;
 use rubberdux::agent::world::driver::WorldDriver;
 use rubberdux::agent::world::edge::HUMAN_EDGE;
-use rubberdux::agent::world::effects::{Command, ModelCaller, SurfaceDriver};
+use rubberdux::agent::world::effects::{Command, SurfaceDriver};
+use rubberdux::provider::{ContentBlock, ModelApi, ModelInfo, ModelRequest, ModelResponse};
+use std::future::Future;
+use std::pin::Pin;
+
 use rubberdux::agent::world::event_log::{EventLog, MemoryEventLog};
 use rubberdux::agent::world::gates::EntityGate;
 use rubberdux::agent::world::history::{Block, History, Msg, Role};
@@ -204,24 +208,34 @@ struct CountingStub {
     calls: Arc<AtomicUsize>,
 }
 
-impl ModelCaller for CountingStub {
-    async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+impl ModelApi for CountingStub {
+    fn turn<'a>(
+        &'a self,
+        _req: &'a ModelRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok((
-            vec![Block::Text {
-                text: self.text.clone(),
-            }],
-            ModelMeta {
+        let text = self.text.clone();
+        Box::pin(async move {
+            Ok(ModelResponse {
+                blocks: vec![ContentBlock::Text { text }],
+                stop_reason: StopReason::EndTurn,
                 usage: Usage {
                     input_tokens: 1,
                     output_tokens: 1,
                 },
                 model_id: "claude-compaction-resume-sink".into(),
-                stop_reason: StopReason::EndTurn,
-                capabilities: Capabilities(serde_json::json!({})),
                 reasoning: ReasoningPolicy::Drop,
-            },
-        ))
+                capabilities: serde_json::json!({}),
+            })
+        })
+    }
+    fn list_models<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn model(&self) -> &str {
+        "claude-compaction-resume-sink"
     }
 }
 
@@ -230,9 +244,20 @@ impl ModelCaller for CountingStub {
 /// structurally unreachable — proving `open` makes ZERO model calls on it.
 struct ExplodingModelCaller;
 
-impl ModelCaller for ExplodingModelCaller {
-    async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+impl ModelApi for ExplodingModelCaller {
+    fn turn<'a>(
+        &'a self,
+        _req: &'a ModelRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
         panic!("a clean resume reconstructs from the log alone; it must never call the model");
+    }
+    fn list_models<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn model(&self) -> &str {
+        "stub"
     }
 }
 

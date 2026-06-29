@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::provider::moonshot::tool::ToolDefinition;
+use crate::provider::kimi_for_coding::tool::ToolDefinition;
 use crate::workspace::entity::ProjectManifest;
 use crate::workspace::{format_yaml_front_matter, parse_yaml_front_matter, Workspace};
 

@@ -131,14 +131,14 @@ impl Message {
     }
 }
 
-pub struct MoonshotClient {
+pub struct KimiForCodingClient {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
     model: String,
 }
 
-impl MoonshotClient {
+impl KimiForCodingClient {
     pub fn new(http: reqwest::Client, base_url: String, api_key: String, model: String) -> Self {
         Self {
             http,
@@ -469,9 +469,9 @@ mod tests {
     }
 
     /// Shared harness: builds history with a given tool result message,
-    /// calls real Moonshot API, and returns whether the model tried to poll.
+    /// calls real Kimi for Coding API, and returns whether the model tried to poll.
     async fn run_background_tool_result_trial(label: &str, tool_result_content: &str) -> bool {
-        let client = MoonshotClient::from_env();
+        let client = KimiForCodingClient::from_env();
         let mut registry = crate::tool::ToolRegistry::new();
         registry.register(Box::new(crate::tool::bash::BashTool));
         registry.register(Box::new(crate::tool::web_fetch::WebFetchTool));
@@ -564,7 +564,7 @@ mod tests {
         polled
     }
 
-    /// Tests multiple tool result message variants against the real Moonshot API
+    /// Tests multiple tool result message variants against the real Kimi for Coding API
     /// to find which ones prevent the model from polling background task output.
     ///
     /// Run with: cargo test test_debug_background_tool_model_call -- --nocapture --ignored
@@ -590,7 +590,7 @@ mod tests {
         eprintln!("\n{}\n", "=".repeat(80));
         eprintln!("BACKGROUND TOOL RESULT — MODEL BEHAVIOR TRIALS");
         eprintln!(
-            "Testing {} variants against real Moonshot API",
+            "Testing {} variants against real Kimi for Coding API",
             trials.len()
         );
         eprintln!("\n{}", "=".repeat(80));
@@ -626,7 +626,7 @@ mod tests {
     #[ignore] // requires real API credentials
     async fn test_tool_call_recursion_shape() {
         dotenvy::dotenv().ok();
-        let client = MoonshotClient::from_env();
+        let client = KimiForCodingClient::from_env();
         let mut registry = crate::tool::ToolRegistry::new();
         registry.register(Box::new(crate::tool::bash::BashTool));
         registry.register(Box::new(crate::tool::web_fetch::WebFetchTool));
@@ -726,7 +726,7 @@ mod tests {
         eprintln!("\n{}", "=".repeat(80));
     }
 
-    /// Experiment: verify the Moonshot API accepts multiple Tool messages
+    /// Experiment: verify the Kimi for Coding API accepts multiple Tool messages
     /// as responses to multiple tool calls in one assistant turn, and the
     /// model processes all results together in the next turn.
     ///
@@ -735,7 +735,7 @@ mod tests {
     #[ignore]
     async fn test_batch_tool_results() {
         dotenvy::dotenv().ok();
-        let client = MoonshotClient::from_env();
+        let client = KimiForCodingClient::from_env();
         let mut registry = crate::tool::ToolRegistry::new();
         registry.register(Box::new(crate::tool::bash::BashTool));
         registry.register(Box::new(crate::tool::web_fetch::WebFetchTool));

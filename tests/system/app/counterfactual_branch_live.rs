@@ -13,8 +13,8 @@
 //!
 //! It needs no macOS surface, no VM, and no subprocess worker: it drives the
 //! same promoted replay spine (`replay::replay_branch`) and branch-materialization
-//! layer (`branch::fork`) the production runtime uses, in-process, against a real
-//! `MessagesClient`. Because record and replay share ONE genesis `ModelConfig`,
+//! layer (`branch::fork`) the production runtime uses, in-process, against the real
+//! selected provider. Because record and replay share ONE genesis `ModelConfig`,
 //! the recorded `ModelResponded` fingerprints and the re-emitted `CallModel`
 //! hashes are self-consistent — so a faithful prefix reuses with ZERO calls and
 //! only the edited turn diverges.
@@ -47,17 +47,21 @@ use serde_json::Value as Json;
 
 use rubberdux::agent::world::branch::{fork, Edit, EditKind};
 use rubberdux::agent::world::budget::Budget;
-use rubberdux::agent::world::effects::{Command, ModelCaller, SurfaceDriver};
+use rubberdux::agent::world::effects::{Command, SurfaceDriver};
 use rubberdux::agent::world::event_log::{EventLog, MemoryEventLog};
 use rubberdux::agent::world::gates::EntityGate;
-use rubberdux::agent::world::history::{Block, History};
-use rubberdux::agent::world::inputs::{Event, LogicalInput, ModelMeta, Origin};
-use rubberdux::agent::world::model_client::MessagesClient;
+use rubberdux::agent::world::history::History;
+use rubberdux::agent::world::inputs::{Event, LogicalInput, Origin};
 use rubberdux::agent::world::replay::{self, is_model_call_result, replay_branch, replay_world};
 use rubberdux::agent::world::world::{
     Activity, Components, Effort, Identity, Inbox, Lineage, ModelConfig, Resources, World,
 };
 use rubberdux::error::Error;
+use rubberdux::provider::{
+    ModelApi, ModelInfo, ModelRequest, ModelResponse, selected_from_env,
+};
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::live_gate::skip_without_live_llm;
 
@@ -159,18 +163,18 @@ fn user_message(at: u64, text: &str) -> Event {
 // CountingCaller — wrap the real client to count the branch-phase model calls
 // ---------------------------------------------------------------------------
 
-/// A `ModelCaller` decorator that COUNTS each call and forwards to a real
-/// `MessagesClient`. Threading it through the branch replay makes "flip
+/// A `ModelCaller` decorator that COUNTS each call and forwards to the real
+/// selected provider. Threading it through the branch replay makes "flip
 /// Replay→Live exactly once" a runtime assertion (`calls() == 1`): turn 1 reuses
 /// its recorded result with zero calls, and only the edited turn-2 divergence
 /// reaches the model.
 struct CountingCaller<'a> {
-    inner: &'a MessagesClient,
+    inner: &'a dyn ModelApi,
     calls: AtomicUsize,
 }
 
 impl<'a> CountingCaller<'a> {
-    fn new(inner: &'a MessagesClient) -> Self {
+    fn new(inner: &'a dyn ModelApi) -> Self {
         Self {
             inner,
             calls: AtomicUsize::new(0),
@@ -181,10 +185,21 @@ impl<'a> CountingCaller<'a> {
     }
 }
 
-impl ModelCaller for CountingCaller<'_> {
-    async fn call(&self, request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+impl ModelApi for CountingCaller<'_> {
+    fn turn<'a>(
+        &'a self,
+        req: &'a ModelRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.call(request_body).await
+        self.inner.turn(req)
+    }
+    fn list_models<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+        self.inner.list_models()
+    }
+    fn model(&self) -> &str {
+        self.inner.model()
     }
 }
 
@@ -210,7 +225,7 @@ impl SurfaceDriver for NoSurfaceDrive {
 /// which has no recorded result yet — diverges off the end of the cursor, flips
 /// the run to live, makes ONE real model call, and appends the result. The
 /// appended events are concatenated so the next turn folds the full history.
-async fn record_live_turn<C: ModelCaller>(
+async fn record_live_turn<C: ModelApi>(
     prior: &[Event],
     user_text: &str,
     model: &ModelConfig,
@@ -263,8 +278,8 @@ pub async fn run() {
         return;
     }
 
-    let client = MessagesClient::from_env()
-        .expect("build a MessagesClient from RUBBERDUX_LLM_* for the live branch call");
+    let client = selected_from_env()
+        .expect("build the selected provider from RUBBERDUX_LLM_* for the live branch call");
     let model = shared_model_config(client.model());
     eprintln!(
         "[VC-1.2] live branch fingerprint ModelConfig: model={:?} max_tokens={} effort={:?}",

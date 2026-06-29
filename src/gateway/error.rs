@@ -20,6 +20,11 @@ pub enum GatewayError {
 
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    /// The selected provider's API returned an error. Mapped to 502 so callers
+    /// can distinguish a provider-side fault from a gateway-side fault.
+    #[error("provider error: {0}")]
+    ProviderError(String),
 }
 
 impl IntoResponse for GatewayError {
@@ -28,6 +33,7 @@ impl IntoResponse for GatewayError {
             GatewayError::EntryNotFound(_)
             | GatewayError::AppNotFound(_)
             | GatewayError::InteractionNotFound(_) => StatusCode::NOT_FOUND,
+            GatewayError::ProviderError(_) => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, self.to_string()).into_response()

@@ -6,11 +6,12 @@ use axum::routing::get;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::entry::Entry;
-use crate::provider::moonshot::Message;
-use crate::provider::moonshot::tool::ToolCall;
+use crate::provider::ModelInfo;
+use crate::provider::kimi_for_coding::Message;
+use crate::provider::kimi_for_coding::tool::ToolCall;
 
 use super::error::GatewayError;
-use super::state::GatewayState;
+use super::state::{GatewayState, ProviderMeta};
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -63,6 +64,14 @@ struct ToolCallsResponse {
     tool_calls: Vec<ToolCallPair>,
 }
 
+/// Response for `GET /api/v1/models`: wraps the live model list from the
+/// selected provider in an OpenAI-compatible envelope.
+#[derive(Serialize)]
+struct ModelsListResponse {
+    object: &'static str,
+    data: Vec<ModelInfo>,
+}
+
 // ---------------------------------------------------------------------------
 // Query params
 // ---------------------------------------------------------------------------
@@ -81,6 +90,8 @@ pub fn router() -> axum::Router<Arc<GatewayState>> {
     axum::Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/legal", get(legal))
+        .route("/api/v1/provider", get(get_provider))
+        .route("/api/v1/models", get(list_models))
         .route("/api/v1/entries", get(list_entries))
         .route("/api/v1/entries/{id}", get(get_entry))
         .route("/api/v1/tool-calls", get(list_tool_calls))
@@ -114,6 +125,26 @@ async fn legal() -> Json<LegalResponse> {
         license_url: "https://www.gnu.org/licenses/agpl-3.0.html",
         source_url: env!("CARGO_PKG_REPOSITORY"),
     })
+}
+
+/// `GET /api/v1/provider` — returns the provider identity captured at startup:
+/// provider id (kebab-case), effective model, and dialect string. No per-request
+/// env resolution; the snapshot in `GatewayState` is used directly.
+async fn get_provider(State(state): State<Arc<GatewayState>>) -> Json<ProviderMeta> {
+    Json(state.provider_meta.clone())
+}
+
+/// `GET /api/v1/models` — proxies the selected provider's live model list.
+/// On provider error returns 502 Bad Gateway rather than panicking.
+async fn list_models(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<ModelsListResponse>, GatewayError> {
+    let data = state
+        .selected_provider
+        .list_models()
+        .await
+        .map_err(|e| GatewayError::ProviderError(e.to_string()))?;
+    Ok(Json(ModelsListResponse { object: "list", data }))
 }
 
 async fn list_entries(
@@ -255,22 +286,109 @@ fn message_role(msg: &Message) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+
     use super::*;
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::agent::entry::EntryOrigin;
     use crate::agent::runtime::port::{InputPort, LoopEvent};
-    use crate::provider::moonshot::UserContent;
-    use crate::provider::moonshot::tool::FunctionCall;
+    use crate::provider::dialect::openai_chat_completions::OpenAiChatCompletions;
+    use crate::provider::kimi_for_coding::UserContent;
+    use crate::provider::kimi_for_coding::tool::FunctionCall;
+    use crate::provider::{AuthScheme, ModelApi, ModelInfo, ModelRequest, ModelResponse};
+    use crate::gateway::state::ProviderMeta;
 
     fn dummy_input_port() -> InputPort {
         let (tx, _rx) = tokio::sync::mpsc::channel::<LoopEvent>(8);
         InputPort::new(tx)
     }
+
+    // -----------------------------------------------------------------------
+    // Stub ModelApi for tests that don't exercise the provider endpoints
+    // -----------------------------------------------------------------------
+
+    /// Returns a fixed list of models. Used by V6.1 wiremock test helper and as
+    /// a simple in-memory stub when no live HTTP is needed.
+    struct MemoryModelApi {
+        models: Vec<ModelInfo>,
+        model_name: &'static str,
+    }
+
+    impl MemoryModelApi {
+        fn empty() -> Self {
+            Self { models: vec![], model_name: "stub-model" }
+        }
+    }
+
+    impl ModelApi for MemoryModelApi {
+        fn turn<'a>(
+            &'a self,
+            _req: &'a ModelRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, crate::error::Error>> + Send + 'a>>
+        {
+            Box::pin(async { unreachable!("MemoryModelApi::turn not used in route tests") })
+        }
+
+        fn list_models<'a>(
+            &'a self,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<Vec<ModelInfo>, crate::error::Error>> + Send + 'a>,
+        > {
+            let models = self.models.clone();
+            Box::pin(async move { Ok(models) })
+        }
+
+        fn model(&self) -> &str {
+            self.model_name
+        }
+    }
+
+    /// A stub that always fails `list_models`, used by V6.3.
+    struct FailingModelApi;
+
+    impl ModelApi for FailingModelApi {
+        fn turn<'a>(
+            &'a self,
+            _req: &'a ModelRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, crate::error::Error>> + Send + 'a>>
+        {
+            Box::pin(async { unreachable!("FailingModelApi::turn not used in route tests") })
+        }
+
+        fn list_models<'a>(
+            &'a self,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<Vec<ModelInfo>, crate::error::Error>> + Send + 'a>,
+        > {
+            Box::pin(async {
+                Err(crate::error::Error::Provider("injected provider failure".into()))
+            })
+        }
+
+        fn model(&self) -> &str {
+            "fail-model"
+        }
+    }
+
+    fn stub_provider_meta() -> ProviderMeta {
+        ProviderMeta {
+            provider: "kimi-for-coding".into(),
+            model: "stub-model".into(),
+            dialect: "anthropic-messages".into(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared test-state helpers
+    // -----------------------------------------------------------------------
 
     async fn test_state() -> Arc<GatewayState> {
         let state = GatewayState::new(
@@ -278,6 +396,8 @@ mod tests {
             "You are an AI assistant.".into(),
             "Be kind and thoughtful.".into(),
             dummy_input_port(),
+            Arc::new(MemoryModelApi::empty()),
+            stub_provider_meta(),
         );
 
         let entries = vec![
@@ -363,6 +483,8 @@ mod tests {
             "id".into(),
             "soul".into(),
             dummy_input_port(),
+            Arc::new(MemoryModelApi::empty()),
+            stub_provider_meta(),
         ));
         router().with_state(state)
     }
@@ -511,6 +633,130 @@ mod tests {
         assert!(events.is_empty());
     }
 
+    // -----------------------------------------------------------------------
+    // V6.1 — GET /api/v1/models proxies the selected provider's model list
+    // -----------------------------------------------------------------------
+
+    /// Build a `GatewayState` whose `selected_provider` is an
+    /// `OpenAiChatCompletions` adapter pointed at `base_url`. The adapter's
+    /// `list_models()` hits `{base_url}/v1/models`, which is what the wiremock
+    /// server will serve.
+    fn models_app_with_base_url(base_url: String, provider_meta: ProviderMeta) -> axum::Router {
+        let adapter = Arc::new(OpenAiChatCompletions::new(
+            reqwest::Client::new(),
+            base_url,
+            "test-key".into(),
+            "test-model".into(),
+            AuthScheme::Bearer,
+        ));
+        let state = Arc::new(GatewayState::new(
+            "sys".into(),
+            "id".into(),
+            "soul".into(),
+            dummy_input_port(),
+            adapter,
+            provider_meta,
+        ));
+        router().with_state(state)
+    }
+
+    /// [V6.1] GET /api/v1/models returns the provider's model list, serialised
+    /// into the `{ "object": "list", "data": [...] }` envelope.
+    #[tokio::test]
+    async fn test_get_models_returns_provider_list() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    { "id": "alpha-model", "owned_by": "acme", "context_length": 8192 },
+                    { "id": "beta-model", "owned_by": null, "context_length": null }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let meta = ProviderMeta {
+            provider: "opencode-go".into(),
+            model: "test-model".into(),
+            dialect: "openai-chat-completions".into(),
+        };
+        let app = models_app_with_base_url(mock_server.uri(), meta);
+
+        let (status, json) = response_json(app, "/api/v1/models").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["object"], "list");
+        let data = json["data"].as_array().unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0]["id"], "alpha-model");
+        assert_eq!(data[0]["owned_by"], "acme");
+        assert_eq!(data[0]["context_length"], 8192);
+        assert_eq!(data[1]["id"], "beta-model");
+        assert!(data[1]["owned_by"].is_null());
+        assert!(data[1]["context_length"].is_null());
+    }
+
+    // -----------------------------------------------------------------------
+    // V6.2 — GET /api/v1/provider returns provider id, model, and dialect
+    // -----------------------------------------------------------------------
+
+    /// [V6.2] GET /api/v1/provider returns the captured provider identity.
+    #[tokio::test]
+    async fn test_get_provider_returns_identity() {
+        let meta = ProviderMeta {
+            provider: "kimi-for-coding".into(),
+            model: "kimi-k2".into(),
+            dialect: "anthropic-messages".into(),
+        };
+        let state = Arc::new(GatewayState::new(
+            "sys".into(),
+            "id".into(),
+            "soul".into(),
+            dummy_input_port(),
+            Arc::new(MemoryModelApi::empty()),
+            meta,
+        ));
+        let app = router().with_state(state);
+
+        let (status, json) = response_json(app, "/api/v1/provider").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["provider"], "kimi-for-coding");
+        assert_eq!(json["model"], "kimi-k2");
+        assert_eq!(json["dialect"], "anthropic-messages");
+    }
+
+    // -----------------------------------------------------------------------
+    // V6.3 — A failing provider list endpoint yields 502, not a panic
+    // -----------------------------------------------------------------------
+
+    /// [V6.3] When `selected_provider.list_models()` fails, the route returns
+    /// HTTP 502 Bad Gateway and does not panic.
+    #[tokio::test]
+    async fn test_get_models_provider_error_yields_502() {
+        let state = Arc::new(GatewayState::new(
+            "sys".into(),
+            "id".into(),
+            "soul".into(),
+            dummy_input_port(),
+            Arc::new(FailingModelApi),
+            stub_provider_meta(),
+        ));
+        let app = router().with_state(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    // -----------------------------------------------------------------------
+    // Trajectory file test (existing)
+    // -----------------------------------------------------------------------
+
     #[tokio::test]
     async fn test_list_trajectory_reads_file() {
         use crate::trajectory::event::{TrajectoryEvent, TrajectoryEventDraft};
@@ -536,6 +782,8 @@ mod tests {
                 "id".into(),
                 "soul".into(),
                 dummy_input_port(),
+                Arc::new(MemoryModelApi::empty()),
+                stub_provider_meta(),
             );
             s.events_path = Some(events_file.clone());
             s

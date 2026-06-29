@@ -12,7 +12,8 @@ use crate::agent::runtime::port::{
 };
 use crate::agent::runtime::task_coordinator::{CompleteResult, TaskGroupSet};
 use crate::agent::runtime::turn_driver::{TurnDriver, TurnOutcome};
-use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
+use crate::provider::ModelApi;
+use crate::provider::kimi_for_coding::{Message, UserContent};
 use crate::tool::BackgroundTaskResult;
 use crate::trajectory::{
     SharedTrajectoryRecorder, TrajectoryEventDraft, filesystem_recorder, noop_recorder,
@@ -47,7 +48,7 @@ enum TaskResultOutcome {
 // ---------------------------------------------------------------------------
 
 pub struct AgentLoopConfig {
-    pub client: Arc<MoonshotClient>,
+    pub client: Arc<dyn ModelApi>,
     pub registry: Arc<crate::tool::ToolRegistry>,
     pub system_prompt: String,
     pub session_path: Option<PathBuf>,

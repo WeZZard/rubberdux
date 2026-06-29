@@ -6,7 +6,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use rubberdux::agent::runtime::subagent::spawn_subagent;
 use rubberdux::hardened_prompts::subagent_preamble;
-use rubberdux::provider::moonshot::MoonshotClient;
+use rubberdux::provider::kimi_for_coding::KimiForCodingClient;
 use rubberdux::tool::agent::{AgentTool, build_subagent_registries};
 use rubberdux::tool::{SubagentType, ToolRegistry};
 
@@ -14,8 +14,8 @@ use rubberdux::tool::{SubagentType, ToolRegistry};
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn setup() -> (Arc<MoonshotClient>, ToolRegistry) {
-    let client = Arc::new(MoonshotClient::new(
+fn setup() -> (Arc<KimiForCodingClient>, ToolRegistry) {
+    let client = Arc::new(KimiForCodingClient::new(
         reqwest::Client::new(),
         "http://localhost:0".into(),
         "test-key".into(),
@@ -26,7 +26,7 @@ fn setup() -> (Arc<MoonshotClient>, ToolRegistry) {
     let (context_tx, _) = broadcast::channel(4);
 
     let agent_tool = AgentTool::new(
-        client.clone(),
+        crate::support::model_api_stub::dummy_model_api(),
         registries,
         "integration test system prompt".into(),
         context_tx,
@@ -106,11 +106,12 @@ fn test_agent_tool_definition_has_subagent_type() {
         .as_array()
         .unwrap();
     let enum_strs: Vec<&str> = enum_values.iter().map(|v| v.as_str().unwrap()).collect();
-    assert_eq!(enum_strs.len(), 4);
+    assert_eq!(enum_strs.len(), 5);
     assert!(enum_strs.contains(&"explore"));
     assert!(enum_strs.contains(&"plan"));
     assert!(enum_strs.contains(&"general_purpose"));
     assert!(enum_strs.contains(&"computer_use"));
+    assert!(enum_strs.contains(&"external"));
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +124,7 @@ async fn test_explore_subagent_happy_path() {
 
     // Turn 1: LLM asks to glob for .rs files
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(tool_call_response(
             "glob",
             r#"{"pattern":"*.rs","path":"src/tool"}"#,
@@ -134,14 +135,14 @@ async fn test_explore_subagent_happy_path() {
 
     // Turn 2: LLM produces final answer
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(stop_response("Found tool source files")),
         )
         .mount(&mock_server)
         .await;
 
-    let client = Arc::new(MoonshotClient::new(
+    let client = Arc::new(KimiForCodingClient::new(
         reqwest::Client::new(),
         mock_server.uri(),
         "test-key".into(),
@@ -155,9 +156,10 @@ async fn test_explore_subagent_happy_path() {
     let system_prompt = format!("{}\n\nBase system prompt.", preamble);
 
     let (context_tx, _) = broadcast::channel(4);
+    let model = crate::support::model_api_stub::openai_model_api(mock_server.uri(), "test-model");
     let handle = spawn_subagent(
         "explore_happy".into(),
-        client,
+        model,
         system_prompt,
         "Find all tool source files".into(),
         registry,
@@ -224,7 +226,7 @@ async fn test_plan_subagent_happy_path() {
 
     // Turn 1: LLM asks to read Cargo.toml
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(tool_call_response(
             "read_file",
             r#"{"file_path":"Cargo.toml"}"#,
@@ -235,14 +237,14 @@ async fn test_plan_subagent_happy_path() {
 
     // Turn 2: stop
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(stop_response("Analyzed project structure")),
         )
         .mount(&mock_server)
         .await;
 
-    let client = Arc::new(MoonshotClient::new(
+    let client = Arc::new(KimiForCodingClient::new(
         reqwest::Client::new(),
         mock_server.uri(),
         "test-key".into(),
@@ -256,9 +258,10 @@ async fn test_plan_subagent_happy_path() {
     let system_prompt = format!("{}\n\nBase system prompt.", preamble);
 
     let (context_tx, _) = broadcast::channel(4);
+    let model = crate::support::model_api_stub::openai_model_api(mock_server.uri(), "test-model");
     let handle = spawn_subagent(
         "plan_happy".into(),
-        client,
+        model,
         system_prompt,
         "Analyze project dependencies".into(),
         registry,
@@ -332,7 +335,7 @@ async fn test_gp_subagent_happy_path() {
 
     // Turn 1: LLM asks to run a bash command (GP-only tool)
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(tool_call_response("bash", r#"{"command":"echo hello"}"#)),
@@ -343,12 +346,12 @@ async fn test_gp_subagent_happy_path() {
 
     // Turn 2: stop
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(stop_response("Command executed")))
         .mount(&mock_server)
         .await;
 
-    let client = Arc::new(MoonshotClient::new(
+    let client = Arc::new(KimiForCodingClient::new(
         reqwest::Client::new(),
         mock_server.uri(),
         "test-key".into(),
@@ -365,9 +368,10 @@ async fn test_gp_subagent_happy_path() {
     let system_prompt = format!("{}\n\nBase system prompt.", preamble);
 
     let (context_tx, _) = broadcast::channel(4);
+    let model = crate::support::model_api_stub::openai_model_api(mock_server.uri(), "test-model");
     let handle = spawn_subagent(
         "gp_happy".into(),
-        client,
+        model,
         system_prompt,
         "Run echo hello".into(),
         registry,
@@ -437,7 +441,7 @@ async fn test_computer_use_subagent_happy_path() {
 
     // Turn 1: LLM asks to run a bash command (ComputerUse has bash)
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(tool_call_response("bash", r#"{"command":"echo hello"}"#)),
@@ -448,12 +452,12 @@ async fn test_computer_use_subagent_happy_path() {
 
     // Turn 2: stop
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(stop_response("Command executed")))
         .mount(&mock_server)
         .await;
 
-    let client = Arc::new(MoonshotClient::new(
+    let client = Arc::new(KimiForCodingClient::new(
         reqwest::Client::new(),
         mock_server.uri(),
         "test-key".into(),
@@ -467,9 +471,10 @@ async fn test_computer_use_subagent_happy_path() {
     let system_prompt = format!("{}\n\nBase system prompt.", preamble);
 
     let (context_tx, _) = broadcast::channel(4);
+    let model = crate::support::model_api_stub::openai_model_api(mock_server.uri(), "test-model");
     let handle = spawn_subagent(
         "cu_happy".into(),
-        client,
+        model,
         system_prompt,
         "Run echo hello".into(),
         registry,

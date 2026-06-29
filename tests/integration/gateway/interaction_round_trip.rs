@@ -28,22 +28,28 @@ use rubberdux::agent::runtime::port::{InputPort, LoopEvent};
 use rubberdux::app::registry::store::{AppStore, FilesystemAppStore};
 use rubberdux::app::supervisor::MemorySupervisor;
 use rubberdux::gateway::apps::router;
-use rubberdux::gateway::state::GatewayState;
-use rubberdux::provider::moonshot::MoonshotClient;
+use rubberdux::gateway::state::{GatewayState, ProviderMeta};
+use rubberdux::provider::ModelApi;
 use rubberdux::session::SessionManager;
+
+use crate::support::model_api_stub::openai_model_api;
 
 fn dummy_input_port() -> InputPort {
     let (tx, _rx) = tokio::sync::mpsc::channel::<LoopEvent>(8);
     InputPort::new(tx)
 }
 
-fn dummy_client() -> Arc<MoonshotClient> {
-    Arc::new(MoonshotClient::new(
-        reqwest::Client::new(),
-        "http://127.0.0.1:0".into(),
-        "test-key".into(),
-        "test-model".into(),
-    ))
+fn dummy_client() -> Arc<dyn ModelApi> {
+    openai_model_api("http://127.0.0.1:0", "test-model")
+}
+
+/// Provider identity snapshot; the routes under test never read it.
+fn dummy_provider_meta() -> ProviderMeta {
+    ProviderMeta {
+        provider: "kimi-for-coding".into(),
+        model: "test-model".into(),
+        dialect: "anthropic-messages".into(),
+    }
 }
 
 async fn send(
@@ -89,6 +95,8 @@ fn memory_board_router() -> axum::Router {
         dummy_input_port(),
         supervisor,
         dummy_client(),
+        dummy_client(),
+        dummy_provider_meta(),
     ));
     router().with_state(state)
 }

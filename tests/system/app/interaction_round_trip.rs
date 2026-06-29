@@ -28,8 +28,8 @@ use rubberdux::agent::runtime::port::{InputPort, LoopEvent};
 use rubberdux::app::registry::store::{AppStore, FilesystemAppStore};
 use rubberdux::app::runtime::local_supervisor::LocalSupervisor;
 use rubberdux::gateway::apps::router;
-use rubberdux::gateway::state::GatewayState;
-use rubberdux::provider::moonshot::MoonshotClient;
+use rubberdux::gateway::state::{GatewayState, ProviderMeta};
+use rubberdux::provider::{ModelApi, selected_from_env};
 
 use crate::live_gate::skip_without_live_llm;
 
@@ -72,7 +72,13 @@ pub async fn run() {
     let store: Arc<dyn AppStore> =
         Arc::new(FilesystemAppStore::with_apps_dir(home.join("apps")));
     let supervisor = Arc::new(LocalSupervisor::bind(store).await.unwrap());
-    let identity_client = Arc::new(MoonshotClient::from_env());
+    let identity_client: Arc<dyn ModelApi> =
+        Arc::from(selected_from_env().expect("build provider from env"));
+    let provider_meta = ProviderMeta {
+        provider: "kimi-for-coding".into(),
+        model: identity_client.model().to_string(),
+        dialect: "anthropic-messages".into(),
+    };
     let state = Arc::new(GatewayState::with_apps(
         "You are a careful assistant. Before taking any action, raise an \
          approval interaction and wait for the answer."
@@ -81,7 +87,9 @@ pub async fn run() {
         "soul".into(),
         dummy_input_port(),
         supervisor,
+        identity_client.clone(),
         identity_client,
+        provider_meta,
     ));
     let app = router().with_state(state);
 

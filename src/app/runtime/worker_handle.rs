@@ -197,8 +197,8 @@ mod tests {
                 entry: crate::agent::entry::Entry {
                     id: 1,
                     parent_id: None,
-                    message: crate::provider::moonshot::Message::User {
-                        content: crate::provider::moonshot::UserContent::Text("x".into()),
+                    message: crate::provider::kimi_for_coding::Message::User {
+                        content: crate::provider::kimi_for_coding::UserContent::Text("x".into()),
                     },
                     origin: crate::agent::entry::EntryOrigin::User {
                         channel: "board".into(),

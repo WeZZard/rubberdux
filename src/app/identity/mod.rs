@@ -11,10 +11,17 @@ pub mod prompt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::runtime::model_bridge::{from_model_response, to_model_request};
 use crate::app::IconSpec;
-use crate::provider::moonshot::{extract_json_object, MoonshotClient};
+use crate::provider::kimi_for_coding::{Message, extract_json_object};
+use crate::provider::{Effort, ModelApi, Sampling};
 
 use fallback::{fallback_color, fallback_symbol, fallback_title};
+
+/// Output-token budget for the identity call. The model spends completion tokens
+/// on a visible chain-of-thought before the answer, so the budget must cover both
+/// or the JSON answer is truncated to empty content. See `docs/app/identity.md`.
+const IDENTITY_MAX_TOKENS: u32 = 2048;
 
 // ---------------------------------------------------------------------------
 // Allowlist and palette
@@ -97,32 +104,16 @@ struct LlmIdentityResponse {
 
 /// Derive an [`AppIdentity`] from a task string.
 ///
-/// Makes a constrained JSON call to the Moonshot API. Per-field validation
+/// Makes a constrained JSON call to the Kimi for Coding API. Per-field validation
 /// repairs only the invalid field; a valid title from the LLM response is
 /// always kept even if the symbol or color must be replaced. If the LLM call
 /// fails or the response is not valid JSON, the full heuristic fallback is used.
 ///
 /// This function never returns an error.
-pub async fn derive_identity(client: &MoonshotClient, task: &str) -> AppIdentity {
+pub async fn derive_identity(client: &dyn ModelApi, task: &str) -> AppIdentity {
     let messages = vec![prompt::system_message(), prompt::user_message(task)];
 
-    // The model is a reasoning model: it spends completion tokens on a visible
-    // chain-of-thought before emitting the answer. The budget must leave room for
-    // both, or the response is truncated (`finish_reason: "length"`) with empty
-    // `content`. The JSON shape is requested at the prompt level (see
-    // `prompt::system_message`), which the model honors, so no `response_format`
-    // constraint is set. See `docs/app/identity.md`.
-    let request = crate::provider::moonshot::api::chat::ChatRequest {
-        model: client.model().to_owned(),
-        messages,
-        temperature: Some(0.3),
-        max_completion_tokens: Some(2048),
-        tools: None,
-        response_format: None,
-        thinking: None,
-    };
-
-    let raw_json = fetch_raw_json(client, request).await;
+    let raw_json = fetch_raw_json(client, messages).await;
 
     match raw_json {
         Some(json) => repair_from_json(&json, task),
@@ -134,37 +125,27 @@ pub async fn derive_identity(client: &MoonshotClient, task: &str) -> AppIdentity
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Send the request and extract the text content of the first assistant choice.
-/// Returns `None` on any network / HTTP / parse error.
-async fn fetch_raw_json(
-    client: &MoonshotClient,
-    request: crate::provider::moonshot::api::chat::ChatRequest,
-) -> Option<String> {
-    let response = client
-        .http()
-        .post(client.url("/chat/completions"))
-        .header("Authorization", client.auth_header())
-        .header("Content-Type", "application/json")
-        .json(&request)
-        .send()
-        .await
-        .ok()?;
+/// Run the identity turn through the selected [`ModelApi`] and extract the text
+/// content of the assistant response. Returns `None` on any provider error so
+/// the deterministic fallback runs cleanly. The JSON shape is requested at the
+/// prompt level (see `prompt::system_message`), so no tools are offered.
+async fn fetch_raw_json(client: &dyn ModelApi, messages: Vec<Message>) -> Option<String> {
+    let sampling = Sampling {
+        model: client.model().to_owned(),
+        max_tokens: IDENTITY_MAX_TOKENS,
+        effort: Effort::Medium,
+    };
+    let request = to_model_request(&messages, None, sampling);
 
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
-        log::warn!(
-            "identity: LLM call failed with status {}: {}",
-            status,
-            body
-        );
-        return None;
-    }
+    let response = match client.turn(&request).await {
+        Ok(resp) => from_model_response(resp),
+        Err(e) => {
+            log::warn!("identity: LLM call failed: {e}");
+            return None;
+        }
+    };
 
-    let chat: crate::provider::moonshot::api::chat::ChatResponse =
-        response.json().await.ok()?;
-
-    let text = chat.choices.into_iter().next()?.message;
+    let text = response.choices.into_iter().next()?.message;
     let content = text.content_text().trim();
     // Empty/whitespace content (e.g. a truncated reasoning response) yields `None`
     // so the deterministic fallback runs cleanly rather than hitting the
@@ -262,12 +243,13 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn make_client(base_url: &str) -> MoonshotClient {
-        MoonshotClient::new(
+    fn make_client(base_url: &str) -> crate::provider::dialect::openai_chat_completions::OpenAiChatCompletions {
+        crate::provider::dialect::openai_chat_completions::OpenAiChatCompletions::new(
             reqwest::Client::new(),
             base_url.to_owned(),
             "test-key".to_owned(),
             "test-model".to_owned(),
+            crate::provider::AuthScheme::Bearer,
         )
     }
 
@@ -304,7 +286,7 @@ mod tests {
         let body = serde_json::to_string(&chat_response_body(content_json)).unwrap();
 
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_string(body.clone()))
             .expect(2)
             .mount(&server)
@@ -327,7 +309,7 @@ mod tests {
             serde_json::to_string(&chat_response_body(response_json)).unwrap();
 
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
             .mount(&server)
             .await;
@@ -351,7 +333,7 @@ mod tests {
             serde_json::to_string(&chat_response_body(response_json)).unwrap();
 
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
             .mount(&server)
             .await;
@@ -384,7 +366,7 @@ mod tests {
             serde_json::to_string(&chat_response_body(response_json)).unwrap();
 
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
             .mount(&server)
             .await;
@@ -411,7 +393,7 @@ mod tests {
             serde_json::to_string(&chat_response_body("not json at all {{{}}}")).unwrap();
 
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
             .mount(&server)
             .await;
@@ -441,7 +423,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
@@ -483,8 +465,8 @@ mod tests {
     #[ignore = "makes real API call — run with `cargo test -- --ignored`"]
     async fn real_llm_derives_identity_not_fallback() {
         dotenvy::dotenv().ok();
-        let client = MoonshotClient::from_env();
-        let id = derive_identity(&client, "Book a flight to Tokyo").await;
+        let client = crate::provider::selected_from_env().expect("provider selection");
+        let id = derive_identity(client.as_ref(), "Book a flight to Tokyo").await;
         assert!(!id.title.trim().is_empty(), "title must be non-empty");
         assert!(
             SYMBOL_ALLOWLIST.contains(&id.icon.symbol.as_str()),

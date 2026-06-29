@@ -356,38 +356,17 @@ pub struct ModelMeta {
     pub reasoning: ReasoningPolicy,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Usage {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-}
-
-/// Why the model stopped. Serialises snake_case to match the Anthropic
-/// `stop_reason` values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StopReason {
-    EndTurn,
-    ToolUse,
-    MaxTokens,
-    Refusal,
-    PauseTurn,
-}
+// `StopReason`, `Usage`, and `ReasoningPolicy` live canonically in the provider
+// domain ([`crate::provider`]) — the neutral home for model request/response
+// vocabulary — and are re-exported here so `ModelMeta` and the event log keep a
+// single definition with no drift. Their serde representation is preserved by
+// the relocation, so persisted events and snapshots stay byte-identical.
+pub use crate::provider::{ReasoningPolicy, StopReason, Usage};
 
 /// Capability metadata that governed a call. Shape only for P0 — opaque
 /// structured JSON; exact fields fixed by a later pass.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Capabilities(pub serde_json::Value);
-
-/// How reasoning blocks were round-tripped for a call, recorded so replay
-/// reconstructs the SAME History deterministically.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReasoningPolicy {
-    Echo,
-    Drop,
-    MustEcho,
-}
 
 /// A model-call failure, distinct from a successful non-`EndTurn` stop reason:
 /// the call yielded no blocks at all.

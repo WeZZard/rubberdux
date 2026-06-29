@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, broadcast};
 
 use crate::agent::entry::Entry;
@@ -7,8 +8,19 @@ use crate::agent::runtime::port::{EntryNotification, InputPort};
 use crate::app::supervisor::{AppSupervisor, BoardEvent};
 use crate::gateway::apps::DynAppSupervisor;
 use crate::gateway::apps_stream::InteractionEvent;
-use crate::provider::moonshot::MoonshotClient;
+use crate::provider::ModelApi;
 use crate::trajectory::TrajectoryEvent;
+
+/// Snapshot of the selected provider's identity fields captured at startup.
+/// Served verbatim by `GET /api/v1/provider`. Stored in [`GatewayState`] so
+/// the REST handler never needs to re-resolve from the environment. See
+/// `docs/gateway/route.md`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProviderMeta {
+    pub provider: String,
+    pub model: String,
+    pub dialect: String,
+}
 
 pub struct GatewayState {
     pub entries: RwLock<Vec<Entry>>,
@@ -26,10 +38,10 @@ pub struct GatewayState {
     /// trait uses bare `async fn` and is not itself `dyn`-compatible. See
     /// `docs/gateway/apps.md`.
     pub supervisor: Option<Arc<dyn DynAppSupervisor>>,
-    /// The Moonshot client used to derive an App's identity (title + icon) as a
-    /// background task when an App is created. Present only alongside
-    /// `supervisor`.
-    pub identity_client: Option<Arc<MoonshotClient>>,
+    /// The selected [`ModelApi`] used to derive an App's identity (title + icon)
+    /// and to cluster conversations, run as background tasks when an App is
+    /// created. Present only alongside `supervisor`.
+    pub identity_client: Option<Arc<dyn ModelApi>>,
     /// Gateway-owned fan-out of App interaction lifecycle events
     /// (`Raised`/`Resolved`). The `AppSupervisor` trait exposes interactions
     /// only as a snapshot poll and an answer path, with no live "raised" event;
@@ -44,6 +56,15 @@ pub struct GatewayState {
     /// out to every connected client. Empty (no forwarder) for the single-agent
     /// constructors. See `docs/gateway/apps_stream.md`.
     pub board_tx: broadcast::Sender<BoardEvent>,
+    /// The one selected [`ModelApi`] adapter, shared with the agent loop and
+    /// App identity tasks. Exposed by `GET /api/v1/models` to proxy the live
+    /// model list. Wired from the single `provider::select_from_env()` call at
+    /// host startup; no per-request re-selection. See `docs/gateway/route.md`.
+    pub selected_provider: Arc<dyn ModelApi>,
+    /// Provider identity snapshot captured at startup from the resolved
+    /// selection. Served verbatim by `GET /api/v1/provider`. See
+    /// `docs/gateway/route.md`.
+    pub provider_meta: ProviderMeta,
 }
 
 impl GatewayState {
@@ -52,6 +73,8 @@ impl GatewayState {
         identity_prompt: String,
         soul_prompt: String,
         input_port: InputPort,
+        selected_provider: Arc<dyn ModelApi>,
+        provider_meta: ProviderMeta,
     ) -> Self {
         let (entry_tx, _) = broadcast::channel(256);
         let (trajectory_tx, _) = broadcast::channel(256);
@@ -69,9 +92,13 @@ impl GatewayState {
             identity_client: None,
             interaction_tx,
             board_tx: broadcast::channel(256).0,
+            selected_provider,
+            provider_meta,
         }
     }
 
+    // constructor mirrors the full GatewayState field set; a builder is out of scope here.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_trajectory_tx(
         system_prompt: String,
         identity_prompt: String,
@@ -79,6 +106,8 @@ impl GatewayState {
         trajectory_tx: broadcast::Sender<TrajectoryEvent>,
         input_port: InputPort,
         events_path: Option<std::path::PathBuf>,
+        selected_provider: Arc<dyn ModelApi>,
+        provider_meta: ProviderMeta,
     ) -> Self {
         let (entry_tx, _) = broadcast::channel(256);
         let (interaction_tx, _) = broadcast::channel(256);
@@ -95,21 +124,27 @@ impl GatewayState {
             identity_client: None,
             interaction_tx,
             board_tx: broadcast::channel(256).0,
+            selected_provider,
+            provider_meta,
         }
     }
 
     /// Construct a gateway state wired for the multi-App board: it carries the
-    /// [`AppSupervisor`] the board REST surface drives and the
-    /// [`MoonshotClient`] used to derive App identities in the background. The
+    /// [`AppSupervisor`] the board REST surface drives and the selected
+    /// [`ModelApi`] used to derive App identities in the background. The
     /// single-agent entry endpoints remain available; their fields default to
     /// empty so one process can serve both surfaces. See `docs/gateway/apps.md`.
+    // constructor mirrors the full GatewayState field set; a builder is out of scope here.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_apps<S>(
         system_prompt: String,
         identity_prompt: String,
         soul_prompt: String,
         input_port: InputPort,
         supervisor: Arc<S>,
-        identity_client: Arc<MoonshotClient>,
+        identity_client: Arc<dyn ModelApi>,
+        selected_provider: Arc<dyn ModelApi>,
+        provider_meta: ProviderMeta,
     ) -> Self
     where
         S: AppSupervisor + 'static,
@@ -154,6 +189,8 @@ impl GatewayState {
             identity_client: Some(identity_client),
             interaction_tx,
             board_tx,
+            selected_provider,
+            provider_meta,
         }
     }
 
@@ -168,7 +205,7 @@ impl GatewayState {
     ///
     /// [`with_trajectory_tx`]: GatewayState::with_trajectory_tx
     /// [`with_apps`]: GatewayState::with_apps
-    pub fn attach_apps<S>(&mut self, supervisor: Arc<S>, identity_client: Arc<MoonshotClient>)
+    pub fn attach_apps<S>(&mut self, supervisor: Arc<S>, identity_client: Arc<dyn ModelApi>)
     where
         S: AppSupervisor + 'static,
     {
@@ -210,14 +247,56 @@ impl GatewayState {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+
     use super::*;
     use crate::agent::entry::EntryOrigin;
     use crate::agent::runtime::port::LoopEvent;
-    use crate::provider::moonshot::{Message, UserContent};
+    use crate::provider::kimi_for_coding::{Message, UserContent};
+    use crate::provider::{ModelApi, ModelInfo, ModelRequest, ModelResponse};
 
     fn dummy_input_port() -> InputPort {
         let (tx, _rx) = tokio::sync::mpsc::channel::<LoopEvent>(8);
         InputPort::new(tx)
+    }
+
+    /// Minimal stub adapter for tests that build `GatewayState` but never
+    /// exercise the provider REST endpoints. `turn` is unreachable in unit
+    /// tests; `list_models` returns an empty vec.
+    struct StubModelApi;
+
+    impl ModelApi for StubModelApi {
+        fn turn<'a>(
+            &'a self,
+            _req: &'a ModelRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, crate::error::Error>> + Send + 'a>>
+        {
+            Box::pin(async { unreachable!("StubModelApi::turn not used in state unit tests") })
+        }
+
+        fn list_models<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, crate::error::Error>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(vec![]) })
+        }
+
+        fn model(&self) -> &str {
+            "stub-model"
+        }
+    }
+
+    fn stub_provider() -> Arc<dyn ModelApi> {
+        Arc::new(StubModelApi)
+    }
+
+    fn stub_provider_meta() -> ProviderMeta {
+        ProviderMeta {
+            provider: "kimi-for-coding".into(),
+            model: "stub-model".into(),
+            dialect: "anthropic-messages".into(),
+        }
     }
 
     #[test]
@@ -227,6 +306,8 @@ mod tests {
             "identity".into(),
             "soul".into(),
             dummy_input_port(),
+            stub_provider(),
+            stub_provider_meta(),
         );
         let entries = state.entries.blocking_read();
         assert!(entries.is_empty());
@@ -237,7 +318,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_push_entry_updates_state() {
-        let state = GatewayState::new("sys".into(), "id".into(), "soul".into(), dummy_input_port());
+        let state = GatewayState::new(
+            "sys".into(),
+            "id".into(),
+            "soul".into(),
+            dummy_input_port(),
+            stub_provider(),
+            stub_provider_meta(),
+        );
         let entry = Entry {
             id: 0,
             parent_id: None,

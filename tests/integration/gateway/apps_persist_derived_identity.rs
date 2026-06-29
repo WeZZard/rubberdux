@@ -11,7 +11,7 @@
 //!   check (no LLM): a known identity overwrites the placeholder in the manifest
 //!   and a second identical write is idempotent.
 //! - `create_persists_derived_identity_and_broadcasts_updated` drives the real
-//!   create handler with a live `MoonshotClient` (per the mock-data policy,
+//!   create handler with a live `KimiForCodingClient` (per the mock-data policy,
 //!   integration tests use real model calls): it connects a board WebSocket,
 //!   creates an App, and asserts the WS receives an `updated` frame and that
 //!   `GET /apps` reflects the persisted, derived identity rather than the
@@ -31,8 +31,8 @@ use rubberdux::app::supervisor::MemorySupervisor;
 use rubberdux::app::{App, AppId, BoardPosition, IconSpec};
 use rubberdux::gateway::apps::router;
 use rubberdux::gateway::apps_stream::ws_board;
-use rubberdux::gateway::state::GatewayState;
-use rubberdux::provider::moonshot::MoonshotClient;
+use rubberdux::gateway::state::{GatewayState, ProviderMeta};
+use rubberdux::provider::{ModelApi, selected_from_env};
 use rubberdux::session::SessionManager;
 
 /// The placeholder identity the create handler seeds before derivation, per
@@ -90,9 +90,9 @@ async fn set_identity_is_persisted_and_idempotent() {
 /// Build the board REST router plus the board WebSocket over a real in-process
 /// supervisor rooted at `apps_dir`, and serve it on an ephemeral loopback port.
 /// Returns the bound address and the served `axum::Router` clone for `oneshot`
-/// REST calls against the same state. The real `MoonshotClient` drives the
+/// REST calls against the same state. The real `KimiForCodingClient` drives the
 /// background identity derivation the create handler spawns.
-async fn serve(apps_dir: std::path::PathBuf, client: Arc<MoonshotClient>) -> std::net::SocketAddr {
+async fn serve(apps_dir: std::path::PathBuf, client: Arc<dyn ModelApi>) -> std::net::SocketAddr {
     let home = apps_dir.parent().unwrap().to_path_buf();
     let session_manager = Arc::new(SessionManager {
         home_dir: home.clone(),
@@ -105,13 +105,20 @@ async fn serve(apps_dir: std::path::PathBuf, client: Arc<MoonshotClient>) -> std
         session_manager,
         store,
     ));
+    let provider_meta = ProviderMeta {
+        provider: "kimi-for-coding".into(),
+        model: client.model().to_string(),
+        dialect: "anthropic-messages".into(),
+    };
     let state = Arc::new(GatewayState::with_apps(
         "sys".into(),
         "id".into(),
         "soul".into(),
         dummy_input_port(),
         supervisor,
+        client.clone(),
         client,
+        provider_meta,
     ));
 
     let app = router()
@@ -179,7 +186,7 @@ where
 /// The end-to-end create path: a real `create_app` over the in-process
 /// supervisor must derive an identity, persist it over the placeholder, and
 /// announce an `updated` board event so `GET /apps` serves the derived
-/// title/icon. Uses a live `MoonshotClient` from the environment per the
+/// title/icon. Uses a live `KimiForCodingClient` from the environment per the
 /// mock-data policy (load `.env` before running).
 #[tokio::test(flavor = "multi_thread")]
 async fn create_persists_derived_identity_and_broadcasts_updated() {
@@ -195,7 +202,8 @@ async fn create_persists_derived_identity_and_broadcasts_updated() {
         std::env::set_var("RUBBERDUX_HOME", &home);
     }
 
-    let client = Arc::new(MoonshotClient::from_env());
+    let client: Arc<dyn ModelApi> =
+        Arc::from(selected_from_env().expect("build provider from env"));
     let addr = serve(home.join("apps"), client).await;
 
     // Subscribe to the board stream before creating so no `updated` is missed.

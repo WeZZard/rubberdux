@@ -7,4 +7,6 @@ pub mod live_gate;
 pub mod log_capture;
 pub mod mock_channel_processor;
 pub mod mock_tools;
+#[path = "../../support/model_api_stub.rs"]
+pub mod model_api_stub;
 pub mod runner;

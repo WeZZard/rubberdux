@@ -2,7 +2,7 @@
 //! fallback. See `docs/app/merge/clustering.md` for the A/B/C trade-offs and
 //! when clustering runs.
 //!
-//! The mechanism mirrors `crate::app::identity`: a constrained-JSON Moonshot
+//! The mechanism mirrors `crate::app::identity`: a constrained-JSON Kimi for Coding
 //! call (here at temperature 0, so the decision is as deterministic as the
 //! provider allows) classifies a new conversation summary against candidate App
 //! summaries. The Jaccard pre-filter bounds the candidate set offered to the
@@ -13,10 +13,17 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::provider::moonshot::api::chat::ChatRequest;
-use crate::provider::moonshot::{extract_json_object, Message, MoonshotClient, UserContent};
+use crate::agent::runtime::model_bridge::{from_model_response, to_model_request};
+use crate::provider::kimi_for_coding::{Message, UserContent, extract_json_object};
+use crate::provider::{Effort, ModelApi, Sampling};
 
 use super::{ClusterCandidate, ClusterDecision, Clusterer};
+
+/// Output-token budget for the classify call. The reasoning model spends
+/// completion tokens on a visible chain-of-thought before the decision, so the
+/// budget must cover both or the JSON answer is truncated to empty content. See
+/// `docs/app/merge/clustering.md`.
+const CLUSTERING_MAX_TOKENS: u32 = 2048;
 
 /// The maximum number of candidates handed to the LLM after the Jaccard
 /// pre-filter ranks them. Bounds the prompt size and cost when the board holds
@@ -29,10 +36,10 @@ pub const MAX_LLM_CANDIDATES: usize = 8;
 /// `docs/app/merge/clustering.md` (option C, fallback).
 pub const JACCARD_JOIN_THRESHOLD: f64 = 0.6;
 
-/// The LLM-backed clusterer. Holds the shared `MoonshotClient` used for the
+/// The LLM-backed clusterer. Holds the selected [`ModelApi`] used for the
 /// classify call; the Jaccard pre-filter and fallback need no state.
 pub struct LlmClusterer {
-    client: Arc<MoonshotClient>,
+    client: Arc<dyn ModelApi>,
 }
 
 /// The model's classify response shape. `decision` is `"join"` or `"new"`;
@@ -44,10 +51,10 @@ struct LlmClassifyResponse {
 }
 
 impl LlmClusterer {
-    /// Construct a clusterer over the shared Moonshot client. The same client
+    /// Construct a clusterer over the selected model API. The same `ModelApi`
     /// the gateway already holds for identity derivation is reused, so no new
     /// state field or dependency is introduced.
-    pub fn new(client: Arc<MoonshotClient>) -> Self {
+    pub fn new(client: Arc<dyn ModelApi>) -> Self {
         Self { client }
     }
 
@@ -82,29 +89,9 @@ impl LlmClusterer {
         new_summary: &str,
         shortlist: &[ClusterCandidate],
     ) -> Option<ClusterDecision> {
-        let request = ChatRequest {
-            model: self.client.model().to_owned(),
-            messages: vec![
-                system_message(),
-                user_message(new_summary, shortlist),
-            ],
-            // Temperature 0: the decision must be as deterministic as the
-            // provider allows so the same conversation clusters the same way.
-            temperature: Some(0.0),
-            // The model is a reasoning model that spends completion tokens on a
-            // visible chain-of-thought before emitting the answer. Too small a
-            // budget truncates the response (`finish_reason: "length"`) with empty
-            // `content`, so the budget must cover the reasoning and the decision.
-            // The JSON shape is requested at the prompt level (see
-            // `system_message`), which the model honors, so no `response_format`
-            // constraint is set. See `docs/app/merge/clustering.md`.
-            max_completion_tokens: Some(2048),
-            tools: None,
-            response_format: None,
-            thinking: None,
-        };
+        let messages = vec![system_message(), user_message(new_summary, shortlist)];
 
-        let raw = fetch_raw_json(&self.client, request).await?;
+        let raw = fetch_raw_json(self.client.as_ref(), messages).await?;
         Some(parse_decision(&raw, shortlist))
     }
 }
@@ -250,29 +237,28 @@ fn user_message(new_summary: &str, candidates: &[ClusterCandidate]) -> Message {
     }
 }
 
-/// Send the request and return the text content of the first assistant choice.
-/// Returns `None` on any network / HTTP / parse error. Mirrors
+/// Run the classify turn through the selected [`ModelApi`] and return the text
+/// content of the assistant response. Returns `None` on any provider error so
+/// the lexical fallback runs cleanly. The JSON shape is requested at the prompt
+/// level (see `system_message`), so no tools are offered. Mirrors
 /// `crate::app::identity`'s `fetch_raw_json`.
-async fn fetch_raw_json(client: &MoonshotClient, request: ChatRequest) -> Option<String> {
-    let response = client
-        .http()
-        .post(client.url("/chat/completions"))
-        .header("Authorization", client.auth_header())
-        .header("Content-Type", "application/json")
-        .json(&request)
-        .send()
-        .await
-        .ok()?;
+async fn fetch_raw_json(client: &dyn ModelApi, messages: Vec<Message>) -> Option<String> {
+    let sampling = Sampling {
+        model: client.model().to_owned(),
+        max_tokens: CLUSTERING_MAX_TOKENS,
+        effort: Effort::Medium,
+    };
+    let request = to_model_request(&messages, None, sampling);
 
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
-        log::warn!("clustering: LLM call failed with status {}: {}", status, body);
-        return None;
-    }
+    let response = match client.turn(&request).await {
+        Ok(resp) => from_model_response(resp),
+        Err(e) => {
+            log::warn!("clustering: LLM call failed: {e}");
+            return None;
+        }
+    };
 
-    let chat: crate::provider::moonshot::api::chat::ChatResponse = response.json().await.ok()?;
-    let message = chat.choices.into_iter().next()?.message;
+    let message = response.choices.into_iter().next()?.message;
     let content = message.content_text().trim();
     // Empty/whitespace content (e.g. a truncated reasoning response) yields `None`
     // so the lexical fallback runs cleanly rather than hitting the parse-error
@@ -330,12 +316,15 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn make_client(base_url: &str) -> Arc<MoonshotClient> {
-        Arc::new(MoonshotClient::new(
+    fn make_client(base_url: &str) -> Arc<dyn ModelApi> {
+        use crate::provider::AuthScheme;
+        use crate::provider::dialect::openai_chat_completions::OpenAiChatCompletions;
+        Arc::new(OpenAiChatCompletions::new(
             reqwest::Client::new(),
             base_url.to_owned(),
             "test-key".to_owned(),
             "test-model".to_owned(),
+            AuthScheme::Bearer,
         ))
     }
 
@@ -448,7 +437,7 @@ mod tests {
         ))
         .unwrap();
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
             .mount(&server)
             .await;
@@ -478,7 +467,7 @@ mod tests {
         let body =
             serde_json::to_string(&chat_response_body(r#"{"decision":"new"}"#)).unwrap();
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
             .mount(&server)
             .await;
@@ -497,7 +486,7 @@ mod tests {
     async fn llm_http_failure_falls_back_to_lexical_join() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
@@ -522,7 +511,7 @@ mod tests {
         let body =
             serde_json::to_string(&chat_response_body("not json {{{")).unwrap();
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
             .mount(&server)
             .await;
@@ -544,7 +533,7 @@ mod tests {
         ))
         .unwrap();
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
             .mount(&server)
             .await;
@@ -571,7 +560,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "makes real API call — run with `cargo test -- --ignored`"]
     async fn real_llm_classifies_related_conversation_as_join() {
-        let clusterer = LlmClusterer::new(Arc::new(MoonshotClient::from_env()));
+        let clusterer = LlmClusterer::new(Arc::from(
+            crate::provider::selected_from_env().expect("provider selection"),
+        ));
         let candidates = vec![
             candidate("trip", "Plan a one-week trip to Tokyo: flights, hotels, itinerary"),
             candidate("taxes", "File the quarterly business tax return"),

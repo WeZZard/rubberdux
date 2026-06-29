@@ -33,9 +33,13 @@ use serde_json::Value as Json;
 
 use rubberdux::agent::world::budget::{Budget, Limits};
 use rubberdux::agent::world::effects::{
-    Command, ModelCaller, ResultStamp, SurfaceDriver, UnattachedPeerSender, drive_live,
+    Command, ResultStamp, SurfaceDriver, UnattachedPeerSender, drive_live,
     fingerprint_call,
 };
+use rubberdux::provider::{ContentBlock, ModelApi, ModelInfo, ModelRequest, ModelResponse};
+use std::future::Future;
+use std::pin::Pin;
+
 use rubberdux::agent::world::event_log::{EventLog, MemoryEventLog};
 use rubberdux::agent::world::gates::EntityGate;
 use rubberdux::agent::world::history::{Block, History, Role};
@@ -132,10 +136,21 @@ struct ExplodingClient {
     calls: Arc<AtomicUsize>,
 }
 
-impl ModelCaller for ExplodingClient {
-    async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+impl ModelApi for ExplodingClient {
+    fn turn<'a>(
+        &'a self,
+        _req: &'a ModelRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         panic!("the replay driver must never invoke the model client");
+    }
+    fn list_models<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn model(&self) -> &str {
+        "stub"
     }
 }
 
@@ -145,21 +160,32 @@ impl ModelCaller for ExplodingClient {
 /// effects.rs unit-test stub.
 struct StubClient;
 
-impl ModelCaller for StubClient {
-    async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
-        Ok((
-            vec![Block::Text { text: "ok".into() }],
-            ModelMeta {
+impl ModelApi for StubClient {
+    fn turn<'a>(
+        &'a self,
+        _req: &'a ModelRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
+        Box::pin(async {
+            Ok(ModelResponse {
+                blocks: vec![ContentBlock::Text { text: "ok".into() }],
+                stop_reason: StopReason::EndTurn,
                 usage: Usage {
                     input_tokens: 1,
                     output_tokens: 1,
                 },
                 model_id: "claude-bounds-replay".into(),
-                stop_reason: StopReason::EndTurn,
-                capabilities: Capabilities(serde_json::json!({})),
                 reasoning: ReasoningPolicy::Drop,
-            },
-        ))
+                capabilities: serde_json::json!({}),
+            })
+        })
+    }
+    fn list_models<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn model(&self) -> &str {
+        "claude-bounds-replay"
     }
 }
 

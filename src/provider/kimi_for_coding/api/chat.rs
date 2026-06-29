@@ -2,7 +2,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use super::super::tool::{FunctionDefinition, ToolDefinition};
-use super::super::{ContentPart, MediaUrl, Message, MoonshotClient, UserContent};
+use super::super::{ContentPart, MediaUrl, Message, KimiForCodingClient, UserContent};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatRequest {
@@ -52,7 +52,7 @@ pub struct Usage {
     pub cached_tokens: usize,
 }
 
-impl MoonshotClient {
+impl KimiForCodingClient {
     /// Uploads inline base64 images via the file API and replaces data URIs
     /// with `ms://{file_id}` references. On upload failure, the original data
     /// URI is kept (the API still accepts inline base64, just slower).
@@ -222,7 +222,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_skips_non_data_urls() {
-        let client = MoonshotClient::new(
+        let client = KimiForCodingClient::new(
             reqwest::Client::new(),
             "http://localhost:0".into(), // won't be called
             "key".into(),
@@ -269,7 +269,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = MoonshotClient::new(
+        let client = KimiForCodingClient::new(
             reqwest::Client::new(),
             mock_server.uri(),
             "test-key".into(),
@@ -315,7 +315,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = MoonshotClient::new(
+        let client = KimiForCodingClient::new(
             reqwest::Client::new(),
             mock_server.uri(),
             "test-key".into(),
@@ -421,7 +421,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "makes real API call — run with `cargo test -- --ignored`"]
     async fn test_web_search_triggers_tool_calls() {
-        let client = MoonshotClient::from_env();
+        let client = KimiForCodingClient::from_env();
         let tools = vec![ToolDefinition {
             r#type: "builtin_function".to_owned(),
             function: FunctionDefinition {

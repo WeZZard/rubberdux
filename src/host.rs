@@ -1152,7 +1152,25 @@ pub async fn run(config: HostConfig, bot: Option<Bot>) {
     let system_prompt =
         crate::hardened_prompts::compose_system_prompt(&prompt_parts, channel_partial);
 
-    let client = Arc::new(crate::provider::moonshot::MoonshotClient::from_env());
+    // Select the model provider from configuration; every turn (host chat and
+    // each App worker) is driven through this one `ModelApi`. A bad/unknown
+    // provider is a fatal startup error, handled like the other fatal init
+    // failures above. `select_from_env` returns both the resolved selection
+    // metadata (provider id, dialect, model) and the built adapter so only ONE
+    // environment resolution is performed — the one-provider invariant.
+    let (resolved_selection, client_box) = match crate::provider::select_from_env() {
+        Ok(pair) => pair,
+        Err(e) => {
+            log::error!("Failed to select model provider: {e}; aborting host startup");
+            return;
+        }
+    };
+    let client: Arc<dyn crate::provider::ModelApi> = Arc::from(client_box);
+    let provider_meta = crate::gateway::state::ProviderMeta {
+        provider: resolved_selection.provider.as_str().to_string(),
+        model: resolved_selection.model.clone(),
+        dialect: resolved_selection.dialect.as_str().to_string(),
+    };
 
     // Create the trajectory broadcast channel and recorder before building the
     // agent loop so that events flow to both the filesystem log and any
@@ -1194,7 +1212,7 @@ pub async fn run(config: HostConfig, bot: Option<Bot>) {
         );
         builder = builder.with_channel_processor("telegram", telegram_processor);
     }
-    let (agent_loop, input_port, _context_tx) = builder.build(client).await;
+    let (agent_loop, input_port, _context_tx) = builder.build(client.clone()).await;
 
     // Subscribe to entry broadcasts for the Telegram adapter
     let entry_rx = agent_loop.subscribe_output().into_receiver();
@@ -1243,13 +1261,16 @@ pub async fn run(config: HostConfig, bot: Option<Bot>) {
         let mut gateway_state = crate::gateway::state::GatewayState::with_trajectory_tx(
             gateway_system_prompt, identity, soul, trajectory_tx, input_port.clone(),
             Some(gateway_events_path),
+            client.clone(),
+            provider_meta,
         );
         // Light up the board REST + WS routes against the supervisor while keeping
         // the single-agent surface above. The identity client derives an App's
         // title + icon as a background task on creation. See `docs/gateway/apps.md`.
         if let Some(supervisor) = app_supervisor {
-            let identity_client = Arc::new(crate::provider::moonshot::MoonshotClient::from_env());
-            gateway_state.attach_apps(supervisor, identity_client);
+            // Identity derivation and clustering share the one selected provider
+            // chosen above for the chat loop; no second selection is needed.
+            gateway_state.attach_apps(supervisor, client.clone());
         }
         let gateway_state = Arc::new(gateway_state);
         let state_clone = gateway_state.clone();

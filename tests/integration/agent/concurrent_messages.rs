@@ -12,7 +12,8 @@ use rubberdux::agent::entry::EntryOrigin;
 use rubberdux::agent::runtime::agent_loop::{AgentLoop, AgentLoopConfig};
 use rubberdux::agent::runtime::compaction::EvictOldestTurns;
 use rubberdux::agent::runtime::port::{EntryNotification, LoopEvent};
-use rubberdux::provider::moonshot::{Message, MoonshotClient, UserContent};
+use rubberdux::provider::kimi_for_coding::{Message, UserContent};
+use crate::support::model_api_stub::openai_model_api;
 use rubberdux::tool::ToolRegistry;
 
 use crate::support::artifact;
@@ -40,12 +41,7 @@ async fn setup_agent_loop(
         artifact_dir
     );
 
-    let client = Arc::new(MoonshotClient::new(
-        reqwest::Client::new(),
-        mock_uri.into(),
-        "test-key".into(),
-        "test-model".into(),
-    ));
+    let client = openai_model_api(mock_uri, "test-model");
 
     let registry = Arc::new(ToolRegistry::new());
 
@@ -128,7 +124,7 @@ async fn test_agent_loop_handles_two_messages() {
     let mock_server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_delay(Duration::from_millis(500))
@@ -150,7 +146,7 @@ async fn test_agent_loop_handles_two_messages() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "cmpl-2",
             "object": "chat.completion",
@@ -213,7 +209,7 @@ async fn test_agent_loop_handles_three_messages() {
     let mock_server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_delay(Duration::from_millis(400))
@@ -235,7 +231,7 @@ async fn test_agent_loop_handles_three_messages() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_delay(Duration::from_millis(300))
@@ -257,7 +253,7 @@ async fn test_agent_loop_handles_three_messages() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "cmpl-3",
             "object": "chat.completion",
@@ -329,7 +325,7 @@ async fn test_agent_loop_handles_four_messages() {
             Duration::from_millis(0)
         };
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_delay(delay).set_body_json(
                 serde_json::json!({
                     "id": format!("cmpl-{}", i),
@@ -411,7 +407,7 @@ async fn test_concurrent_messages_with_tool_call_preserve_reply_to() {
 
     // First call: tool call response (non-final) with 200ms delay
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_delay(Duration::from_millis(200))
@@ -446,7 +442,7 @@ async fn test_concurrent_messages_with_tool_call_preserve_reply_to() {
 
     // Second call: final response after tool execution
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "cmpl-final",
             "object": "chat.completion",
@@ -468,7 +464,7 @@ async fn test_concurrent_messages_with_tool_call_preserve_reply_to() {
 
     // Third call: response for message 2
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "cmpl-msg2",
             "object": "chat.completion",
@@ -575,7 +571,7 @@ async fn test_concurrent_messages_do_not_swap_content() {
 
     // First call: slow response for message 1 (500ms delay)
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_delay(Duration::from_millis(500))
@@ -601,7 +597,7 @@ async fn test_concurrent_messages_do_not_swap_content() {
 
     // Second call: fast response for message 2
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "cmpl-2",
             "object": "chat.completion",
@@ -712,7 +708,7 @@ async fn test_error_response_preserves_reply_to_metadata() {
 
     // Mock returns HTTP 400 to simulate an LLM API error
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
             "error": {
                 "message": "invalid temperature",

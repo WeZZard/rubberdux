@@ -20,8 +20,9 @@ use rubberdux::app::runtime::local_supervisor::LocalSupervisor;
 use rubberdux::app::{App, AppId, BoardPosition, IconSpec};
 use rubberdux::agent::runtime::port::{InputPort, LoopEvent};
 use rubberdux::gateway::route::router;
-use rubberdux::gateway::state::GatewayState;
-use rubberdux::provider::moonshot::MoonshotClient;
+use rubberdux::gateway::state::{GatewayState, ProviderMeta};
+
+use crate::support::model_api_stub::dummy_model_api;
 
 fn dummy_input_port() -> InputPort {
     let (tx, _rx) = tokio::sync::mpsc::channel::<LoopEvent>(8);
@@ -93,10 +94,16 @@ async fn host_wired_state_serves_health_and_app_board() {
         trajectory_tx,
         dummy_input_port(),
         None,
+        dummy_model_api(),
+        ProviderMeta {
+            provider: "kimi-for-coding".into(),
+            model: "test-model".into(),
+            dialect: "anthropic-messages".into(),
+        },
     );
-    // `from_env` constructs the client without making a network call; the board
-    // list path below never hits the LLM.
-    let identity_client = Arc::new(MoonshotClient::from_env());
+    // The board list path below never hits the LLM, so a stub adapter is enough
+    // for the identity client the board attaches.
+    let identity_client = dummy_model_api();
     state.attach_apps(supervisor, identity_client);
     let state = Arc::new(state);
 

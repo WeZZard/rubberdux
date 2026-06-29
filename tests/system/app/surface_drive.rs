@@ -145,16 +145,19 @@ pub async fn run() {
     if !await_final(&mut entries, TURN_TIMEOUT).await {
         // No assistant reply: dump the recorded world log so the failure is
         // self-explaining. A `model_failed` here means the World driver's live
-        // model call failed — and `MessagesClient::call` posts to
-        // `{base}/v1/messages`, doubling `/v1` for a base that already ends in
-        // `/v1` (the repo `.env` base is `.../coding/v1`), which the provider
-        // 404s. See src/agent/world/model_client.rs.
+        // model call failed — the Anthropic Messages dialect adapter posts to
+        // the provider's `/v1/messages`; its `messages_url` helper folds the
+        // base-URL `/v1` so a base already ending in `/v1` (the repo `.env` base
+        // is `.../coding/v1`) is NOT doubled. See
+        // src/provider/dialect/anthropic_messages.rs.
         let events = read_world_log_settled(&app_dir, Duration::from_secs(10));
         panic!(
             "VC-E.1: the first live turn produced no final entry within {TURN_TIMEOUT:?}. \
              Recorded world log: [{}]. A `model_failed` here is the live model call failing \
-             (MessagesClient::call posts to `{{base}}/v1/messages`, doubling `/v1` against the \
-             repo .env base `.../coding/v1`; see src/agent/world/model_client.rs).",
+             (the Anthropic Messages dialect adapter posts to the provider's `/v1/messages`; \
+             its `messages_url` helper folds the base-URL `/v1` so a base already ending in \
+             `/v1` like the repo .env `.../coding/v1` is not doubled; see \
+             src/provider/dialect/anthropic_messages.rs).",
             world_log_summary(&events)
         );
     }

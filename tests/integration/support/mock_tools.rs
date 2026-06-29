@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 
-use rubberdux::provider::moonshot::tool::ToolDefinition;
+use rubberdux::provider::kimi_for_coding::tool::ToolDefinition;
 use rubberdux::tool::{BackgroundTaskResult, Tool, ToolOutcome};
 
 // ---------------------------------------------------------------------------

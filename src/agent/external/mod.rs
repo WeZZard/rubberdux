@@ -430,8 +430,8 @@ pub fn spawn_external_agent_session(
 
                             // Inject the interaction as a user message into the parent agent loop
                             let injection_text = format_interaction_message(&request, &task_id);
-                            let injection_message = crate::provider::moonshot::Message::User {
-                                content: crate::provider::moonshot::UserContent::Text(injection_text),
+                            let injection_message = crate::provider::kimi_for_coding::Message::User {
+                                content: crate::provider::kimi_for_coding::UserContent::Text(injection_text),
                             };
                             let _ = input_port.send_user_message(
                                 injection_message,

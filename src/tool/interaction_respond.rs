@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::agent::external::interaction_queue::InteractionQueue;
 use crate::agent::external::UIInteractionResponse;
-use crate::provider::moonshot::tool::ToolDefinition;
+use crate::provider::kimi_for_coding::tool::ToolDefinition;
 
 use super::ToolOutcome;
 

@@ -22,7 +22,8 @@ use crate::agent::runtime::port::{EntryNotification, InputPort};
 use crate::app::registry::store::AppStore;
 use crate::app::{App, AppId, AppStatus, BoardPosition, IconSpec};
 use crate::error::Error;
-use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
+use crate::provider::ModelApi;
+use crate::provider::kimi_for_coding::{Message, UserContent};
 use crate::session::SessionManager;
 use crate::trajectory::{BroadcastTrajectoryRecorder, TrajectoryEvent, noop_recorder};
 
@@ -169,7 +170,7 @@ struct AppRuntime {
 /// `crate::agent::runtime::subagent`. Persistence is delegated to the injected
 /// [`AppStore`]; live runtimes are tracked in memory keyed by [`AppId`].
 pub struct MemorySupervisor {
-    client: Arc<MoonshotClient>,
+    client: Arc<dyn ModelApi>,
     session_manager: Arc<SessionManager>,
     store: Arc<dyn AppStore>,
     /// Live worker handles for `Active` Apps. Guarded by an async mutex so the
@@ -183,7 +184,7 @@ pub struct MemorySupervisor {
 impl MemorySupervisor {
     /// Construct a supervisor over the given client, session manager, and store.
     pub fn new(
-        client: Arc<MoonshotClient>,
+        client: Arc<dyn ModelApi>,
         session_manager: Arc<SessionManager>,
         store: Arc<dyn AppStore>,
     ) -> Self {
@@ -446,12 +447,15 @@ mod tests {
     /// A client that never reaches the network in these tests: messages produce
     /// a user entry on the loop's broadcast before any LLM turn is driven, which
     /// is all the entry-subscription test observes.
-    fn dummy_client() -> Arc<MoonshotClient> {
-        Arc::new(MoonshotClient::new(
+    fn dummy_client() -> Arc<dyn ModelApi> {
+        use crate::provider::AuthScheme;
+        use crate::provider::dialect::openai_chat_completions::OpenAiChatCompletions;
+        Arc::new(OpenAiChatCompletions::new(
             reqwest::Client::new(),
             "http://localhost:0".into(),
             "test-key".into(),
             "test-model".into(),
+            AuthScheme::Bearer,
         ))
     }
 

@@ -18,7 +18,7 @@ use crate::agent::runtime::port::{EntryNotification, InputPort, InternalMutation
 use crate::channel::interpreter;
 use crate::channel::processor::ChannelProcessor;
 use crate::error::Error;
-use crate::provider::moonshot::{Message, UserContent};
+use crate::provider::kimi_for_coding::{Message, UserContent};
 
 const TELEGRAM_PROMPT: &str = include_str!("TELEGRAM.md");
 
@@ -642,7 +642,7 @@ impl ChannelProcessor for TelegramChannelProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::moonshot::{Message, UserContent};
+    use crate::provider::kimi_for_coding::{Message, UserContent};
 
     #[test]
     fn test_inject_id_into_existing_telegram_tag() {

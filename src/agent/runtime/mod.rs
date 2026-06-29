@@ -3,6 +3,7 @@ pub mod agent_loop;
 pub mod chat;
 pub mod compaction;
 pub mod history_store;
+pub mod model_bridge;
 pub mod port;
 pub mod session;
 pub mod subagent;

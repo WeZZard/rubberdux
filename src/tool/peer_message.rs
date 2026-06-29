@@ -22,7 +22,7 @@ use std::pin::Pin;
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::provider::moonshot::tool::ToolDefinition;
+use crate::provider::kimi_for_coding::tool::ToolDefinition;
 
 use super::{Tool, ToolOutcome};
 

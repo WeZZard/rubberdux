@@ -1,7 +1,9 @@
+// intentional: world/world.rs is the domain core.
+#[allow(clippy::module_inception)]
 pub mod world;
 pub mod inputs;
 pub mod history;
-pub mod model_client;
+pub mod model_bridge;
 pub mod event_log;
 pub mod effects;
 pub mod gates;

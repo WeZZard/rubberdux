@@ -1,7 +1,8 @@
 //! driver — the imperative-shell tick-driver loop. See docs/agent/world/ecs-runtime.md
 //!
 //! [`WorldDriver`] is the IMPERATIVE SHELL that drives the pure World runtime
-//! live: it owns the IO capabilities (a [`ModelCaller`], a [`SurfaceDriver`] and
+//! live: it owns the IO capabilities (a model client [`crate::provider::ModelApi`],
+//! a [`SurfaceDriver`] and
 //! an [`EventLog`]) the pure `tick`/Systems are forbidden to touch, and turns a
 //! stream of [`LogicalInput`]s into recorded `Event`s + a settled `World`.
 //!
@@ -27,7 +28,7 @@
 //! `OutputPort` did — without re-introducing the legacy loop.
 //!
 //! The driver is GENERIC over the three IO traits so it is OFFLINE-TESTABLE: a
-//! test injects a `MemoryEventLog`, a stub `ModelCaller`, and a no-op
+//! test injects a `MemoryEventLog`, a stub model client (`ModelApi`), and a no-op
 //! `SurfaceDriver` and drives a full `Idle → Thinking → Idle` turn with no
 //! network. The functional core (`tick`, the Systems, `drive_live`) stays pure;
 //! this loop is the only place clocks, the network, and the log are touched.
@@ -36,12 +37,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::entry::{Entry, EntryOrigin};
 use crate::agent::runtime::port::EntryNotification;
-use crate::provider::moonshot::Message;
+use crate::provider::kimi_for_coding::Message;
+use crate::provider::ModelApi;
 use crate::error::Error;
 
 use super::edge;
 use super::effects::{
-    drive_live, Command, CommandKey, ModelCaller, PeerSender, ResultStamp, SurfaceDriver,
+    drive_live, Command, CommandKey, PeerSender, ResultStamp, SurfaceDriver,
     UnattachedPeerSender,
 };
 use super::event_log::EventLog;
@@ -102,7 +104,8 @@ fn surface_tool_names() -> super::effects::ToolSet {
 /// The imperative-shell loop that drives the pure World live.
 ///
 /// Generic over the three IO capabilities so it is offline-testable:
-/// - `C: ModelCaller` — the model-call effect (`MessagesClient` in production),
+/// - `C: ModelApi` — the model-call effect (the config-selected provider, a
+///   `Box<dyn ModelApi>` from `provider::selected_from_env()`, in production),
 /// - `S: SurfaceDriver` — the surface-drive sink (the app-worker forwarder), and
 /// - `L: EventLog` — the append-only log (`FilesystemEventLog` in production).
 pub struct WorldDriver<C, S, L> {
@@ -135,7 +138,7 @@ pub struct WorldDriver<C, S, L> {
 
 impl<C, S, L> WorldDriver<C, S, L>
 where
-    C: ModelCaller,
+    C: ModelApi,
     S: SurfaceDriver,
     L: EventLog,
 {
@@ -815,11 +818,14 @@ mod tests {
     use crate::agent::world::inputs::{
         Capabilities, ModelMeta, ReasoningPolicy, StopReason, Usage,
     };
+    use crate::agent::world::model_bridge::to_model_response;
     use crate::agent::world::world::Effort;
-    use serde_json::Value as Json;
+    use crate::provider::{ModelInfo, ModelRequest, ModelResponse};
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A `ModelCaller` that returns a fixed `EndTurn` assistant text and counts its
+    /// A `ModelApi` that returns a fixed `EndTurn` assistant text and counts its
     /// invocations, so a test proves EXACTLY ONE model call happened (one
     /// `Idle → Thinking → Idle` turn) without a network.
     struct StubModelCaller {
@@ -827,24 +833,36 @@ mod tests {
         calls: AtomicUsize,
     }
 
-    impl ModelCaller for StubModelCaller {
-        async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+    impl ModelApi for StubModelCaller {
+        fn turn<'a>(
+            &'a self,
+            _req: &'a ModelRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok((
-                vec![Block::Text {
-                    text: self.text.clone(),
-                }],
-                ModelMeta {
-                    usage: Usage {
-                        input_tokens: 3,
-                        output_tokens: 2,
+            let text = self.text.clone();
+            Box::pin(async move {
+                Ok(to_model_response(
+                    vec![Block::Text { text }],
+                    ModelMeta {
+                        usage: Usage {
+                            input_tokens: 3,
+                            output_tokens: 2,
+                        },
+                        model_id: "claude-stub".into(),
+                        stop_reason: StopReason::EndTurn,
+                        capabilities: Capabilities(serde_json::json!({})),
+                        reasoning: ReasoningPolicy::Drop,
                     },
-                    model_id: "claude-stub".into(),
-                    stop_reason: StopReason::EndTurn,
-                    capabilities: Capabilities(serde_json::json!({})),
-                    reasoning: ReasoningPolicy::Drop,
-                },
-            ))
+                ))
+            })
+        }
+        fn list_models<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn model(&self) -> &str {
+            "claude-stub"
         }
     }
 
@@ -869,7 +887,7 @@ mod tests {
     /// The acceptance self-check: a `UserMessage` drives the primary entity
     /// `Idle → Thinking → Idle`, the log records `SessionStarted` + `UserMessage` +
     /// `ModelResponded` in order, and an `EntryNotification` carrying the assistant
-    /// text is emitted. Offline: `MemoryEventLog` + stub `ModelCaller` + no-op
+    /// text is emitted. Offline: `MemoryEventLog` + stub `ModelApi` + no-op
     /// `SurfaceDriver`, no network.
     #[tokio::test]
     async fn user_message_drives_idle_to_thinking_to_idle_logs_and_emits_entry() {
@@ -1001,7 +1019,7 @@ mod tests {
         );
     }
 
-    /// A `ModelCaller` that drives a tool turn then ends: it returns a `set_value`
+    /// A `ModelApi` that drives a tool turn then ends: it returns a `set_value`
     /// tool_use on its FIRST call (so the agent performs a surface write) and an
     /// `EndTurn` text reply on its second (so the turn settles). Counts its calls so
     /// the test proves exactly two model calls bracket the one surface write.
@@ -1009,8 +1027,11 @@ mod tests {
         calls: AtomicUsize,
     }
 
-    impl ModelCaller for ToolThenEndCaller {
-        async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+    impl ModelApi for ToolThenEndCaller {
+        fn turn<'a>(
+            &'a self,
+            _req: &'a ModelRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             let (blocks, stop_reason) = if n == 0 {
                 (
@@ -1028,19 +1049,29 @@ mod tests {
             } else {
                 (vec![Block::Text { text: "done".into() }], StopReason::EndTurn)
             };
-            Ok((
-                blocks,
-                ModelMeta {
-                    usage: Usage {
-                        input_tokens: 1,
-                        output_tokens: 1,
+            Box::pin(async move {
+                Ok(to_model_response(
+                    blocks,
+                    ModelMeta {
+                        usage: Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                        },
+                        model_id: "claude-stub".into(),
+                        stop_reason,
+                        capabilities: Capabilities(serde_json::json!({})),
+                        reasoning: ReasoningPolicy::Drop,
                     },
-                    model_id: "claude-stub".into(),
-                    stop_reason,
-                    capabilities: Capabilities(serde_json::json!({})),
-                    reasoning: ReasoningPolicy::Drop,
-                },
-            ))
+                ))
+            })
+        }
+        fn list_models<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn model(&self) -> &str {
+            "claude-stub"
         }
     }
 
@@ -1127,15 +1158,28 @@ mod tests {
 
     // --- CR-driver-open: resume reconstruction + periodic snapshot ------------
 
-    /// A `ModelCaller` that PANICS if invoked: a CLEAN resume reconstructs the
+    /// A `ModelApi` that PANICS if invoked: a CLEAN resume reconstructs the
     /// World from the recorded log alone (zero model calls), so on `open` this
     /// client is structurally unreachable — proving `open` never re-runs the
     /// recorded turn.
     struct ExplodingModelCaller;
 
-    impl ModelCaller for ExplodingModelCaller {
-        async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
-            panic!("a clean resume reconstructs from the log alone; it must never call the model");
+    impl ModelApi for ExplodingModelCaller {
+        fn turn<'a>(
+            &'a self,
+            _req: &'a ModelRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
+            Box::pin(async {
+                panic!("a clean resume reconstructs from the log alone; it must never call the model")
+            })
+        }
+        fn list_models<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn model(&self) -> &str {
+            "claude-stub"
         }
     }
 
@@ -1669,7 +1713,7 @@ mod tests {
 
     // --- FD-complete: child-EndTurn → ChildReturned completion bridge ----------
 
-    /// A `ModelCaller` that drives a one-child fan-out then ends: the PARENT's first
+    /// A `ModelApi` that drives a one-child fan-out then ends: the PARENT's first
     /// call requests a `spawn_subagent`, the CHILD's call ends its turn with a fixed
     /// answer, and the parent's CONTINUATION call ends the parent. It counts its calls
     /// so the test proves exactly three model calls bracket the one fan-out.
@@ -1677,8 +1721,11 @@ mod tests {
         calls: AtomicUsize,
     }
 
-    impl ModelCaller for SpawnThenEndCaller {
-        async fn call(&self, _request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+    impl ModelApi for SpawnThenEndCaller {
+        fn turn<'a>(
+            &'a self,
+            _req: &'a ModelRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             let (blocks, stop_reason) = match n {
                 0 => (
@@ -1702,19 +1749,29 @@ mod tests {
                     StopReason::EndTurn,
                 ),
             };
-            Ok((
-                blocks,
-                ModelMeta {
-                    usage: Usage {
-                        input_tokens: 1,
-                        output_tokens: 1,
+            Box::pin(async move {
+                Ok(to_model_response(
+                    blocks,
+                    ModelMeta {
+                        usage: Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                        },
+                        model_id: "claude-stub".into(),
+                        stop_reason,
+                        capabilities: Capabilities(serde_json::json!({})),
+                        reasoning: ReasoningPolicy::Drop,
                     },
-                    model_id: "claude-stub".into(),
-                    stop_reason,
-                    capabilities: Capabilities(serde_json::json!({})),
-                    reasoning: ReasoningPolicy::Drop,
-                },
-            ))
+                ))
+            })
+        }
+        fn list_models<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn model(&self) -> &str {
+            "claude-stub"
         }
     }
 
@@ -1819,7 +1876,7 @@ mod tests {
         }
 
         // DETERMINISM (Inv 6/7/9): a full `fold_log` of the RECORDED fan-out log — with
-        // NO ModelCaller, so ZERO model calls by construction — reconstructs the live
+        // NO model client, so ZERO model calls by construction — reconstructs the live
         // World byte-identically. The regenerated `ChildReturned` is re-applied directly
         // from the log (it is the identity-correlated, non-fingerprinted exception), so
         // an offline replay reaches the parent's resume without a fingerprinted boundary.

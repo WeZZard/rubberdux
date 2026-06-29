@@ -4,7 +4,8 @@ use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::entry::EntryOrigin;
-use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
+use crate::provider::ModelApi;
+use crate::provider::kimi_for_coding::{Message, UserContent};
 use crate::tool::ToolRegistry;
 
 use super::agent_loop::{AgentLoop, AgentLoopConfig};
@@ -42,7 +43,7 @@ pub struct SubagentResult {
 /// respects the `CancellationToken` for early termination.
 pub fn spawn_subagent(
     task_id: String,
-    client: Arc<MoonshotClient>,
+    client: Arc<dyn ModelApi>,
     system_prompt: String,
     initial_prompt: String,
     registry: Arc<ToolRegistry>,

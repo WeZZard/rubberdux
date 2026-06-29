@@ -20,7 +20,7 @@
 //!   (`PeerId::is_local` routes the delivery locally). This drives the genuine
 //!   broker path deterministically, without a non-deterministic model-driven
 //!   `drive_peer` tool call (which the effects/host unit tests already cover).
-//! - **TARGET (a real World).** A live [`WorldDriver`] over a real `MessagesClient`.
+//! - **TARGET (a real World).** A live [`WorldDriver`] over the real selected provider.
 //!   The delivered [`DurableEnvelope`] is bridged to a `DriveRequested` (exactly as
 //!   the production worker's `bridge_peer_deliver` does) and submitted; the driver
 //!   stamps it `Origin::Peer`, binds + logs the peer edge, projects the surface ops,
@@ -45,9 +45,9 @@ use rubberdux::agent::world::history::{Block, History, Role};
 use rubberdux::agent::world::inputs::{
     DriveCommand, DurableEnvelope, Event, LogicalInput, Origin, PeerPayload,
 };
-use rubberdux::agent::world::model_client::MessagesClient;
 use rubberdux::agent::world::replay;
 use rubberdux::agent::world::surface::{PeerEnvelopeId, SurfaceOp};
+use rubberdux::provider::selected_from_env;
 use rubberdux::agent::world::world::{
     Activity, Components, Effort, Identity, Inbox, Lineage, ModelConfig, PeerId as WorldPeerId,
     Resources, World,
@@ -143,8 +143,8 @@ pub async fn run() {
         return;
     }
 
-    let client = MessagesClient::from_env()
-        .expect("build a MessagesClient from RUBBERDUX_LLM_* for the live target turn");
+    let client = selected_from_env()
+        .expect("build a provider from RUBBERDUX_LLM_* for the live target turn");
     let model = shared_model_config(client.model());
     eprintln!(
         "[VC-3.2] live loopback ModelConfig: model={:?} max_tokens={} effort={:?}",
@@ -168,7 +168,7 @@ pub async fn run() {
     broker.register(lead_peer.clone(), lead_tx).await;
     broker.register(target_peer.clone(), target_tx).await;
 
-    // -- The TARGET: a real live World over a real MessagesClient -----------------
+    // -- The TARGET: a real live World over the real selected provider ------------
     // Its event log lives under the results dir so the recorded transcript is
     // collected for debugging (tests/CLAUDE.md).
     let artifact_dir = results_dir();

@@ -4,7 +4,7 @@ use tokio_util::sync::CancellationToken;
 
 use rubberdux::agent::entry::EntryHistory;
 use rubberdux::agent::runtime::compaction::{CompactionStrategy, EvictOldestTurns};
-use rubberdux::provider::moonshot::{Message, UserContent};
+use rubberdux::provider::kimi_for_coding::{Message, UserContent};
 
 /// Test that compaction reduces history size when token budget is exceeded.
 #[tokio::test]

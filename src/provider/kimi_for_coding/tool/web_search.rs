@@ -4,22 +4,22 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::{FunctionDefinition, ToolDefinition};
-use crate::provider::moonshot::api::chat::ChatResponse;
-use crate::provider::moonshot::{Message, MoonshotClient, UserContent};
+use crate::provider::kimi_for_coding::api::chat::ChatResponse;
+use crate::provider::kimi_for_coding::{Message, KimiForCodingClient, UserContent};
 use crate::tool::{Tool, ToolOutcome};
 
 const WEB_SEARCH_PROMPT: &str = include_str!("WEB_SEARCH.md");
 
 pub struct WebSearchContext {
-    pub client: Arc<MoonshotClient>,
+    pub client: Arc<KimiForCodingClient>,
 }
 
 pub struct WebSearchTool {
-    client: Arc<MoonshotClient>,
+    client: Arc<KimiForCodingClient>,
 }
 
 impl WebSearchTool {
-    pub fn new(client: Arc<MoonshotClient>) -> Self {
+    pub fn new(client: Arc<KimiForCodingClient>) -> Self {
         Self { client }
     }
 }
@@ -213,11 +213,11 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::provider::moonshot::api::chat::{ChatChoice, Usage};
-    use crate::provider::moonshot::tool::{FunctionCall, ToolCall};
+    use crate::provider::kimi_for_coding::api::chat::{ChatChoice, Usage};
+    use crate::provider::kimi_for_coding::tool::{FunctionCall, ToolCall};
 
-    fn dummy_client() -> Arc<MoonshotClient> {
-        Arc::new(MoonshotClient::new(
+    fn dummy_client() -> Arc<KimiForCodingClient> {
+        Arc::new(KimiForCodingClient::new(
             reqwest::Client::new(),
             "http://127.0.0.1:1".to_owned(),
             "test-key".to_owned(),
@@ -276,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_builtin_definition_uses_private_moonshot_name() {
+    fn provider_builtin_definition_uses_private_kimi_for_coding_name() {
         let tools = web_search_builtin_tools();
 
         assert_eq!(tools.len(), 1);

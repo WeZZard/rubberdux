@@ -11,7 +11,8 @@ use rubberdux::agent::runtime::agent_loop::{AgentLoop, AgentLoopConfig};
 use rubberdux::agent::runtime::compaction::EvictOldestTurns;
 use rubberdux::agent::runtime::port::{EntryNotification, LoopEvent};
 use rubberdux::channel::processor::ChannelProcessor;
-use rubberdux::provider::moonshot::{Message, MoonshotClient, UserContent};
+use rubberdux::provider::kimi_for_coding::{Message, UserContent};
+use crate::support::model_api_stub::openai_model_api;
 use rubberdux::tool::ToolRegistry;
 
 use crate::support::artifact;
@@ -20,7 +21,7 @@ use crate::support::mock_channel_processor::MockChannelProcessor;
 /// Mount a single mock LLM response that returns plain text.
 async fn mount_plain_text_response(mock_server: &MockServer) {
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "cmpl-chan-1",
             "object": "chat.completion",
@@ -47,12 +48,7 @@ fn build_config(
     test_name: &str,
     channel_processors: HashMap<String, Arc<dyn ChannelProcessor>>,
 ) -> (AgentLoopConfig, std::path::PathBuf) {
-    let client = Arc::new(MoonshotClient::new(
-        reqwest::Client::new(),
-        mock_server_uri.to_string(),
-        "test-key".into(),
-        "test-model".into(),
-    ));
+    let client = openai_model_api(mock_server_uri, "test-model");
 
     let artifact_dir = artifact::artifact_dir(test_name);
     let session_path = artifact_dir.join("transcript.jsonl");

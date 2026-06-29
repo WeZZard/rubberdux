@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use super::super::MoonshotClient;
+use super::super::KimiForCodingClient;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FileInfo {
@@ -16,7 +16,7 @@ struct FileList {
     data: Vec<FileInfo>,
 }
 
-impl MoonshotClient {
+impl KimiForCodingClient {
     pub async fn upload_file(
         &self,
         filename: &str,

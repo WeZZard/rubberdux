@@ -3,7 +3,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use crate::agent::entry::{Entry, EntryHistory};
-use crate::provider::moonshot::Message;
+use crate::provider::kimi_for_coding::Message;
 
 const DEFAULT_SESSION_DIR: &str = "./sessions";
 const SESSION_FILENAME: &str = "session.jsonl";

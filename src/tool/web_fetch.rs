@@ -1,5 +1,5 @@
 use super::ToolOutcome;
-use crate::provider::moonshot::tool::ToolDefinition;
+use crate::provider::kimi_for_coding::tool::ToolDefinition;
 use spider::features::chrome_common::RequestInterceptConfiguration;
 use spider::website::Website;
 use std::future::Future;

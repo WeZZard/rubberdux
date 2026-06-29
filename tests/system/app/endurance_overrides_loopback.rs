@@ -18,7 +18,7 @@
 //! the only VALID model. Driving the sub-agent's turn through the pure `tick` reducer
 //! emits its `CallModel` with `params = World::model_for(child)` — the OVERRIDE. The
 //! emitted command is dispatched through the production [`drive_live`] driver against a
-//! recording wrapper over a REAL [`MessagesClient`]. Two independent facts pin the
+//! recording wrapper over the REAL selected provider. Two independent facts pin the
 //! override:
 //!
 //! 1. **The request carries the override.** The recorded `/v1/messages` body's `model`
@@ -40,21 +40,23 @@
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::Value as Json;
-
 use rubberdux::agent::world::budget::Budget;
 use rubberdux::agent::world::effects::{
-    drive_live, Command, ModelCaller, ResultStamp, SurfaceDriver, UnattachedPeerSender,
+    drive_live, Command, ResultStamp, SurfaceDriver, UnattachedPeerSender,
 };
 use rubberdux::agent::world::event_log::{EventLog, MemoryEventLog};
 use rubberdux::agent::world::gates::EntityGate;
-use rubberdux::agent::world::history::{Block, History};
-use rubberdux::agent::world::inputs::{Event, LogicalInput, ModelMeta, Origin};
-use rubberdux::agent::world::model_client::MessagesClient;
+use rubberdux::agent::world::history::History;
+use rubberdux::agent::world::inputs::{Event, LogicalInput, Origin};
 use rubberdux::agent::world::world::{
     Activity, Components, Effort, EntityId, Identity, Inbox, Lineage, ModelConfig, Resources, World,
 };
 use rubberdux::error::Error;
+use rubberdux::provider::{
+    ModelApi, ModelInfo, ModelRequest, ModelResponse, selected_from_env,
+};
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::live_gate::skip_without_live_llm;
 
@@ -124,7 +126,7 @@ fn genesis(world_default: &ModelConfig, override_model: &ModelConfig) -> World {
 }
 
 /// The override `ModelConfig` (the real env model the live call must target).
-/// `model` is the alias `MessagesClient::from_env` resolved from `RUBBERDUX_LLM_MODEL`
+/// `model` is the alias `selected_from_env` resolved from `RUBBERDUX_LLM_MODEL`
 /// (so a REAL call hits a valid model); `max_tokens` from `RUBBERDUX_LLM_MAX_TOKENS`
 /// (default 1024); effort `Medium`. Mirrors `peer_drive_loopback::shared_model_config`.
 fn override_model_config(model_alias: &str) -> ModelConfig {
@@ -159,42 +161,52 @@ impl SurfaceDriver for NoSurfaceDrive {
     }
 }
 
-/// A `ModelCaller` that RECORDS the `/v1/messages` request body it is handed and then
-/// forwards to a REAL [`MessagesClient`]. The captured body's `model` field is the
-/// proof the sub-agent's call carried its OVERRIDE on the wire. The guard is dropped
-/// before the await so the future stays `Send`.
-struct RecordingCaller<'a> {
-    inner: &'a MessagesClient,
-    last_body: Mutex<Option<Json>>,
+/// A [`ModelApi`] that RECORDS the model alias on each neutral request it is handed
+/// and then forwards to the REAL config-selected provider. The captured
+/// `sampling.model` is the proof the sub-agent's call carried its OVERRIDE — the
+/// neutral request is the dialect-independent pivot the wire body is built from, so
+/// its `model` is exactly what the provider sends. The guard is dropped before the
+/// await so the future stays `Send`.
+struct RecordingCaller {
+    inner: Box<dyn ModelApi>,
+    last_model: Mutex<Option<String>>,
 }
 
-impl<'a> RecordingCaller<'a> {
-    fn new(inner: &'a MessagesClient) -> Self {
+impl RecordingCaller {
+    fn new(inner: Box<dyn ModelApi>) -> Self {
         Self {
             inner,
-            last_body: Mutex::new(None),
+            last_model: Mutex::new(None),
         }
     }
 
-    /// The `model` field of the last request body sent, if any.
+    /// The `model` of the last request sent, if any.
     fn last_request_model(&self) -> Option<String> {
-        self.last_body
+        self.last_model
             .lock()
-            .expect("lock the recorded request body")
-            .as_ref()
-            .and_then(|b| b.get("model"))
-            .and_then(|m| m.as_str())
-            .map(|s| s.to_string())
+            .expect("lock the recorded request model")
+            .clone()
     }
 }
 
-impl ModelCaller for RecordingCaller<'_> {
-    async fn call(&self, request_body: Json) -> Result<(Vec<Block>, ModelMeta), Error> {
+impl ModelApi for RecordingCaller {
+    fn turn<'a>(
+        &'a self,
+        req: &'a ModelRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, Error>> + Send + 'a>> {
         {
-            let mut guard = self.last_body.lock().expect("lock the recorded request body");
-            *guard = Some(request_body.clone());
+            let mut guard = self.last_model.lock().expect("lock the recorded request model");
+            *guard = Some(req.sampling.model.clone());
         }
-        self.inner.call(request_body).await
+        self.inner.turn(req)
+    }
+    fn list_models<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, Error>> + Send + 'a>> {
+        self.inner.list_models()
+    }
+    fn model(&self) -> &str {
+        self.inner.model()
     }
 }
 
@@ -209,8 +221,8 @@ pub async fn run() {
         return;
     }
 
-    let client = MessagesClient::from_env()
-        .expect("build a MessagesClient from RUBBERDUX_LLM_* for the live override turn");
+    let client =
+        selected_from_env().expect("build a provider from RUBBERDUX_LLM_* for the live override turn");
     let override_model = override_model_config(client.model());
     let world_default = sentinel_world_default();
     // Non-vacuity precondition: the override is OBSERVABLY distinct from the (sentinel)
@@ -258,7 +270,7 @@ pub async fn run() {
     );
 
     // -- Dispatch the emitted CallModel LIVE through the production driver -------------
-    let recorder = RecordingCaller::new(&client);
+    let recorder = RecordingCaller::new(client);
     let stamp = ResultStamp {
         edge: 0,
         app_edge: 1,

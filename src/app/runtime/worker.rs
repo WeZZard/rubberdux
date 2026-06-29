@@ -33,7 +33,6 @@ use crate::agent::world::event_log::FilesystemEventLog;
 use crate::agent::world::inputs::{
     Authorization, DeliveryOutcome, DurableEnvelope, LogicalInput, PeerPayload,
 };
-use crate::agent::world::model_client::MessagesClient;
 use crate::agent::world::snapshot::SnapshotStore;
 use crate::agent::world::surface::{
     classify_native_signal, IdempotencyKey, NativeSignal, PeerEnvelopeId, SurfaceOp,
@@ -42,6 +41,7 @@ use crate::agent::world::world::{Effort, ModelConfig, PeerId};
 use crate::app::peer::NodeId;
 use crate::error::Error;
 use crate::protocol::{self, AgentToHost, HostToAgent};
+use crate::provider::{self, ModelApi};
 use crate::session::{SessionId, SessionManager};
 use crate::tool::peer_message::PeerRequest;
 
@@ -89,9 +89,10 @@ async fn run_app_worker_inner(
     // session creation in crate::app::supervisor.
     let session_manager = Arc::new(session_manager_at(app_session_dir));
     // The agent path is the ECS World tick-driver (crate::agent::world::driver),
-    // NOT the legacy AgentLoop: an Anthropic-shape `MessagesClient` performs the
-    // model calls the LIVE driver dispatches. See docs/agent/world/ecs-runtime.md.
-    let client = MessagesClient::from_env()?;
+    // NOT the legacy AgentLoop: the config-selected provider (a `Box<dyn ModelApi>`
+    // from `provider::selected_from_env`) performs the model calls the LIVE driver
+    // dispatches. See docs/agent/world/ecs-runtime.md.
+    let client: Box<dyn ModelApi> = provider::selected_from_env()?;
     let model = world_model_config(client.model());
     // The model alias recorded into a fresh session's metadata, captured before
     // `client` is moved into the driver open below.
@@ -353,7 +354,7 @@ impl PeerSender for WorkerPeerSender {
 /// frames so the macOS app renders the agent's reply. A per-input drive error is
 /// logged and the loop continues with the next input.
 async fn run_world_driver(
-    mut driver: WorldDriver<MessagesClient, WorkerSurfaceDriver, FilesystemEventLog>,
+    mut driver: WorldDriver<Box<dyn ModelApi>, WorkerSurfaceDriver, FilesystemEventLog>,
     mut world_input_rx: tokio::sync::mpsc::Receiver<LogicalInput>,
     writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     peer_sender: WorkerPeerSender,
@@ -408,10 +409,10 @@ async fn run_world_driver(
     }
 }
 
-/// The concrete [`WorldDriver`] the production worker drives: an Anthropic-shape
-/// [`MessagesClient`] model caller, the [`WorkerSurfaceDriver`] LIVE surface sink,
-/// and a [`FilesystemEventLog`] rooted under the session dir.
-type WorkerWorldDriver = WorldDriver<MessagesClient, WorkerSurfaceDriver, FilesystemEventLog>;
+/// The concrete [`WorldDriver`] the production worker drives: the config-selected
+/// provider model client (`Box<dyn ModelApi>`), the [`WorkerSurfaceDriver`] LIVE
+/// surface sink, and a [`FilesystemEventLog`] rooted under the session dir.
+type WorkerWorldDriver = WorldDriver<Box<dyn ModelApi>, WorkerSurfaceDriver, FilesystemEventLog>;
 
 /// Open the World driver this worker drives, at STARTUP (before the message pump):
 /// RESUME the latest existing session via [`WorldDriver::open`] so a restarted App
@@ -429,7 +430,7 @@ async fn open_world_driver(
     app_id: &str,
     model: ModelConfig,
     model_alias: String,
-    client: MessagesClient,
+    client: Box<dyn ModelApi>,
     surface_drive_tx: tokio::sync::mpsc::Sender<HostToAgent>,
 ) -> Result<WorkerWorldDriver, Error> {
     // Prefer resuming the latest existing session.
@@ -451,8 +452,9 @@ async fn open_world_driver(
                 return Ok(driver);
             }
             Err(e) => {
-                // `client` was consumed by the failed `open`; rebuild it from env
-                // for the fresh session below so the worker stays available.
+                // `client` was consumed by the failed `open`; rebuild the
+                // config-selected provider for the fresh session below so the worker
+                // stays available.
                 log::warn!(
                     "[app-worker:{}] could not reopen latest session {} ({}); \
                      falling back to a fresh session",
@@ -460,7 +462,7 @@ async fn open_world_driver(
                     session_id.to_string(),
                     e
                 );
-                let client = MessagesClient::from_env()?;
+                let client = provider::selected_from_env()?;
                 return open_fresh(session_manager, app_id, model, model_alias, client, surface_drive_tx)
                     .await;
             }
@@ -480,7 +482,7 @@ async fn open_fresh(
     app_id: &str,
     model: ModelConfig,
     model_alias: String,
-    client: MessagesClient,
+    client: Box<dyn ModelApi>,
     surface_drive_tx: tokio::sync::mpsc::Sender<HostToAgent>,
 ) -> Result<WorkerWorldDriver, Error> {
     let (session_id, session_dir) = session_manager
